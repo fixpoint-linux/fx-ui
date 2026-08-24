@@ -772,8 +772,51 @@ test "M4 zinctest 35: appterm 2-arg RTL env indexes rightmost" {
     v.init(&g);
     defer v.deinit();
 
+    // REWRITTEN for the currying model (the pre-currying program fed 2 args
+    // to a 1-PARAM closure — under-application-as-dump then, OVER-application
+    // now).  A legitimate 2-param closure (one leading grab => arity 2) keeps
+    // the test's intent — RTL arg order + env indexing with access 0 = the
+    // innermost param:
     // RTL: 99 pushed first, 42 last; env=[42,99]; access 0 -> env[1] = 99.
-    try expectRunNum(&g, &v, "(mn[2:n]99n[2:n]42c(a[1:n]0v)t)", 99);
+    try expectRunNum(&g, &v, "(mn[2:n]99n[2:n]42c(ra[1:n]0v)t)", 99);
+}
+
+test "M4 over-applying a 1-param closure throws (old zinctest-35 shape)" {
+    var g = try testInit();
+    defer g.deinit();
+    var v: state.Vm = undefined;
+    v.init(&g);
+    defer v.deinit();
+
+    // The OLD zinctest-35 program: 2 args to a 1-param closure is now
+    // Elm-style over-application — apply 42 to id -> 42, then 42 applied to
+    // 99 is non-callable -> catchable ShenError (inside a trap-error site).
+    var sym = symbols.SymbolInterner.init();
+    defer sym.deinit();
+
+    const wm0 = g.rootWatermark();
+    var code: ?[*]types.Instr = null;
+    const len = try parser.parseBytecode(&g, &sym, "(mn[2:n]99n[2:n]42c(a[1:n]0v)t)", &code);
+    parser.resolveJumps(code.?, len);
+
+    var site = state.CatchSite{ .in_trap_error = true };
+    site.parent = v.catch_chain;
+    v.catch_chain = &site;
+    defer v.catch_chain = site.parent;
+
+    g.rootPushPtr(@ptrCast(&code));
+    err: {
+        defer g.rootPop();
+        try std.testing.expectError(error.ShenError, interp.vmExec(&v, @ptrCast(code.?), len));
+        break :err;
+    }
+    try std.testing.expectEqual(types.ValTag.error_, v.err_slot.tag);
+    try std.testing.expectEqualStrings(
+        "appterm: over-application to non-callable",
+        std.mem.sliceTo(v.err_slot.payload.error_.message.?, 0),
+    );
+    // The error unwind also popped to the entry watermark.
+    try std.testing.expectEqual(wm0, g.rootWatermark());
 }
 
 test "M4 zinctest 36: appterm-in-apply frame reuse" {
@@ -1096,6 +1139,249 @@ test "M4 deep 2000-level cur/apply chain churns collections (verbose probe)" {
     try std.testing.expectEqual(types.ValTag.number, r.tag);
     try std.testing.expectEqual(@as(i64, 42), r.payload.number);
     try std.testing.expectEqual(wm0 + 1, g.rootWatermark());
+}
+
+// =====================================================================
+//  M4-C — currying / partial application (N<A) + Elm-style
+//  over-application (N>A)   [plan T1-T8; T7 lives at zinctest 35,
+//  T8 is the whole-suite gate]
+// =====================================================================
+
+test "T1 zincArity: leading grabs + 1, non-grab stops" {
+    var g = try testInit();
+    defer g.deinit();
+    var sym = symbols.SymbolInterner.init();
+    defer sym.deinit();
+
+    const Case = struct { src: [:0]const u8, want: i32 };
+    const cases = [_]Case{
+        .{ .src = "(c(a[1:n]0v))", .want = 1 }, // [access, ret]
+        .{ .src = "(c(ra[1:n]0v))", .want = 2 }, // [grab, access, ret]
+        .{ .src = "(c(rra[1:n]0v))", .want = 3 }, // [grab, grab, access, ret]
+        .{ .src = "(c(ma[1:n]0v)t)", .want = 1 }, // leading non-grab stops
+    };
+    for (cases) |c| {
+        const wm0 = g.rootWatermark();
+        var code: ?[*]types.Instr = null;
+        _ = try parser.parseBytecode(&g, &sym, c.src, &code);
+        try std.testing.expectEqual(types.Opcode.cur, code.?[0].op);
+        const body = code.?[0].closure_code;
+        const body_len = code.?[0].closure_len;
+        try std.testing.expectEqual(c.want, interp.zincArity(body, body_len));
+        try std.testing.expectEqual(wm0, g.rootWatermark());
+    }
+}
+
+test "T2 N<A apply: partial closure, arity chain 3->2->1, full-app value" {
+    var g = try testInit();
+    defer g.deinit();
+    var v: state.Vm = undefined;
+    v.init(&g);
+    defer v.deinit();
+
+    const wm0 = g.rootWatermark();
+
+    // 3-param fn (two leading grabs) returning its FIRST param (access 2).
+    // Apply to 1 arg -> a partial closure: drop-grabs 1 (code_len 4 -> 3,
+    // the visible drop) and env = [] ++ [7] (len 1).
+    const p1 = try expectRunVal(&g, &v, "(mn[1:n]7c(rra[1:n]2v)p)");
+    try std.testing.expectEqual(types.ValTag.lambda, p1.tag);
+    try std.testing.expectEqual(@as(i32, 3), p1.payload.lambda.code_len);
+    try std.testing.expectEqual(@as(i32, 1), p1.payload.lambda.env_len);
+    try std.testing.expectEqual(wm0, g.rootWatermark());
+
+    // defunSet is C-heap only (no GC alloc between the run and the store);
+    // the dirty-marked table entry keeps the partial reachable afterwards.
+    v.defunSet("p1", p1);
+
+    // The partial applied to the remaining 2 args yields the full-app
+    // value: env = [7] ++ [8,9]; access 2 -> env[0] = 7 (== (f 7 8 9)).
+    try expectRunNum(&g, &v, "(mn[1:n]9n[1:n]8g[2:s]p1p)", 7);
+
+    // The partial applied to 1 MORE arg yields another partial (arity
+    // chain 3 -> 2 -> 1): code_len 3 -> 2, env = [7,8].
+    const p2 = try expectRunVal(&g, &v, "(mn[1:n]8g[2:s]p1p)");
+    try std.testing.expectEqual(types.ValTag.lambda, p2.tag);
+    try std.testing.expectEqual(@as(i32, 2), p2.payload.lambda.code_len);
+    try std.testing.expectEqual(@as(i32, 2), p2.payload.lambda.env_len);
+    v.defunSet("p2", p2);
+    try expectRunNum(&g, &v, "(mn[1:n]9g[2:s]p2p)", 7);
+}
+
+test "T3 map-style: partial flows as a value through env/argbuf" {
+    var g = try testInit();
+    defer g.deinit();
+    var v: state.Vm = undefined;
+    v.init(&g);
+    defer v.deinit();
+
+    // add = 2-param cur'd closure: [grab, pushmark, access 1, access 0,
+    // global +, apply, ret] — the zinc-c shape for (lambda X Y (+ X Y)).
+    const add = try expectRunVal(&g, &v, "(c(rma[1:n]1a[1:n]0g[1:s]+pv))");
+    try std.testing.expectEqual(types.ValTag.lambda, add.tag);
+    try std.testing.expectEqual(@as(i32, 2), interp.zincArity(add.payload.lambda.code, add.payload.lambda.code_len));
+    v.defunSet("add", add);
+
+    // Sanity: the exact-arity call still works (byte-compat path).
+    try expectRunNum(&g, &v, "(mn[1:n]4n[1:n]3g[3:s]addp)", 7);
+
+    // Partial application: add(5) -> a 1-param closure.
+    const p5 = try expectRunVal(&g, &v, "(mn[1:n]5g[3:s]addp)");
+    try std.testing.expectEqual(types.ValTag.lambda, p5.tag);
+    v.defunSet("p5", p5);
+
+    // Pass the PARTIAL as an ARG into another closure that applies it —
+    // the function-as-value flows through env/argbuf like any value.
+    try expectRunNum(&g, &v, "(mg[2:s]p5c(mn[1:n]3a[1:n]0pv)p)", 8);
+}
+
+test "T4 N>A apply: peel continuation, non-callable/prim throw" {
+    var g = try testInit();
+    defer g.deinit();
+    var v: state.Vm = undefined;
+    v.init(&g);
+    defer v.deinit();
+
+    // (1) 2-param fn returning a 1-param fn (cur inside the body), called
+    // with 3 args at once: the peel applies [7,8], gets the closure back,
+    // and the dispatch applies the remaining 9 -> access 2 = env[0] = 7.
+    try expectRunNum(&g, &v, "(mn[1:n]9n[1:n]8n[1:n]7c(rc(a[1:n]2v)v)p)", 7);
+    // Curried equivalent of the same call: ((f 7 8) 9) == 7 — the env
+    // layout of the curried chain matches the single-shot call.  (9 sits
+    // BELOW the inner mark so the inner apply takes exactly [7,8]; its
+    // result closure is then the outer apply's fn with 9 its only arg.)
+    try expectRunNum(&g, &v, "(mn[1:n]9mn[1:n]8n[1:n]7c(rc(a[1:n]2v)v)pp)", 7);
+
+    // (2) Over-application to a fn returning a NON-callable, inside
+    // trap-error: 2-param fn returning a1; the peel leaves the number 0
+    // with arg 2 remaining -> catchable ShenError -> handler returns 77.
+    try expectRunNum(
+        &g,
+        &v,
+        "(mc(n[2:n]77v)c(mn[1:n]2n[1:n]1n[1:n]0c(ra[1:n]1v)pv)g[10:s]trap-errorp)",
+        77,
+    );
+    // ... and the error message outside the trap path:
+    {
+        var sym = symbols.SymbolInterner.init();
+        defer sym.deinit();
+        const wm0 = g.rootWatermark();
+        var code: ?[*]types.Instr = null;
+        const len = try parser.parseBytecode(&g, &sym, "(mn[1:n]2n[1:n]1n[1:n]0c(ra[1:n]1v)p)", &code);
+        parser.resolveJumps(code.?, len);
+        var site = state.CatchSite{ .in_trap_error = true };
+        site.parent = v.catch_chain;
+        v.catch_chain = &site;
+        defer v.catch_chain = site.parent;
+        g.rootPushPtr(@ptrCast(&code));
+        err: {
+            defer g.rootPop();
+            try std.testing.expectError(error.ShenError, interp.vmExec(&v, @ptrCast(code.?), len));
+            break :err;
+        }
+        try std.testing.expectEqualStrings(
+            "apply: over-application to non-callable",
+            std.mem.sliceTo(v.err_slot.payload.error_.message.?, 0),
+        );
+        try std.testing.expectEqual(wm0, g.rootWatermark());
+    }
+
+    // (3) Over-application to a fn returning a PRIM: prims are
+    // fixed-arity, NOT curried — the peel throws instead.
+    {
+        var sym = symbols.SymbolInterner.init();
+        defer sym.deinit();
+        var code: ?[*]types.Instr = null;
+        const len = try parser.parseBytecode(&g, &sym, "(mn[1:n]2n[1:n]1n[1:n]0c(rg[1:s]+v)p)", &code);
+        parser.resolveJumps(code.?, len);
+        var site = state.CatchSite{ .in_trap_error = true };
+        site.parent = v.catch_chain;
+        v.catch_chain = &site;
+        defer v.catch_chain = site.parent;
+        g.rootPushPtr(@ptrCast(&code));
+        err: {
+            defer g.rootPop();
+            try std.testing.expectError(error.ShenError, interp.vmExec(&v, @ptrCast(code.?), len));
+            break :err;
+        }
+        try std.testing.expectEqualStrings(
+            "apply: cannot over-apply primitive",
+            std.mem.sliceTo(v.err_slot.payload.error_.message.?, 0),
+        );
+    }
+}
+
+test "T5 appterm N<A returns the partial to the grand-caller; N>A returns the value" {
+    var g = try testInit();
+    defer g.deinit();
+    var v: state.Vm = undefined;
+    v.init(&g);
+    defer v.deinit();
+
+    // N<A at tail position: the outer apply frames; the inner body's
+    // appterm under-applies a 3-param fn, so the PARTIAL (not the body
+    // value) is returned through the .ret frame-restore flow to the top
+    // level.  The 3-param closure captured env [7] at cur time, so the
+    // partial's env = [7, 5] and its code is the body minus 1 grab.
+    const r = try expectRunVal(&g, &v, "(mn[1:n]7c(mn[1:n]5c(rra[1:n]2v)t)p)");
+    try std.testing.expectEqual(types.ValTag.lambda, r.tag);
+    try std.testing.expectEqual(@as(i32, 3), r.payload.lambda.code_len);
+    try std.testing.expectEqual(@as(i32, 2), r.payload.lambda.env_len);
+
+    // The tail-returned partial still applies to the remaining 2 args:
+    // env = [7,5,8,9]; access 2 -> env[1] = 5 (a1 of the appterm call).
+    v.defunSet("tp", r);
+    try expectRunNum(&g, &v, "(mn[1:n]9n[1:n]8g[2:s]tpp)", 5);
+
+    // N>A at tail position: the peel bottoms out and the ret-flow returns
+    // the final value through the outer frame.
+    try expectRunNum(&g, &v, "(mn[2:n]99c(mn[1:n]9n[1:n]8n[1:n]7c(rc(a[1:n]2v)v)t)p)", 7);
+}
+
+test "T6 GC churn: partial closures + peels survive scavenge and full collect" {
+    var g = try testInit();
+    defer g.deinit();
+    var v: state.Vm = undefined;
+    v.init(&g);
+    defer v.deinit();
+
+    const wm0 = g.rootWatermark();
+
+    // Build a partial, then FORCE a nursery scavenge (promotes the partial,
+    // its fresh drop-grabs code array and its env) and a FULL collect
+    // (evacuates old-gen).  A stale interior pointer in the partial would
+    // read garbage or crash here — demand the exact structure through the
+    // moved pointers, then apply it.
+    var p = try expectRunVal(&g, &v, "(mn[1:n]7c(rra[1:n]2v)p)");
+    var guard = g.rootValue(&p);
+    g.collectNursery(.@"test");
+    g.collect(.@"test");
+    const code_many: [*]types.Instr = @ptrCast(p.payload.lambda.code.?);
+    try std.testing.expectEqual(types.Opcode.grab, code_many[0].op);
+    try std.testing.expectEqual(types.Opcode.access, code_many[1].op);
+    try std.testing.expectEqual(types.Opcode.ret, code_many[2].op);
+    try std.testing.expectEqual(@as(i32, 3), p.payload.lambda.code_len);
+    try std.testing.expectEqual(types.ValTag.number, p.payload.lambda.env.?[0].tag);
+    try std.testing.expectEqual(@as(i64, 7), p.payload.lambda.env.?[0].payload.number);
+    try std.testing.expect(g.nursery_scavenge_count > 0);
+    try std.testing.expect(g.full_collect_count > 0);
+    v.defunSet("pc", p);
+    guard.end();
+    try expectRunNum(&g, &v, "(mn[1:n]9n[1:n]8g[2:s]pcp)", 7);
+
+    // Churn loop: unrooted cons garbage + repeated peels/partial-builds
+    // drive natural scavenges and threshold full collects between the
+    // runs; expectRunNum/expectRunVal assert the watermark balance after
+    // every vmExec (the wm0 pattern).
+    var i: usize = 0;
+    while (i < 60) : (i += 1) {
+        _ = consNums(&g, &.{ 1, 2, 3, 4, 5 }); // unrooted garbage
+        try expectRunNum(&g, &v, "(mn[1:n]9n[1:n]8n[1:n]7c(rc(a[1:n]2v)v)p)", 7); // peel
+        const q = try expectRunVal(&g, &v, "(mn[1:n]7c(rra[1:n]2v)p)"); // fresh partial
+        v.defunSet("qc", q);
+        try expectRunNum(&g, &v, "(mn[1:n]9n[1:n]8g[2:s]qcp)", 7); // partial applies
+    }
+    try std.testing.expectEqual(wm0, g.rootWatermark());
 }
 
 // =====================================================================

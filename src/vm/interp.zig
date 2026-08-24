@@ -38,6 +38,21 @@
 //!   env fill; va_push / env_push root their argument internally across the
 //!   grow alloc.  `Instr *in` is re-derived from the rooted cur_code at the
 //!   top of EVERY iteration and never cached across an allocating call.
+//!   [CURRYING] apply/appterm partial application (N<A) and Elm-style
+//!   over-application (N>A; the C VM and the metacircular reference are
+//!   full-arity-only here).  N==0 apply KEEPS the legacy full-arity jump
+//!   (hand-bundle top-level thunks are called with nargs==0 via
+//!   `mm <name> p`; zinc-c never emits a 0-arg apply): the partial's
+//!   drop-grabs code is a FRESH
+//!   allocArray(Instr) + copy of the suffix — interior pointers like
+//!   code+N are FORBIDDEN roots in a moving collector (gcMove reads the
+//!   header at *(p-1)) — and the fresh array is itself rooted across the
+//!   later env/closure allocs (buildPartialClosure).  The N>A peel runs
+//!   each callee body through a NESTED vmExecEnv (fresh frame stack, the
+//!   prims.zig trap-error precedent) with the outer frame's roots —
+//!   including the rooted &acc slot and the argbuf — still live below the
+//!   callee's entry watermark (peelOverArgs).  Both paths re-read every
+//!   lambda field through the rooted acc slot (5) after each allocation.
 //!   [EPILOGUE] the defer rootPopTo(entry_wm) above covers every exit,
 //!   including error returns.
 
@@ -180,6 +195,265 @@ pub fn envPop(vm: *Vm, env: *?[*]Value, env_len: *i32) VmError!Value {
 ///   error.ShenError  → propagates up to the enclosing CatchSite chain.
 fn execPrimitive(vm: *Vm, name: []const u8, acc: *Value, stack: *types.ValueArray) VmError!void {
     return prims.execPrimitive(vm, name, acc, stack);
+}
+
+// =====================================================================
+//  Currying helpers — partial application (N<A) + Elm-style
+//  over-application peel (N>A).
+//
+//  NOT in the C VM: zincvm.c:3274-3350 OP_APPLY / OP_APPTERM are
+//  full-arity-only (under/over-application silently corrupts the env).
+//  The N<A partial-closure semantics follow the metacircular reference
+//  (interp.shen:193-245, zinc-arity + drop-grabs); the N>A continuation is
+//  the user-approved Elm-style divergence where the reference errors
+//  ("too many args").  NOTE for frontend compilers (supersedes the
+//  elm-csexp plan's TARGET SEMANTICS): curried calls are now LEGAL at the
+//  ZINC level, but primitives are NOT curried — a prim left with args
+//  after a peel throws, so compilers must wrap prims in curried closures.
+// =====================================================================
+
+/// Arity of a closure body: leading grabs + 1, minimum 1 (a K-param lambda
+/// compiles to [grab x (K-1), body..., ret]; the wrapper [cur] binds the
+/// first param via APPLY, every further param via a leading grab).
+/// Reference: interp.shen:78-85 zinc-arity.  Pure walk, NO allocation.
+/// pub for the vm_test unit tests (T1); every runtime caller reads the
+/// fields through a ROOTED slot.
+pub fn zincArity(code: ?*types.Instr, code_len: i32) i32 {
+    if (code == null) return 1;
+    const arr: [*]types.Instr = @ptrCast(code.?);
+    var i: i32 = 0;
+    var grabs: i32 = 0;
+    while (i < code_len and arr[@intCast(i)].op == .grab) {
+        grabs += 1;
+        i += 1;
+    }
+    return grabs + 1;
+}
+
+/// The .ret arm's frame-restore body (C:3347-3360), extracted so .ret and
+/// appterm's under-application paths share ONE source of truth for the
+/// rooting-sensitive frame-restore discipline.  Pops the current CallFrame,
+/// restores the caller's code/env/stack (writing THROUGH the rooted frame
+/// slots cur_code (7) / env (3) / stack.data (4)), releases the stale
+/// pointers in the popped frame slot (the old-gen CALLFRAME_ARRAY drain
+/// scan must not keep dead frame envs/stacks reachable — C:3217-3221), and
+/// pushes `accv` as the return value on the restored caller stack
+/// (vaPush roots accv across its own grow alloc internally).  Returns
+/// false when the frame stack is exhausted — the caller breaks :run and
+/// vmExecEnv's epilogue returns acc.
+fn popFramePushAcc(
+    g: *Gc,
+    accv: Value,
+    frame_stack: [*]types.CallFrame,
+    frames_sp: *i32,
+    cur_code: *?*types.Instr,
+    cur_len: *i32,
+    pc: *i32,
+    env: *?[*]Value,
+    env_len: *i32,
+    env_cap: *i32,
+    stack: *types.ValueArray,
+) bool {
+    if (frames_sp.* <= 0) return false;
+    frames_sp.* -= 1;
+    const cf = &frame_stack[@intCast(frames_sp.*)];
+    cur_code.* = cf.code;
+    cur_len.* = cf.code_len;
+    pc.* = cf.pc;
+    env.* = cf.env;
+    env_len.* = cf.env_len;
+    env_cap.* = cf.env_cap;
+    vaFree(stack);
+    stack.* = cf.stack;
+    cf.env = null;
+    cf.stack.data = null;
+    cf.stack.len = 0;
+    cf.code = null;
+    cf.code_len = 0;
+    cf.pc = 0;
+    vaPush(g, stack, accv); // push return value to caller stack
+    return true;
+}
+
+/// buildPartialClosure — drop-grabs + env capture for the N<A
+/// under-application case of apply/appterm.  Returns a closure whose code
+/// is the callee body with its `nargs` leading grabs dropped and whose env
+/// is closure_env ++ argbuf[0..nargs].  The env layout is CONSISTENT with
+/// a single-shot call: a later apply APPENDS the remaining args, and
+/// access j then resolves exactly as if all args had been supplied at once
+/// (proof in the plan's GROUND TRUTH 1).
+///
+/// DROP-GRABS IS A FRESH ALLOC, NEVER POINTER ARITHMETIC: closure bodies
+/// are GC-allocated, MOVING instr_arrays — `code + nargs` would be an
+/// interior pointer, forbidden as a root by the precise-root contract
+/// (gcMove reads the header at *(p-1): garbage header = heap corruption).
+/// The fresh array is scanned as instr_array, so the copied Instrs'
+/// operand strings and closure_code children stay reachable even if the
+/// original body array dies.
+///
+/// ROOTING WALKTHROUGH (the M4 hazard discipline):
+///   - fnv_slot is the CALLER'S ROOTED &acc slot (prologue root (5)) and
+///     argbuf is the caller's rootPushValueArray pair: both stay pinned
+///     across every allocation below, and every lambda field is re-read
+///     through fnv_slot AFTER each alloc (fresh post-GC).
+///   - ALLOC#1 (fresh instr_array): fnv_slot pins the ORIGINAL code array;
+///     the source head is re-read through fnv_slot after the alloc.  The
+///     i32 bounds (code_len/nargs) are plain copies — GC-invariant.
+///   - new_code is itself rooted across ALLOC#2/#3: the fresh array must
+///     survive the env allocs even if the original body dies.
+///   - ALLOC#2 (env concat): lambda_env is re-read through fnv_slot after
+///     the alloc; the fill mirrors the full-arity apply env build's
+///     inOldgen / valueReferencesNursery / dirtyVectorsAdd barrier dance.
+///   - ALLOC#3 (the closure's env copy) happens INSIDE valLambda, which
+///     roots its own code/env slot copies; no alloc occurs between the
+///     fill above and its prologue pushes.
+fn buildPartialClosure(g: *Gc, fnv_slot: *Value, argbuf: [*]Value, nargs: i32) Value {
+    const code_len = fnv_slot.payload.lambda.code_len; // i32 — GC-invariant
+    const new_len = code_len - nargs; // drop-grabs nargs
+    // ALLOC#1 — fresh instr_array holding the suffix [nargs..code_len).
+    var new_code = g.allocArray(types.Instr, @intCast(new_len));
+    // Source head re-read through the rooted slot AFTER the alloc; the
+    // i32 bounds are pre-GC copies and still exact.
+    const src: [*]types.Instr = @ptrCast(fnv_slot.payload.lambda.code.?);
+    @memcpy(
+        new_code[0..@as(usize, @intCast(new_len))],
+        src[@intCast(nargs)..@intCast(code_len)],
+    );
+    g.rootPushPtr(@ptrCast(&new_code)); // pin the fresh array across #2/#3
+    defer g.rootPop(); // new_code
+
+    const lambda_env_len = fnv_slot.payload.lambda.env_len; // i32 — invariant
+    // ALLOC#2 — the env concat closure_env ++ argbuf[0..nargs].
+    const ne = g.allocArray(Value, @intCast(lambda_env_len + nargs));
+    const lambda_env = fnv_slot.payload.lambda.env; // fresh post-alloc read
+    const ne_is_oldgen = g.inOldgen(@intFromPtr(ne));
+    if (lambda_env_len > 0 and lambda_env != null) {
+        const lel: usize = @intCast(lambda_env_len);
+        @memcpy(ne[0..lel], lambda_env.?[0..lel]);
+        if (ne_is_oldgen) {
+            var j: usize = 0;
+            while (j < lel) : (j += 1) {
+                if (gc.scan.valueReferencesNursery(g, &lambda_env.?[j])) {
+                    g.dirtyVectorsAdd(ne);
+                    break;
+                }
+            }
+        }
+    }
+    var i: usize = 0;
+    while (i < @as(usize, @intCast(nargs))) : (i += 1) {
+        const idx = @as(usize, @intCast(lambda_env_len)) + i;
+        ne[idx] = argbuf[i];
+        if (ne_is_oldgen and gc.scan.valueReferencesNursery(g, &argbuf[i]))
+            g.dirtyVectorsAdd(ne);
+    }
+    // ALLOC#3 inside valLambda (the env copy); its internal roots cover the
+    // interval.  new_code is read through the rooted slot — post-#3 fresh.
+    return values.valLambda(
+        g,
+        @ptrCast(new_code),
+        new_len,
+        ne,
+        lambda_env_len + nargs,
+    );
+}
+
+/// peelOverArgs — the N>A Elm-style over-application loop shared by apply
+/// and appterm: apply the callee's FIRST `arity` source args through a
+/// NESTED vmExecEnv (fresh frame stack — the prims.zig trap-error
+/// precedent), then continue applying the remaining args to the result
+/// until the application is no longer over-applied.
+///
+/// Exits, returning to the caller's N==A / N<A dispatch: acc_slot is a
+/// .lambda with nargs <= zincArity(acc), or acc_slot is the final value
+/// with nargs == 0.  Throws (catchable ShenError, trap-error compatible)
+/// when a peel level's result is a non-lambda with args remaining — for a
+/// .prim specifically: primitives are fixed-arity, NOT curried; the
+/// frontend compiler must wrap them in curried closures.
+///
+/// TERMINATION: zincArity >= 1 always, so nargs strictly decreases per
+/// level (bounded by the 64-slot argbuf).  Each nested vmExecEnv gets a
+/// fresh instr_limit budget and allocates its own frame stack (~3 MB
+/// old-gen per level, bounded by over-application depth) — noted future
+/// optimizations, accepted for this unit (same as trap-error).
+///
+/// Rooting: acc_slot is the caller's rooted &acc slot (5) — every lambda
+/// field read goes through it AFTER the previous alloc; argbuf/nargs are
+/// the caller's rootPushValueArray pair, still live BELOW the nested
+/// vmExecEnv's entry watermark (its defer rootPopTo rebalances only its
+/// own roots).  The env concat is filled and handed straight to vmExecEnv
+/// with NO alloc in between — the callee's prologue roots init_env at its
+/// slot (2) before its first allocation (primTrapError precedent).
+fn peelOverArgs(
+    vm: *Vm,
+    acc_slot: *Value,
+    argbuf: *[64]Value,
+    nargs: *i32,
+    op_name: []const u8,
+) VmError!void {
+    const g = vm.gc;
+    while (true) {
+        // Loop invariant: acc_slot.* is a .lambda and nargs.* > its arity.
+        const arity = zincArity(acc_slot.payload.lambda.code, acc_slot.payload.lambda.code_len);
+        const lambda_env_len = acc_slot.payload.lambda.env_len; // i32 copy
+        // env_A = closure_env ++ argbuf[0..arity] — the FIRST arity SOURCE
+        // args (argbuf holds source order: argbuf[i] = call arg i+1).
+        const ne = g.allocArray(Value, @intCast(lambda_env_len + arity));
+        // Callee read FRESH post-alloc through the rooted acc_slot.
+        const code = acc_slot.payload.lambda.code;
+        const code_len = acc_slot.payload.lambda.code_len;
+        const lambda_env = acc_slot.payload.lambda.env;
+        const ne_is_oldgen = g.inOldgen(@intFromPtr(ne));
+        if (lambda_env_len > 0 and lambda_env != null) {
+            const lel: usize = @intCast(lambda_env_len);
+            @memcpy(ne[0..lel], lambda_env.?[0..lel]);
+            if (ne_is_oldgen) {
+                var j: usize = 0;
+                while (j < lel) : (j += 1) {
+                    if (gc.scan.valueReferencesNursery(g, &lambda_env.?[j])) {
+                        g.dirtyVectorsAdd(ne);
+                        break;
+                    }
+                }
+            }
+        }
+        var i: usize = 0;
+        while (i < @as(usize, @intCast(arity))) : (i += 1) {
+            const idx = @as(usize, @intCast(lambda_env_len)) + i;
+            ne[idx] = argbuf[i];
+            if (ne_is_oldgen and gc.scan.valueReferencesNursery(g, &argbuf[i]))
+                g.dirtyVectorsAdd(ne);
+        }
+        // Nested body run: fresh frame stack, returns the body's result.
+        acc_slot.* = try vmExecEnv(vm, code, code_len, ne, lambda_env_len + arity);
+        // Left-shift argbuf by arity — plain Value copies, no alloc
+        // (copyForwards: dst < src but the ranges may overlap when
+        // nargs > 2*arity); the ROOT_VALUE_ARRAY count is read live at
+        // scan time, so the remaining prefix stays the scanned region.
+        const rem = nargs.* - arity;
+        if (rem > 0) {
+            std.mem.copyForwards(
+                Value,
+                argbuf[0..@as(usize, @intCast(rem))],
+                argbuf[@intCast(arity)..@intCast(nargs.*)],
+            );
+        }
+        nargs.* = rem;
+
+        if (nargs.* == 0) return; // acc is the final value
+        if (acc_slot.tag != .lambda) {
+            const what = if (acc_slot.tag == .prim)
+                "cannot over-apply primitive"
+            else
+                "over-application to non-callable";
+            var buf: [80]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "{s}: {s}", .{ op_name, what }) catch what;
+            return vm.throwShen(msg);
+        }
+        if (nargs.* <= zincArity(acc_slot.payload.lambda.code, acc_slot.payload.lambda.code_len))
+            return; // caller dispatches N==A (full) / N<A (partial)
+        // Still over-applied — peel another level.
+    }
 }
 
 // =====================================================================
@@ -367,7 +641,10 @@ pub fn vmExecEnv(
                 } else pc += 1;
             },
 
-            // C:3264-3346 — apply.
+            // C:3264-3346 — apply.  Currying extension: N<A returns a
+            // partial closure (drop-grabs + env capture), N>A is the
+            // Elm-style peel; the N==A full-arity path is byte-identical
+            // to the C VM.
             .apply => {
                 if (stack.len > 0) acc = vaPop(&stack); // pop function
                 if (acc.tag == .lambda) {
@@ -391,57 +668,98 @@ pub fn vmExecEnv(
                     _ = vaPop(&stack);
                     g.rootPushValueArray(&argbuf, &nargs); // root argbuf BEFORE any alloc below — C:3294
 
-                    if (frames_sp >= types.CALL_STACK_DEPTH) break :run; // C:3296
-                    const cf = &frame_stack[@intCast(frames_sp)];
-                    frames_sp += 1;
-                    cf.code = cur_code;
-                    cf.code_len = cur_len;
-                    cf.pc = pc + 1;
-                    cf.env = env;
-                    cf.env_len = env_len;
-                    cf.env_cap = env_cap;
-                    cf.stack = stack;
-                    vaInit(g, &stack); // ALLOC — cf must not be touched after this
+                    // Arity dispatch (currying).  zincArity never allocates;
+                    // acc is the rooted slot (5), so the code read is fresh.
+                    var arity = zincArity(acc.payload.lambda.code, acc.payload.lambda.code_len);
+                    if (nargs > arity) {
+                        // N>A — Elm-style peel: apply the first A args, feed
+                        // the rest to the result, repeat.  Returns with
+                        // nargs <= arity(acc) (acc callable) or nargs == 0
+                        // (acc is the final value — a NON-lambda with 0
+                        // args left; never read its lambda fields then).
+                        try peelOverArgs(vm, &acc, &argbuf, &nargs, "apply");
+                        if (acc.tag == .lambda)
+                            arity = zincArity(acc.payload.lambda.code, acc.payload.lambda.code_len);
+                    }
 
-                    env = null;
-                    env_len = 0;
-                    env_cap = 0;
+                    if (acc.tag == .lambda and (nargs == arity or nargs == 0)) {
+                        // N==A — the EXISTING full-arity path, byte-identical
+                        // to the C VM (frame push + env build + pc=0); all
+                        // exact-arity bytecode (the Shen bundle) keeps
+                        // working.  N==0 keeps the SAME old path (jump into
+                        // the body with env = closure_env): zinc-c never
+                        // emits a 0-arg apply, but hand-bundle top-level
+                        // thunks ([pushmark 2 1 global + apply ret] bodies)
+                        // are CALLED with nargs==0 via `mm <name> p` — the
+                        // identity rule would break them, and the old path
+                        // is the byte-compat requirement of this unit.
+                        if (frames_sp >= types.CALL_STACK_DEPTH) break :run; // C:3296
+                        const cf = &frame_stack[@intCast(frames_sp)];
+                        frames_sp += 1;
+                        cf.code = cur_code;
+                        cf.code_len = cur_len;
+                        cf.pc = pc + 1;
+                        cf.env = env;
+                        cf.env_len = env_len;
+                        cf.env_cap = env_cap;
+                        cf.stack = stack;
+                        vaInit(g, &stack); // ALLOC — cf must not be touched after this
 
-                    const lambda_env_len = acc.payload.lambda.env_len;
-                    const new_env_len = lambda_env_len + nargs;
-                    const ne = g.allocArray(Value, @intCast(new_env_len));
-                    // acc is rooted (5), so acc.lambda.code/env are read
-                    // AFTER the alloc and are post-GC fresh (C:3303-3305);
-                    // acc.lambda.env stays reachable via the shadow stack.
-                    cur_code = acc.payload.lambda.code;
-                    cur_len = acc.payload.lambda.code_len;
-                    const lambda_env = acc.payload.lambda.env;
-                    const ne_is_oldgen = g.inOldgen(@intFromPtr(ne));
-                    if (lambda_env_len > 0 and lambda_env != null) {
-                        const lel: usize = @intCast(lambda_env_len);
-                        @memcpy(ne[0..lel], lambda_env.?[0..lel]);
-                        if (ne_is_oldgen) {
-                            var j: usize = 0;
-                            while (j < lel) : (j += 1) {
-                                if (gc.scan.valueReferencesNursery(g, &lambda_env.?[j])) {
-                                    g.dirtyVectorsAdd(ne);
-                                    break;
+                        env = null;
+                        env_len = 0;
+                        env_cap = 0;
+
+                        const lambda_env_len = acc.payload.lambda.env_len;
+                        const new_env_len = lambda_env_len + nargs;
+                        const ne = g.allocArray(Value, @intCast(new_env_len));
+                        // acc is rooted (5), so acc.lambda.code/env are read
+                        // AFTER the alloc and are post-GC fresh (C:3303-3305);
+                        // acc.lambda.env stays reachable via the shadow stack.
+                        cur_code = acc.payload.lambda.code;
+                        cur_len = acc.payload.lambda.code_len;
+                        const lambda_env = acc.payload.lambda.env;
+                        const ne_is_oldgen = g.inOldgen(@intFromPtr(ne));
+                        if (lambda_env_len > 0 and lambda_env != null) {
+                            const lel: usize = @intCast(lambda_env_len);
+                            @memcpy(ne[0..lel], lambda_env.?[0..lel]);
+                            if (ne_is_oldgen) {
+                                var j: usize = 0;
+                                while (j < lel) : (j += 1) {
+                                    if (gc.scan.valueReferencesNursery(g, &lambda_env.?[j])) {
+                                        g.dirtyVectorsAdd(ne);
+                                        break;
+                                    }
                                 }
                             }
                         }
+                        var i: usize = 0;
+                        while (i < @as(usize, @intCast(nargs))) : (i += 1) {
+                            const idx = @as(usize, @intCast(lambda_env_len)) + i;
+                            ne[idx] = argbuf[i];
+                            if (ne_is_oldgen and gc.scan.valueReferencesNursery(g, &argbuf[i]))
+                                g.dirtyVectorsAdd(ne);
+                        }
+                        env = ne;
+                        env_len = new_env_len;
+                        env_cap = new_env_len;
+                        g.rootPop(); // argbuf — C:3340
+                        pc = 0;
+                    } else {
+                        // N<A with nargs>0 (a post-peel final value can no
+                        // longer land here — the peel loop only exits to a
+                        // lambda or throws): NO frame push — the caller frame
+                        // stays current (args + mark are already popped).
+                        // buildPartialClosure re-reads everything through
+                        // the rooted acc slot; the vaPush grow is covered
+                        // by acc's root (5) + vaPush's internal root.
+                        // (The nargs>0 tag guard is belt-and-braces: the
+                        // peel only ever exits to a .lambda or throws.)
+                        if (acc.tag == .lambda and nargs > 0)
+                            acc = buildPartialClosure(g, &acc, &argbuf, nargs);
+                        vaPush(g, &stack, acc);
+                        pc += 1;
+                        g.rootPop(); // argbuf
                     }
-                    var i: usize = 0;
-                    while (i < @as(usize, @intCast(nargs))) : (i += 1) {
-                        const idx = @as(usize, @intCast(lambda_env_len)) + i;
-                        ne[idx] = argbuf[i];
-                        if (ne_is_oldgen and gc.scan.valueReferencesNursery(g, &argbuf[i]))
-                            g.dirtyVectorsAdd(ne);
-                    }
-                    env = ne;
-                    env_len = new_env_len;
-                    env_cap = new_env_len;
-                    g.rootPop(); // argbuf — C:3340
-                    pc = 0;
                 } else if (acc.tag == .prim) {
                     // Function already popped; pop mark before args if present.
                     if (stack.len > 0 and vaPeek(&stack).tag == .mark) _ = vaPop(&stack);
@@ -466,26 +784,22 @@ pub fn vmExecEnv(
             },
 
             // C:3347-3360 — return: pop the frame, push acc to the caller.
+            // (The frame-restore body lives in popFramePushAcc — shared with
+            // appterm's under-application paths below.)
             .ret => {
-                if (frames_sp > 0) {
-                    frames_sp -= 1;
-                    const cf = &frame_stack[@intCast(frames_sp)];
-                    cur_code = cf.code;
-                    cur_len = cf.code_len;
-                    pc = cf.pc;
-                    env = cf.env;
-                    env_len = cf.env_len;
-                    env_cap = cf.env_cap;
-                    vaFree(&stack);
-                    stack = cf.stack;
-                    cf.env = null;
-                    cf.stack.data = null;
-                    cf.stack.len = 0;
-                    cf.code = null;
-                    cf.code_len = 0;
-                    cf.pc = 0;
-                    vaPush(g, &stack, acc); // push return value to caller stack
-                } else break :run;
+                if (!popFramePushAcc(
+                    g,
+                    acc,
+                    frame_stack,
+                    &frames_sp,
+                    &cur_code,
+                    &cur_len,
+                    &pc,
+                    &env,
+                    &env_len,
+                    &env_cap,
+                    &stack,
+                )) break :run;
             },
 
             // C:3361-3364 — access.
@@ -549,7 +863,11 @@ pub fn vmExecEnv(
             },
 
             // C:3397-3461 — appterm: tail-call in the current frame
-            // (pc = 0, no new CallFrame — frame reuse).
+            // (pc = 0, no new CallFrame — frame reuse).  Currying
+            // extension: N<A builds the partial and RETURNS it via the
+            // .ret frame-restore flow (the tail-call result goes to the
+            // caller's caller); N>A peels; N==A is the byte-identical
+            // tail-jump.
             .appterm => {
                 if (stack.len > 0) acc = vaPop(&stack); // pop function
                 if (acc.tag == .lambda) {
@@ -578,42 +896,80 @@ pub fn vmExecEnv(
                         break :run;
                     }
 
-                    const lambda_env_len = acc.payload.lambda.env_len;
-                    const new_env_len = lambda_env_len + nargs;
-                    g.rootPushValueArray(&argbuf, &nargs); // root argbuf before the alloc — C:3421
-                    const ne = g.allocArray(Value, @intCast(new_env_len));
-                    // cur_code set AFTER the alloc from the rooted acc — the
-                    // rooted cur_code slot (7) makes any interim value safe,
-                    // and reading acc fresh after the alloc matches C:3423-3425.
-                    cur_code = acc.payload.lambda.code;
-                    cur_len = acc.payload.lambda.code_len;
-                    const lambda_env = acc.payload.lambda.env;
-                    const ne_is_oldgen = g.inOldgen(@intFromPtr(ne));
-                    if (lambda_env_len > 0 and lambda_env != null) {
-                        const lel: usize = @intCast(lambda_env_len);
-                        @memcpy(ne[0..lel], lambda_env.?[0..lel]);
-                        if (ne_is_oldgen) {
-                            var j: usize = 0;
-                            while (j < lel) : (j += 1) {
-                                if (gc.scan.valueReferencesNursery(g, &lambda_env.?[j])) {
-                                    g.dirtyVectorsAdd(ne);
-                                    break;
+                    g.rootPushValueArray(&argbuf, &nargs); // root argbuf before any alloc
+
+                    // Same arity dispatch as apply (currying).
+                    var arity = zincArity(acc.payload.lambda.code, acc.payload.lambda.code_len);
+                    if (nargs > arity) {
+                        try peelOverArgs(vm, &acc, &argbuf, &nargs, "appterm");
+                        // peel may return a NON-lambda final value with
+                        // nargs == 0 — never read its lambda fields then.
+                        if (acc.tag == .lambda)
+                            arity = zincArity(acc.payload.lambda.code, acc.payload.lambda.code_len);
+                    }
+
+                    if (acc.tag == .lambda and nargs == arity) {
+                        // N==A — EXISTING tail-jump path, byte-identical
+                        // (pc = 0, no new CallFrame — frame reuse).
+                        const lambda_env_len = acc.payload.lambda.env_len;
+                        const new_env_len = lambda_env_len + nargs;
+                        const ne = g.allocArray(Value, @intCast(new_env_len));
+                        // cur_code set AFTER the alloc from the rooted acc — the
+                        // rooted cur_code slot (7) makes any interim value safe,
+                        // and reading acc fresh after the alloc matches C:3423-3425.
+                        cur_code = acc.payload.lambda.code;
+                        cur_len = acc.payload.lambda.code_len;
+                        const lambda_env = acc.payload.lambda.env;
+                        const ne_is_oldgen = g.inOldgen(@intFromPtr(ne));
+                        if (lambda_env_len > 0 and lambda_env != null) {
+                            const lel: usize = @intCast(lambda_env_len);
+                            @memcpy(ne[0..lel], lambda_env.?[0..lel]);
+                            if (ne_is_oldgen) {
+                                var j: usize = 0;
+                                while (j < lel) : (j += 1) {
+                                    if (gc.scan.valueReferencesNursery(g, &lambda_env.?[j])) {
+                                        g.dirtyVectorsAdd(ne);
+                                        break;
+                                    }
                                 }
                             }
                         }
+                        var i: usize = 0;
+                        while (i < @as(usize, @intCast(nargs))) : (i += 1) {
+                            const idx = @as(usize, @intCast(lambda_env_len)) + i;
+                            ne[idx] = argbuf[i];
+                            if (ne_is_oldgen and gc.scan.valueReferencesNursery(g, &argbuf[i]))
+                                g.dirtyVectorsAdd(ne);
+                        }
+                        env = ne;
+                        env_len = new_env_len;
+                        env_cap = new_env_len;
+                        g.rootPop(); // argbuf — C:3451
+                        pc = 0;
+                    } else {
+                        // N<A: the partial closure (or post-peel final value)
+                        // IS the tail-call result — return it to the caller's
+                        // caller through the .ret frame-restore flow
+                        // (reference interp.shen:225/238; at top level
+                        // frames_sp==0 breaks :run and acc becomes the
+                        // program value).
+                        if (acc.tag == .lambda and nargs > 0)
+                            acc = buildPartialClosure(g, &acc, &argbuf, nargs);
+                        g.rootPop(); // argbuf
+                        if (!popFramePushAcc(
+                            g,
+                            acc,
+                            frame_stack,
+                            &frames_sp,
+                            &cur_code,
+                            &cur_len,
+                            &pc,
+                            &env,
+                            &env_len,
+                            &env_cap,
+                            &stack,
+                        )) break :run;
                     }
-                    var i: usize = 0;
-                    while (i < @as(usize, @intCast(nargs))) : (i += 1) {
-                        const idx = @as(usize, @intCast(lambda_env_len)) + i;
-                        ne[idx] = argbuf[i];
-                        if (ne_is_oldgen and gc.scan.valueReferencesNursery(g, &argbuf[i]))
-                            g.dirtyVectorsAdd(ne);
-                    }
-                    env = ne;
-                    env_len = new_env_len;
-                    env_cap = new_env_len;
-                    g.rootPop(); // argbuf — C:3451
-                    pc = 0;
                 } else if (acc.tag == .prim) {
                     // Function already popped; pop mark before args if present.
                     if (stack.len > 0 and vaPeek(&stack).tag == .mark) _ = vaPop(&stack);
