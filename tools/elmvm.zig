@@ -8,9 +8,10 @@
 //!   elmvm <bundle.csexp> <fn-name> [arg ...]
 //!
 //! The call snippet mirrors the plan's full-arity emission rule:
-//!   m <arg-atoms> g[len:s]<fn> p v
-//! i.e. pushmark, then each arg (number literal, auto-push), load the global
-//! closure by symbol, apply, return.
+//!   m <arg-atoms RTL> g[len:s]<fn> p v
+//! i.e. pushmark, then each arg (number literal, auto-push) pushed
+//! right-to-left (reverse command-line order), load the global closure by
+//! symbol, apply, return.
 
 const std = @import("std");
 const gc = @import("gc");
@@ -61,14 +62,27 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // ---- build the call snippet: (m <arg atoms> g[len:s]fn p v) ----
+    // Args are pushed RIGHT-TO-LEFT (reverse command-line order).  The VM's
+    // apply pops them top-first into argbuf, so the LAST-pushed arg lands in
+    // argbuf[0] = first command-line arg = param1.  This is consistent with the
+    // compiler's currying env layout (param_i = access(n-i)).
+    var argvals: [64]i64 = undefined;
+    var nargs: usize = 0;
+    while (it.next()) |arg| {
+        if (nargs >= 64) return error.TooManyArgs;
+        argvals[nargs] = try std.fmt.parseInt(i64, arg, 10);
+        nargs += 1;
+    }
     var snip_buf: [1024]u8 = undefined;
     var snip_len: usize = 0;
     snip_buf[snip_len] = '(';
     snip_len += 1;
     snip_buf[snip_len] = 'm';
     snip_len += 1;
-    while (it.next()) |arg| {
-        const val = try std.fmt.parseInt(i64, arg, 10);
+    var i: usize = nargs;
+    while (i > 0) {
+        i -= 1;
+        const val = argvals[i];
         var numbuf: [32]u8 = undefined;
         const numstr = try std.fmt.bufPrint(&numbuf, "{d}", .{val});
         const atom = try std.fmt.bufPrint(snip_buf[snip_len..], "n[{d}:n]{s}", .{ numstr.len, numstr });

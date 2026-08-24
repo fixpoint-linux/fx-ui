@@ -1,15 +1,16 @@
 port module Main exposing (main)
 
--- M0 bootstrap: prove the stil4m/elm-syntax 7.3.9 API end-to-end against a real
--- build.  Receives Elm source via flags, parses it with Elm.Parser.parseToFile,
--- and emits a one-line result over the `emit` port:
---   "ok <declCount> <firstDeclName>"   on successful parse
---   "err <deadEndCount>"               on parse failure
+-- M1b: orchestrate the Elm -> ZINC-csexp compiler pipeline.
+--
+-- Receives Elm source via flags, parses it to a File with Elm.Parser.parseToFile,
+-- lowers it to a ZINC bundle (Lower.Module.compile), resolves jumps + flattens
+-- (Zinc.Emit), and emits over the `emit` port:
+--   the bundle csexp TEXT on success
+--   "err <message>"                on parse or compile failure
 -- run.js wires flags -> compiler.js and the emit port -> a .csexp output file.
 
 import Elm.Parser
-import Elm.Syntax.Declaration as Declaration exposing (Declaration(..))
-import Elm.Syntax.Node exposing (Node(..))
+import Lower.Module as Module
 import Platform
 
 port emit : String -> Cmd msg
@@ -41,33 +42,12 @@ compile : String -> String
 compile source =
     case Elm.Parser.parseToFile source of
         Ok file ->
-            let
-                count =
-                    List.length file.declarations
+            case Module.compile file of
+                Ok bundleText ->
+                    bundleText
 
-                firstName =
-                    firstDeclName file.declarations
-            in
-            "ok " ++ String.fromInt count ++ " " ++ firstName
+                Err msg ->
+                    "err " ++ msg
 
-        Err deadends ->
-            "err " ++ String.fromInt (List.length deadends)
-
-
-firstDeclName : List (Node Declaration.Declaration) -> String
-firstDeclName decls =
-    case decls of
-        [] ->
-            ""
-
-        first :: _ ->
-            case first of
-                Node _ (FunctionDeclaration fn) ->
-                    case fn.declaration of
-                        Node _ impl ->
-                            case impl.name of
-                                Node _ name ->
-                                    name
-
-                Node _ _ ->
-                    ""
+        Err _ ->
+            "err parse failed"
