@@ -58,6 +58,25 @@ run() {
 # read_expected <name> -> trims the trailing newline
 read_expected() { cat "$FIX/expected/$1.txt"; }
 
+# compile_error <name> <expected-substring>: asserts compilation emits
+# "err <message>" and that <message> contains the expected substring.  Used for
+# fixtures that must FAIL to compile (duplicate/unknown names, etc.) rather than
+# run through the value gate.
+compile_error() {
+  local name="$1" exp="$2"
+  node "$CDIR/run.js" "$FIX/$name.elm" "$OUT/$name.csexp" 2>/dev/null
+  local rc=$?
+  if [ $rc -ne 0 ]; then
+    echo "FAIL $name: node run.js rc=$rc"; fail=$((fail+1)); return
+  fi
+  local out
+  out=$(cat "$OUT/$name.csexp")
+  case "$out" in
+    err*"$exp"*) echo "PASS $name: $out"; pass=$((pass+1));;
+    *) echo "FAIL $name: expected err containing [$exp], got [$out]"; fail=$((fail+1));;
+  esac
+}
+
 run fib        fib        "$(read_expected fib)"        10
 run rtl1       main       "$(read_expected rtl1)"
 run rtl2       main       "$(read_expected rtl2)"
@@ -75,6 +94,9 @@ run subpartial main       "$(read_expected subpartial)"
 run overapply  main       "$(read_expected overapply)"
 run curry      main       "$(read_expected curry)"
 run opvalue    main       "$(read_expected opvalue)"
+run crossref   main       "$(read_expected crossref)"
+run selfqual   main       "$(read_expected selfqual)"
+compile_error dup         "duplicate top-level definition: f"
 
 rm -rf "$OUT"
 echo "=============================="

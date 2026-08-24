@@ -34,6 +34,7 @@ import Dict exposing (Dict)
 import Elm.Syntax.Declaration as Declaration exposing (Declaration(..))
 import Elm.Syntax.Expression as Expression exposing (Expression, Function)
 import Elm.Syntax.File as File
+import Elm.Syntax.Module as SyntaxModule
 import Elm.Syntax.Node as Node exposing (Node(..))
 import Elm.Syntax.Pattern as Pattern exposing (Pattern(..))
 import Lower.Expr as Expr
@@ -45,32 +46,97 @@ import Zinc.Emit as Emit exposing (Instr(..))
 compile : File.File -> Result String String
 compile file =
     let
-        funs =
-            List.filterMap asFunction file.declarations
-
-        globals =
-            Dict.fromList (List.map (\(name, _) -> ( name, arityOf name funs )) funs)
-
-        -- Build the base context once; each function entry gets its own scope.
-        baseCtx =
-            Expr.newContext globals
-
-        entryResult =
-            List.foldl (compileEntry baseCtx) (Ok []) funs
+        modName =
+            moduleNameOf file
     in
-    case entryResult of
+    collectFunctions file.declarations
+        |> Result.andThen (\funs ->
+            case findDuplicate (List.map Tuple.first funs) of
+                Just dup ->
+                    Err ("duplicate top-level definition: " ++ dup)
+
+                Nothing ->
+                    let
+                        globals =
+                            buildArityDict funs
+
+                        -- Build the base context once; each function entry gets
+                        -- its own scope.  The module name lets Expr resolve
+                        -- self-qualified references (Module.name) as globals.
+                        baseCtx =
+                            Expr.newContext modName globals
+
+                        entryResult =
+                            List.foldl (compileEntry baseCtx) (Ok []) funs
+                    in
+                    entryResult
+                        |> Result.map (\entries ->
+                            let
+                                wrapperEntries =
+                                    List.map wrapperEntry Expr.binaryPrims
+
+                                bundleEntries =
+                                    entries ++ wrapperEntries
+                            in
+                            Csexp.list bundleEntries
+                        )
+        )
+
+
+-- The current module's name (e.g. ["Fib"] for `module Fib exposing (..)`).
+-- Used by Expr name resolution to distinguish self-qualified references from
+-- foreign (imported) ones.
+moduleNameOf : File.File -> List String
+moduleNameOf file =
+    case file.moduleDefinition of
+        Node _ modDef ->
+            SyntaxModule.moduleName modDef
+
+
+-- Collect the top-level FunctionDeclarations as (name, Function) pairs.
+-- Non-function declarations are tolerated for now EXCEPT Port/Infix
+-- declarations, which the subset never supports (they error).  Alias/CustomType/
+-- Destructuring declarations are silently skipped (M2 implements them); if one
+-- of their names is referenced the existing "unknown name" error fires.
+collectFunctions : List (Node Declaration.Declaration) -> Result String (List ( String, Function ))
+collectFunctions decls =
+    List.foldr collectOne (Ok []) decls
+
+
+collectOne : Node Declaration.Declaration -> Result String (List ( String, Function )) -> Result String (List ( String, Function ))
+collectOne node acc =
+    case acc of
         Err msg ->
             Err msg
 
-        Ok entries ->
-            let
-                wrapperEntries =
-                    List.map wrapperEntry Expr.binaryPrims
+        Ok funs ->
+            case asFunction node of
+                Just f ->
+                    Ok (f :: funs)
 
-                bundleEntries =
-                    entries ++ wrapperEntries
-            in
-            Ok (Csexp.list bundleEntries)
+                Nothing ->
+                    case forbiddenDecl node of
+                        Just msg ->
+                            Err msg
+
+                        Nothing ->
+                            -- Alias/CustomType/Destructuring: tolerate silently.
+                            Ok funs
+
+
+-- Port/Infix declarations are never supported by the subset; everything else
+-- (Alias/CustomType/Destructuring) is tolerated (M2).
+forbiddenDecl : Node Declaration.Declaration -> Maybe String
+forbiddenDecl (Node _ decl) =
+    case decl of
+        PortDeclaration _ ->
+            Just "port declarations are not supported"
+
+        InfixDeclaration _ ->
+            Just "infix declarations are not supported"
+
+        _ ->
+            Nothing
 
 
 asFunction : Node Declaration.Declaration -> Maybe ( String, Function )
@@ -85,14 +151,35 @@ asFunction (Node _ decl) =
             Nothing
 
 
-arityOf : String -> List ( String, Function ) -> Int
-arityOf name funs =
-    case List.head (List.filter (\(n, _) -> n == name) funs) of
-        Just ( _, fn ) ->
-            functionArity fn
+-- Build the top-level global table (name -> source-arity) in ONE pass.
+-- Dict.fromList alone would silently overwrite on duplicate names, so
+-- duplicates are detected separately (findDuplicate) BEFORE this runs.
+buildArityDict : List ( String, Function ) -> Dict String Int
+buildArityDict funs =
+    List.foldl
+        (\( name, fn ) acc -> Dict.insert name (functionArity fn) acc)
+        Dict.empty
+        funs
+
+
+-- First duplicate name in the (ordered) function list, if any.
+findDuplicate : List String -> Maybe String
+findDuplicate names =
+    Tuple.second (List.foldl findDuplicateStep ( Dict.empty, Nothing ) names)
+
+
+findDuplicateStep : String -> ( Dict String (), Maybe String ) -> ( Dict String (), Maybe String )
+findDuplicateStep name ( seen, dup ) =
+    case dup of
+        Just _ ->
+            ( seen, dup )
 
         Nothing ->
-            0
+            if Dict.member name seen then
+                ( seen, Just name )
+
+            else
+                ( Dict.insert name () seen, Nothing )
 
 
 functionArity : Function -> Int

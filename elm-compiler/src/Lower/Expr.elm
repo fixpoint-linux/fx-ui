@@ -52,14 +52,16 @@ type Position
 
 
 type alias Context =
-    { scope : Scope.Scope
+    { moduleName : List String
+    , scope : Scope.Scope
     , globals : Dict String Int
     }
 
 
-newContext : Dict String Int -> Context
-newContext globals =
-    { scope = Scope.empty
+newContext : List String -> Dict String Int -> Context
+newContext moduleName globals =
+    { moduleName = moduleName
+    , scope = Scope.empty
     , globals = globals
     }
 
@@ -127,8 +129,8 @@ lowerExpression (Node range expr) pos ctx =
         ParenthesizedExpression inner ->
             lowerExpression inner pos ctx
 
-        FunctionOrValue _ name ->
-            functionOrValue name ctx
+        FunctionOrValue modName name ->
+            functionOrValue modName name ctx
 
         PrefixOperator op ->
             operatorValue op ctx
@@ -175,9 +177,21 @@ negation inner ctx =
                 |> Result.map (\code -> code ++ [ Number_ 0, Prim "-" ])
 
 
-functionOrValue : String -> Context -> Result String (List Instr)
-functionOrValue name ctx =
-    if name == "True" then
+functionOrValue : List String -> String -> Context -> Result String (List Instr)
+functionOrValue modName name ctx =
+    if not (List.isEmpty modName) then
+        -- A qualified reference can only denote a top-level global, never a
+        -- local.  If the qualifier is the current module it is a qualified
+        -- SELF-reference: resolve `name` against the globals table exactly as an
+        -- unqualified global (same const-thunk vs N-arg-closure logic).  Any
+        -- other qualifier is a foreign module, which M3 (imports) will handle.
+        if modName == ctx.moduleName then
+            resolveGlobal name ctx
+
+        else
+            Err ("imports/foreign modules are M3: " ++ String.join "." modName ++ "." ++ name)
+
+    else if name == "True" then
         Ok [ Boolean_ True ]
 
     else if name == "False" then
@@ -189,17 +203,25 @@ functionOrValue name ctx =
                 Ok [ Access idx ]
 
             Nothing ->
-                case Dict.get name ctx.globals of
-                    Just 0 ->
-                        -- 0-arg top-level constant: apply the thunk to get its value.
-                        Ok [ Pushmark, Global name, Apply ]
+                resolveGlobal name ctx
 
-                    Just _ ->
-                        -- N-arg function used as a value: load the closure.
-                        Ok [ Global name ]
 
-                    Nothing ->
-                        Err ("unknown name: " ++ name)
+-- Resolve an (unqualified or qualified-self) name against the top-level global
+-- table.  0-arg constants are thunks, so referencing them APPLIES the thunk to
+-- obtain the value; N-arg functions are curried closures loaded directly.
+resolveGlobal : String -> Context -> Result String (List Instr)
+resolveGlobal name ctx =
+    case Dict.get name ctx.globals of
+        Just 0 ->
+            -- 0-arg top-level constant: apply the thunk to get its value.
+            Ok [ Pushmark, Global name, Apply ]
+
+        Just _ ->
+            -- N-arg function used as a value: load the closure.
+            Ok [ Global name ]
+
+        Nothing ->
+            Err ("unknown name: " ++ name)
 
 
 operatorValue : String -> Context -> Result String (List Instr)
@@ -382,24 +404,32 @@ lowerArgs exprs ctx =
 calleeCode : Node Expression -> Context -> Result String (List Instr)
 calleeCode fn ctx =
     case fn of
-        Node _ (FunctionOrValue _ name) ->
-            case Scope.resolve name ctx.scope of
-                Just idx ->
-                    Ok [ Access idx ]
-
-                Nothing ->
-                    case Dict.get name ctx.globals of
-                        -- A 0-arg const used as a callee: first get its value
-                        -- (the thunk returns e.g. a partial/closure), the
-                        -- surrounding apply then feeds the args to that value.
-                        Just 0 ->
-                            Ok [ Pushmark, Global name, Apply ]
-
-                        _ ->
-                            Ok [ Global name ]
+        Node _ (FunctionOrValue modName name) ->
+            calleeFunctionOrValue modName name ctx
 
         _ ->
             lowerExpression fn NonTail ctx
+
+
+-- The callee side of name resolution mirrors functionOrValue: an unqualified
+-- name checks local scope first, then the global table; a qualified name must
+-- be a self-qualified global (foreign modules are M3).
+calleeFunctionOrValue : List String -> String -> Context -> Result String (List Instr)
+calleeFunctionOrValue modName name ctx =
+    if not (List.isEmpty modName) then
+        if modName == ctx.moduleName then
+            resolveGlobal name ctx
+
+        else
+            Err ("imports/foreign modules are M3: " ++ String.join "." modName ++ "." ++ name)
+
+    else
+        case Scope.resolve name ctx.scope of
+            Just idx ->
+                Ok [ Access idx ]
+
+            Nothing ->
+                resolveGlobal name ctx
 
 
 lambdaExpr : Lambda -> Context -> Result String (List Instr)
