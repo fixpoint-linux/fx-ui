@@ -149,6 +149,19 @@ pub fn valLambda(
         const env_copy = g.allocArray(Value, len);
         @memcpy(env_copy[0..len], env_root.?[0..len]);
 
+        // Write barrier: if env_copy landed in old-gen and references
+        // the nursery, record it in the remembered set so the full
+        // collector scans it (same pattern as interp.zig env build).
+        if (g.inOldgen(@intFromPtr(env_copy))) {
+            var j: usize = 0;
+            while (j < len) : (j += 1) {
+                if (gc.scan.valueReferencesNursery(g, &env_copy[j])) {
+                    g.dirtyVectorsAdd(env_copy);
+                    break;
+                }
+            }
+        }
+
         v.payload.lambda.env = env_copy;
         v.payload.lambda.env_len = env_len;
         v.payload.lambda.code = code_root;
