@@ -1,2 +1,6 @@
 .zig-cache/
 zig-out/
+
+# elm-compiler build artifacts (regenerable via elm-compiler/build.sh)
+elm-compiler/elm-stuff/
+elm-compiler/compiler.js

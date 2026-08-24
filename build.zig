@@ -49,6 +49,14 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // ---- Shen ZINC VM module (src/vm.zig re-exports parser/interp/state) ----
+    const vm_mod = b.createModule(.{
+        .root_source_file = b.path("src/vm.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{ .{ .name = "gc", .module = gc_mod } },
+    });
+
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
     // to the module defined above, it's sometimes preferable to split business
@@ -97,6 +105,26 @@ pub fn build(b: *std.Build) void {
     // step). By default the install prefix is `zig-out/` but can be overridden
     // by passing `--prefix` or `-p`.
     b.installArtifact(exe);
+
+    // ---- `elmvm`: the M0 gate harness (tools/elmvm.zig) ----
+    // A CLI wrapper that loads a csexp bundle and runs one function, proving
+    // the ZINC VM parser/interp end-to-end before any Elm codegen exists.
+    const elmvm_mod = b.createModule(.{
+        .root_source_file = b.path("tools/elmvm.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "gc", .module = gc_mod },
+            .{ .name = "vm", .module = vm_mod },
+        },
+    });
+    const elmvm = b.addExecutable(.{
+        .name = "elmvm",
+        .root_module = elmvm_mod,
+    });
+    const elmvm_install = b.addInstallArtifact(elmvm, .{});
+    const elmvm_step = b.step("elmvm", "Build the elmvm gate harness");
+    elmvm_step.dependOn(&elmvm_install.step);
 
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
