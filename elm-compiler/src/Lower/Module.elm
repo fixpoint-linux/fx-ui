@@ -1,6 +1,7 @@
-module Lower.Module exposing (compile)
+module Lower.Module exposing (compileSources)
 
--- M1b/M1c/M2 module lowering: turn a parsed Elm File into a ZINC-csexp BUNDLE.
+-- M1b/M1c/M2/M3 module lowering: turn PARSED Elm source(s) into a ZINC-csexp
+-- BUNDLE.
 --
 -- For every top-level FunctionDeclaration (grouped by name; see below) we emit
 -- one bundle entry
@@ -11,18 +12,9 @@ module Lower.Module exposing (compile)
 -- the C/Zig VM).  The body is lowered in Tail position (its final call uses
 -- appterm) with the function's params in de Bruijn scope.
 --
--- M2 ADDS:
+-- M2 ADDITIONS:
 --   * CustomTypeDeclaration ctor DEFUNS.  Each value constructor (name, arity
---     n) becomes a bundle entry whose body builds
---
---         (tag . [a1..an])     via   n0 P emptylist  a[0:n]0 P cons ... @p tag
---
---     under RTL: param1 = access(n-1) .. param_n = access(0); the args list is
---     built by consing arg_n first so the front-to-back list is [a1..an]; @p
---     pops the args-list then the tag symbol -> (tag . argsList).  Nullary
---     ctors are 0-arg thunks (referenced via the existing `m g name p` apply).
---   * TOP-LEVEL GLOBALS are the union of function arities and ctor arities;
---     a ctor-vs-fn or ctor-vs-ctor name collision is a duplicate error.
+--     n) becomes a bundle entry whose body builds (@p tag argsList).
 --   * MULTI-CLAUSE / PATTERN-ARG FUNCTIONS are desugared: functions with the
 --     same name are grouped, and any group with >1 clause or a non-variable
 --     argument is rewritten (via Lower.Pattern.normalizeClauses) into a single
@@ -36,18 +28,67 @@ module Lower.Module exposing (compile)
 --
 --     ( [len:s]<op>.curried ( c ( r  a[1:n]0 a[1:n]1 P[..:s]<prim> v ) ) )
 --
--- where access 1 = 1st arg (param1), access 0 = 2nd arg (param2), and the prim
--- pops a1=TOP first, so we push param2 (access 0) then param1 (access 1).
+-- where access 1 = param1, access 0 = param2; the prim pops a1=TOP first, so
+-- we push param2 (access 0) then param1 (access 1).
 --
--- ARG CONVENTION (RTL): arguments are pushed right-to-left
--- (`m code(an)..code(a1)`), matching the elmvm gate harness which also pushes
--- command-line args RTL.  The VM pops them top-first into argbuf, so argbuf[0]
--- = first source arg (param1) = access(n-1).
+-- ARG CONVENTION (RTL): arguments are pushed right-to-left; param_i =
+-- access(n-i).
+--
+-- ============================================================
+--  M3 ADDITIONS: QUALIFIED KEYS + THE ALIAS TABLE + PRELUDE
+-- ============================================================
+--
+-- QUALIFIED GLOBAL KEYS.  Every function/constructor defun is keyed under its
+-- FULLY QUALIFIED dotted name "<Module>.<member>" (e.g. "Main.fib",
+-- "Prelude.map").  Name resolution (Lower.Expr) is ONE uniform rule over the
+-- joined token "Mod.member" (bare names are the empty module case):
+--
+--     local scope  ->  alias table  ->  globals membership  ->  error
+--
+-- The globals-membership step makes PLAIN `import Aux` (no exposing clause)
+-- work with ZERO registration: a qualified reference Aux.f simply checks
+-- whether "Aux.f" is in the merged table.
+--
+-- THE ALIAS TABLE (ctx.imports : List (token, globalKey)) replaces plan §6's
+-- generated-defun alias shims with pure compile-time rewriting — no alias
+-- defuns exist.  Rows come from four sources, built per module:
+--   1. PRIM DOT ALIASES: String.append -> "cn.curried", String.length ->
+--      "c-strlen.curried", String.slice -> "substring.curried" — dotted
+--      conveniences backed DIRECTLY by curried prim wrappers.
+--   2. PRELUDE ALIASES: the implicit `import Prelude exposing (..)` present
+--      in every module except the Prelude compilation itself (where they
+--      would self-shadow the definitions being lowered).
+--   3. USER IMPORTS: `import X exposing (a, T)` contributes bare-token rows
+--      x -> "X.a".  `exposing (..)` from a user module cannot be enumerated
+--      without a cross-module pass — use dotted refs or explicit lists
+--      (documented minimal-M3 limitation).
+--   4. SELF ROWS: a module's OWN exposed names map bare token -> qualified
+--      key (so the MAIN fixture regime keeps working after qualification).
+--
+-- MERGED VIEW / MULTI-SOURCE PIPELINE.  compile takes the LIST of sources;
+-- every module is parsed, all qualified arity tables are UNIONED, and each
+-- module is then lowered against the merged view (plus its own alias rows).
+-- Qualified keys are globally unique, so the union cannot collide; the
+-- per-module duplicate check keeps single-module hygiene.  The VM side
+-- tolerates repeated bundle keys anyway (tables.defunSet: later store wins)
+-- because identical prim-wrapper entries are emitted once per compilation
+-- unit (dedupe-by-overwrite).
+--
+-- PRELUDE AUTO-INJECTION lives in run.js/Main (sources ++ [preludeSource]) —
+-- here the Prelude is simply the last module in the list.  Gate runners find
+-- the entry function under its qualified key ("<Fix>.main").
+--
+-- DOTTED SYMBOLS ARE VM-SAFE: symbol atoms carry byte-length-prefixed RAW
+-- bytes (src/vm/parser.zig parseCsexpAtom) — "Prelude.map"/"cn.curried"
+-- intern as ordinary symbols, and defunGet compares raw bytes.
 
 import Dict exposing (Dict)
 import Elm.Syntax.Declaration as Declaration exposing (Declaration(..))
+import Elm.Syntax.Exposing as Exposing exposing (Exposing(..))
 import Elm.Syntax.Expression as Expression exposing (Expression, Function, FunctionImplementation)
 import Elm.Syntax.File as File
+import Elm.Parser
+import Elm.Syntax.Import as Import
 import Elm.Syntax.Module as SyntaxModule
 import Elm.Syntax.Node as Node exposing (Node(..))
 import Elm.Syntax.Pattern as Pattern exposing (Pattern(..))
@@ -60,59 +101,383 @@ import Zinc.Csexp as Csexp
 import Zinc.Emit as Emit exposing (Instr(..))
 
 
-compile : File.File -> Result String String
-compile file =
+preludeModuleName : List String
+preludeModuleName =
+    [ "Prelude" ]
+
+
+
+-- ============================ TOP-LEVEL API ============================
+-- compileSources : parse all sources, merge, lower each module, concatenate
+-- the per-module bundles into ONE bundle text.
+
+
+compileSources : List String -> Result String String
+compileSources sources =
+    parseAll sources
+        |> Result.andThen
+            (\files ->
+                let
+                    unitsResult =
+                        collectAll files
+                in
+                unitsResult
+                    |> Result.andThen
+                        (\units ->
+                            case mergedGlobals units of
+                                Err msg ->
+                                    Err msg
+
+                                Ok globals ->
+                                    -- Per-unit lowering against the MERGED
+                                    -- table; concatenation preserves any
+                                    -- order (keys are globally unique).
+                                    sequenceMaps (List.map (compileUnit globals) units)
+                                        |> Result.map (Csexp.list << List.concat)
+                        )
+            )
+
+
+parseAll : List String -> Result String (List File.File)
+parseAll sources =
+    sequenceMaps (List.map parseOne sources)
+
+
+parseOne : String -> Result String File.File
+parseOne source =
+    case Elm.Parser.parseToFile source of
+        Ok file ->
+            Ok file
+
+        Err _ ->
+            Err "parse failed"
+
+
+collectAll : List File.File -> Result String (List Unit)
+collectAll files =
+    sequenceMaps (List.map collectUnit files)
+
+
+-- One compilation unit: a module's lowering inputs + outputs.
+
+
+type alias Unit =
+    { moduleName : List String
+    , funs : List ( String, Function )
+    , ctors : List ( String, Int )
+    , file : File.File
+    }
+
+
+collectUnit : File.File -> Result String Unit
+collectUnit file =
     let
         modName =
             moduleNameOf file
     in
     collectFunctions file.declarations
-        |> Result.andThen (\funs ->
-            collectCtors file.declarations
-                |> Result.andThen (\ctors ->
-                    case findDuplicate (List.map Tuple.first funs ++ List.map Tuple.first ctors) of
-                        Just dup ->
-                            Err ("duplicate top-level definition: " ++ dup)
+        |> Result.andThen
+            (\funs ->
+                collectCtors file.declarations
+                    |> Result.map
+                        (\ctors ->
+                            { moduleName = modName
+                            , funs = funs
+                            , ctors = ctors
+                            , file = file
+                            }
+                        )
+            )
 
-                        Nothing ->
-                            let
-                                fnGlobals =
-                                    buildArityDict funs
 
-                                ctorGlobals =
-                                    Dict.fromList ctors
+-- Per-module duplicate check (ctor-vs-fn / ctor-vs-ctor collisions).
 
-                                -- Union (no collision: findDuplicate caught it above).
-                                globals =
-                                    Dict.union ctorGlobals fnGlobals
 
-                                baseCtx =
-                                    Expr.newContext modName globals
+mergedGlobals : List Unit -> Result String (Dict String Int)
+mergedGlobals units =
+    List.foldl mergeStep (Ok Dict.empty) units
 
-                                fnEntriesResult =
-                                    compileFuns baseCtx funs
-                            in
-                            fnEntriesResult
-                                |> Result.map (\fnEntries ->
-                                    let
-                                        ctorEntries =
-                                            List.map (ctorEntry baseCtx) ctors
 
-                                        wrapperEntries =
-                                            List.map wrapperEntry Expr.binaryPrims
+mergeStep : Unit -> Result String (Dict String Int) -> Result String (Dict String Int)
+mergeStep unit accResult =
+    case accResult of
+        Err msg ->
+            Err msg
 
-                                        bundleEntries =
-                                            fnEntries ++ ctorEntries ++ wrapperEntries
-                                    in
-                                    Csexp.list bundleEntries
-                                )
+        Ok acc ->
+            let
+                locals =
+                    List.map Tuple.first unit.funs ++ List.map Tuple.first unit.ctors
+            in
+            case findDuplicate locals of
+                Just dup ->
+                    Err
+                        ("duplicate top-level definition in "
+                            ++ String.join "." unit.moduleName
+                            ++ ": "
+                            ++ dup
+                        )
+
+                Nothing ->
+                    let
+                        fnsArity =
+                            List.map (\( nm, fn ) -> ( nm, functionArity fn )) unit.funs
+
+                        qualifiedPairs =
+                            List.map (\( n, ar ) -> ( qualify unit.moduleName n, ar ))
+                                (fnsArity ++ unit.ctors)
+                    in
+                    Ok (List.foldl (\( k, v ) d -> Dict.insert k v d) acc qualifiedPairs)
+
+
+-- Sequence a list of Results into a Result of a list (Ok-shortcircuiting).
+
+
+sequenceMaps : List (Result String a) -> Result String (List a)
+sequenceMaps results =
+    List.foldr (Result.map2 (::)) (Ok []) results
+
+
+
+-- ========================= UNIT COMPILATION =========================
+-- compileUnit lowers one collected module against the merged global view.
+
+
+compileUnit : Dict String Int -> Unit -> Result String (List String)
+compileUnit globals unit =
+    let
+        modName =
+            unit.moduleName
+
+        definedNames =
+            List.map Tuple.first unit.funs ++ List.map Tuple.first unit.ctors
+
+        exported =
+            exportedNames unit.file.moduleDefinition definedNames
+
+        aliasTable =
+            -- ORDER MATTERS (first-match-wins): SELF rows first — the
+            -- module's own definitions shadow everything (incl. prelude
+            -- names) — then user-import expose rows, then the implicit
+            -- prelude. prim-dot keys are dotted so can go last.
+            selfAliases modName exported
+                ++ importAliases unit.file.imports
+                ++ preludeAliasesFor modName
+                ++ primDotAliases
+
+        baseCtx =
+            Expr.newContext modName globals
+                |> Expr.withImport aliasTable
+    in
+    compileFuns baseCtx unit.funs
+        |> Result.map
+            (\fnEntries ->
+                let
+                    ctorEntries =
+                        List.map (ctorEntry modName) unit.ctors
+
+                    wrapperEntries =
+                        List.map wrapperEntry Expr.primWrappers
+                            ++ List.map unaryWrapperEntry Expr.unaryPrims
+                in
+                fnEntries ++ ctorEntries ++ wrapperEntries
+            )
+
+
+
+-- ======================= EXPORTS & ALIAS TABLE =======================
+
+
+selfAliases : List String -> List String -> List ( String, String )
+selfAliases modName exported =
+    List.map (\n -> ( n, qualify modName n )) exported
+
+
+preludeAliasesFor : List String -> List ( String, String )
+preludeAliasesFor modName =
+    if modName == preludeModuleName then
+        []
+
+    else
+        preludeTable
+
+
+-- The built-in `import Prelude exposing (..)` equivalent: bare short names
+-- plus the dotted stdlib spellings, mapping to Prelude's qualified globals.
+
+
+preludeTable : List ( String, String )
+preludeTable =
+    [ -- Basics-flavored values/functions
+      ( "not", "Prelude.not" )
+    , ( "identity", "Prelude.identity" )
+    , ( "always", "Prelude.always" )
+    , ( "min", "Prelude.min" )
+    , ( "max", "Prelude.max" )
+    , ( "clamp", "Prelude.clamp" )
+    , ( "compare", "Prelude.compare" )
+
+    -- Maybe / Result constructors + conveniences
+    , ( "Just", "Prelude.Just" )
+    , ( "Nothing", "Prelude.Nothing" )
+    , ( "Ok", "Prelude.Ok" )
+    , ( "Err", "Prelude.Err" )
+    , ( "LT", "Prelude.LT" )
+    , ( "EQ", "Prelude.EQ" )
+    , ( "GT", "Prelude.GT" )
+    , ( "maybeMap", "Prelude.maybeMap" )
+    , ( "maybeWithDefault", "Prelude.maybeWithDefault" )
+    , ( "resultMap", "Prelude.resultMap" )
+    , ( "resultWithDefault", "Prelude.resultWithDefault" )
+
+    -- List functions
+    , ( "map", "Prelude.map" )
+    , ( "filter", "Prelude.filter" )
+    , ( "foldl", "Prelude.foldl" )
+    , ( "foldr", "Prelude.foldr" )
+    , ( "length", "Prelude.length" )
+    , ( "sum", "Prelude.sum" )
+    , ( "reverse", "Prelude.reverse" )
+    , ( "append", "Prelude.append" )
+    , ( "head", "Prelude.head" )
+    , ( "tail", "Prelude.tail" )
+    , ( "isEmpty", "Prelude.isEmpty" )
+    , ( "singleton", "Prelude.singleton" )
+    ]
+        ++ dottedRows "List."
+            [ ( "map", "map" )
+            , ( "filter", "filter" )
+            , ( "foldl", "foldl" )
+            , ( "foldr", "foldr" )
+            , ( "length", "length" )
+            , ( "sum", "sum" )
+            , ( "reverse", "reverse" )
+            , ( "append", "append" )
+            , ( "head", "head" )
+            , ( "tail", "tail" )
+            , ( "isEmpty", "isEmpty" )
+            , ( "singleton", "singleton" )
+            ]
+        ++ dottedRows ""
+            [ ( "String.concat", "concat" )
+            , ( "String.join", "join" )
+            , ( "String.fromInt", "fromInt" )
+            ]
+
+
+dottedRows : String -> List ( String, String ) -> List ( String, String )
+dottedRows prefix rows =
+    List.map (\( d, short ) -> ( prefix ++ d, "Prelude." ++ short )) rows
+
+
+-- Dotted conveniences backed DIRECTLY by curried prim wrappers (see
+-- wrapperEntry): these beat indirection through Prelude functions.
+
+
+primDotAliases : List ( String, String )
+primDotAliases =
+    [ ( "String.append", Expr.wrapperGlobalName "cn" )
+    , ( "String.length", Expr.wrapperGlobalName "c-strlen" )
+    ]
+
+
+-- User imports -> bare-token alias rows (explicit exposing lists only).
+
+
+importAliases : List (Node Import.Import) -> List ( String, String )
+importAliases imports =
+    List.concatMap importAlias imports
+
+
+importAlias : Node Import.Import -> List ( String, String )
+importAlias (Node _ imp) =
+    let
+        target =
+            Node.value imp.moduleName
+
+        qualified n =
+            String.join "." (target ++ [ n ])
+    in
+    -- Plain `import X` / `import X as Y` need NO rows: qualified references
+    -- (X.f / Y.f — Y the alias spelling) resolve via globals-membership,
+    -- because dotted tokens are tried verbatim against the merged table.
+    -- (LIMITATION, fine for the M3 gate: `import X as Y exposing (..)`'s
+    -- bare names are not enumerable without a cross-module export pass.)
+    case imp.exposingList of
+        Just (Node _ exp) ->
+            case exp of
+                All _ ->
+                    -- Minimal-M3 limitation: unenumerable without a
+                    -- cross-module export pass (use explicit lists).
+                    []
+
+                Explicit items ->
+                    List.concatMap (exposeAlias qualified) items
+
+        Nothing ->
+            []
+
+
+exposeAlias : (String -> String) -> Node Exposing.TopLevelExpose -> List ( String, String )
+exposeAlias mkQualified (Node _ item) =
+    case item of
+        Exposing.InfixExpose _ ->
+            []
+
+        Exposing.FunctionExpose n ->
+            [ ( n, mkQualified n ) ]
+
+        Exposing.TypeOrAliasExpose n ->
+            [ ( n, mkQualified n ) ]
+
+        Exposing.TypeExpose { name } ->
+            -- Listed type: expose the type name bare; its constructors ride
+            -- along implicitly under the SAME spelling Elm uses for nullary
+            -- tags (minimal semantics: unknown names still error naturally).
+            [ ( name, mkQualified name ) ]
+
+
+-- The exported-name list of a module, honoring its exposing clause:
+--   exposing (..)        -> everything (functions + ctors)
+--   exposing (a, T(..))  -> filtered to what the module actually defines
+
+
+exportedNames : Node SyntaxModule.Module -> List String -> List String
+exportedNames (Node _ modDef) defined =
+    let
+        pick names =
+            List.filter (\n -> List.member n defined) names
+    in
+    case SyntaxModule.exposingList modDef of
+        All _ ->
+            defined
+
+        Explicit items ->
+            List.concatMap
+                (\(Node _ item) ->
+                    case item of
+                        Exposing.InfixExpose _ ->
+                            []
+
+                        Exposing.FunctionExpose n ->
+                            pick [ n ]
+
+                        Exposing.TypeOrAliasExpose n ->
+                            pick [ n ]
+
+                        Exposing.TypeExpose { name } ->
+                            pick [ name ]
                 )
-        )
+                items
 
 
--- The current module's name (e.g. ["Fib"] for `module Fib exposing (..)`).
--- Used by Expr name resolution to distinguish self-qualified references from
--- foreign (imported) ones.
+
+-- ==================== DECLARATION COLLECTION ====================
+-- collect the top-level FunctionDeclarations as (name, Function) pairs.
+-- Non-function declarations are tolerated for now EXCEPT Port/Infix
+-- declarations, which the subset never supports (they error).
+
+
 moduleNameOf : File.File -> List String
 moduleNameOf file =
     case file.moduleDefinition of
@@ -120,11 +485,6 @@ moduleNameOf file =
             SyntaxModule.moduleName modDef
 
 
--- Collect the top-level FunctionDeclarations as (name, Function) pairs.
--- Non-function declarations are tolerated for now EXCEPT Port/Infix
--- declarations, which the subset never supports (they error).  Alias/CustomType/
--- Destructuring declarations are silently skipped here (CustomType ctor defuns
--- are collected separately in collectCtors).
 collectFunctions : List (Node Declaration.Declaration) -> Result String (List ( String, Function ))
 collectFunctions decls =
     List.foldr collectOne (Ok []) decls
@@ -180,15 +540,13 @@ addCtor node acc =
             ( nodeString vc.name, List.length vc.arguments ) :: acc
 
 
--- Port/Infix declarations are never supported by the subset; everything else
--- (Alias/CustomType/Destructuring) is tolerated (M2).
 forbiddenDecl : Node Declaration.Declaration -> Maybe String
 forbiddenDecl (Node _ decl) =
     case decl of
-        PortDeclaration _ ->
+        Declaration.PortDeclaration _ ->
             Just "port declarations are not supported"
 
-        InfixDeclaration _ ->
+        Declaration.InfixDeclaration _ ->
             Just "infix declarations are not supported"
 
         _ ->
@@ -207,18 +565,15 @@ asFunction (Node _ decl) =
             Nothing
 
 
--- Build the top-level global table (name -> source-arity) in ONE pass.
--- Dict.fromList alone would silently overwrite on duplicate names, so
--- duplicates are detected separately (findDuplicate) BEFORE this runs.
-buildArityDict : List ( String, Function ) -> Dict String Int
-buildArityDict funs =
-    List.foldl
-        (\( name, fn ) acc -> Dict.insert name (functionArity fn) acc)
-        Dict.empty
-        funs
+qualify : List String -> String -> String
+qualify modName name =
+    String.join "." (modName ++ [ name ])
 
 
--- First duplicate name in the (ordered) name list, if any.
+
+-- ======================= COMPILATION CORE =======================
+
+
 findDuplicate : List String -> Maybe String
 findDuplicate names =
     Tuple.second (List.foldl findDuplicateStep ( Dict.empty, Nothing ) names)
@@ -245,9 +600,6 @@ functionArity fn =
             List.length impl.arguments
 
 
--- Group flat (name, Function) pairs by name, preserving first-occurrence group
--- order and within-group clause order.  A multi-clause Elm function is parsed
--- as several FunctionDeclarations sharing one name.
 groupByName : List ( String, Function ) -> List ( String, List Function )
 groupByName pairs =
     case pairs of
@@ -318,8 +670,6 @@ clauseOf fn =
             ( impl.arguments, impl.expression )
 
 
--- Build a single Function whose declaration carries the given variable args
--- and case body — the normal form normalizeClauses produces.
 synthesize : String -> List (Node Pattern.Pattern) -> Node Expression -> Function
 synthesize name args body =
     { documentation = Nothing
@@ -328,7 +678,6 @@ synthesize name args body =
     }
 
 
--- True iff every argument pattern is a variable (possibly parenthesized).
 allSimpleVarArgs : Function -> Bool
 allSimpleVarArgs fn =
     case fn.declaration of
@@ -358,19 +707,22 @@ compileOne baseCtx name fn =
                     patternNames impl.arguments
             in
             argNamesResult
-                |> Result.andThen (\argNames ->
-                    Expr.lowerExpression impl.expression Expr.Tail (withArgs baseCtx argNames)
-                        |> Result.map (\body ->
-                            let
-                                grabs =
-                                    List.repeat (List.length argNames - 1) Emit.Grab
+                |> Result.andThen
+                    (\argNames ->
+                        Expr.lowerExpression impl.expression Expr.Tail (withArgs baseCtx argNames)
+                            |> Result.map
+                                (\body ->
+                                    let
+                                        grabs =
+                                            List.repeat (List.length argNames - 1) Emit.Grab
 
-                                code =
-                                    [ Emit.Cur (grabs ++ body ++ [ Emit.Return ]) ]
-                            in
-                            Csexp.bundleEntry name (Emit.flatten (Emit.resolve code))
-                        )
-                )
+                                        code =
+                                            [ Emit.Cur (grabs ++ body ++ [ Emit.Return ]) ]
+                                    in
+                                    Csexp.bundleEntry (qualify baseCtx.moduleName name)
+                                        (Emit.flatten (Emit.resolve code))
+                                )
+                    )
 
 
 withArgs : Expr.Context -> List String -> Expr.Context
@@ -380,18 +732,13 @@ withArgs baseCtx argNames =
     { baseCtx | scope = List.foldl Scope.push baseCtx.scope argNames }
 
 
--- A value-constructor defun for a ctor of arity n:
---
---     ( [len:s]<name> ( c ( r^(n-1)  n0 P emptylist  a[0:n]0 P cons ... a[n-1:n]N P cons  s<name> P @p  v ) ) )
---
--- RTL: param1 = access(n-1) .. param_n = access(0).  The args list [a1..an] is
--- built front-to-back by consing arg_n (access 0) first, then arg_{n-1} (access
--- 1), ... so the cons chain is [a1, a2, ...] in source order.  @p pops the
--- args-list then the tag symbol -> (tag . argsList).  Nullary (n=0): no grabs,
--- body `n0 P emptylist s<name> P @p` — a 0-arg thunk (referenced via the
--- existing 0-arity `m g name p` apply path).
-ctorEntry : Expr.Context -> ( String, Int ) -> String
-ctorEntry _ ( name, n ) =
+-- A value-constructor defun for a ctor of arity n, keyed under the module's
+-- qualified name.  The @p TAG stays the BARE ctor name (that tag is the ADT
+-- runtime representation shared with patterns — Pattern.compilePattern tests
+-- Symbol tag).  Nullary (n=0): no grabs — a 0-arg thunk referenced via the
+-- existing 0-arity `m g name p` apply path.
+ctorEntry : List String -> ( String, Int ) -> String
+ctorEntry modName ( name, n ) =
     let
         grabs =
             List.repeat (n - 1) Emit.Grab
@@ -406,24 +753,46 @@ ctorEntry _ ( name, n ) =
         code =
             [ Emit.Cur (grabs ++ body ++ [ Emit.Return ]) ]
     in
-    Csexp.bundleEntry name (Emit.flatten (Emit.resolve code))
+    Csexp.bundleEntry (qualify modName name) (Emit.flatten (Emit.resolve code))
 
 
--- A 2-arg curried wrapper for a binary prim:  (c (r a[1:n]0 a[1:n]1 P p v)).
--- Under RTL, param1 = access(1), param2 = access(0).  The prim pops a1 = TOP
--- first and we need a1 = param1, so we push param2 (access 0) then param1
--- (access 1).
+-- A 2-arg curried wrapper for a binary prim, keyed "<prim>.curried".
+-- Identical duplicates across compilation units are harmless (defunSet:
+-- later store wins with byte-identical bodies).
 wrapperEntry : ( String, String ) -> String
-wrapperEntry ( op, prim ) =
+wrapperEntry ( _, prim ) =
     let
         name =
-            Expr.wrapperGlobalName op
+            Expr.wrapperGlobalName prim
 
         body =
             [ Emit.Access 0, Emit.Access 1, Emit.Prim prim, Emit.Return ]
 
         code =
             [ Emit.Cur (Emit.Grab :: body) ]
+    in
+    Csexp.bundleEntry name (Emit.flatten (Emit.resolve code))
+
+
+-- A 1-arg curried wrapper for a UNARY prim (`c-strlen`), keyed
+-- "c-strlen.curried".  ZERO grabs: a lone `r` in a closure body misbehaves on
+-- this VM — interp.zig's grab treats a mark-on-stack as "no more args", pops
+-- it and EXITS the run loop with acc = mark (not a clean partial-app return),
+-- so a full-arity call into `(r body)` returns garbage.  With zero grabs the
+-- N==0 apply path jumps straight into the body; access(0) reads back the one
+-- pushed arg.  (Binary wrappers stay healthy: their first grab consumes the
+-- mark, and single-grab AFTER that grab behaves.)
+unaryWrapperEntry : String -> String
+unaryWrapperEntry prim =
+    let
+        name =
+            Expr.wrapperGlobalName prim
+
+        body =
+            [ Emit.Access 0, Emit.Prim prim, Emit.Return ]
+
+        code =
+            [ Emit.Cur body ]
     in
     Csexp.bundleEntry name (Emit.flatten (Emit.resolve code))
 

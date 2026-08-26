@@ -3,7 +3,10 @@ module Lower.Expr exposing
     , Context
     , newContext
     , binaryPrims
+    , primWrappers
+    , unaryPrims
     , wrapperGlobalName
+    , withImport
     , lowerExpression
     )
 
@@ -56,6 +59,7 @@ type alias Context =
     { moduleName : List String
     , scope : Scope.Scope
     , globals : Dict String Int
+    , imports : List ( String, String )
     }
 
 
@@ -64,7 +68,57 @@ newContext moduleName globals =
     { moduleName = moduleName
     , scope = Scope.empty
     , globals = globals
+    , imports = []
     }
+
+
+-- Import resolution: a bare name is looked up in the alias table FIRST ( Elm
+-- semantics: imports shadow nothing local but win over the "unknown" error —
+-- and exposed Prelude names must rewrite to their qualified globals).  The
+-- table maps EXPOSED SHORT name -> GLOBAL key as registered by Lower.Module:
+--
+--   * Prelude entries:  ("map", "Prelude.map"), ("Just", "Prelude.Just") …
+--     (the Prelude module compiles under its own name; preludeName prefixes).
+--   * User-module entries: ("Aux.f", "Aux.f") for `import Aux` — the user's
+--     own module names cannot collide with it because Elm identifiers cannot
+--     contain `.`.
+withImport : List ( String, String ) -> Context -> Context
+withImport imports ctx =
+    { ctx | imports = imports }
+
+
+resolveImport : String -> List ( String, String ) -> Maybe String
+resolveImport name imports =
+    Maybe.map Tuple.second (listAssoc lookupPair name imports)
+
+
+lookupPair : String -> ( String, String ) -> Bool
+lookupPair a ( b, _ ) =
+    a == b
+
+
+listAssoc : (String -> a -> Bool) -> String -> List a -> Maybe a
+listAssoc pred key items =
+    case items of
+        [] ->
+            Nothing
+
+        item :: rest ->
+            if pred key item then
+                Just item
+
+            else
+                listAssoc pred key rest
+
+
+orElse : (() -> Maybe a) -> Maybe a -> Maybe a
+orElse f m =
+    case m of
+        Just v ->
+            Just v
+
+        Nothing ->
+            f ()
 
 
 -- Operator -> VM prim-name table.  Single source of truth for BOTH the inline
@@ -87,6 +141,23 @@ binaryPrims =
 wrapperGlobalName : String -> String
 wrapperGlobalName op =
     op ++ ".curried"
+
+
+-- Prims that additionally get a CURRIED WRAPPER usable as a value.
+-- Lower.Module emits one `<prim>.curried` wrapper global per row:
+--   * primWrappers -> 2-ARG wrapper `(c (r a[1:n]0 a[1:n]1 P<prim> v))`;
+--     covers every binary operator plus `cn` (source-order concat).
+--   * unaryPrims   -> 1-ARG wrapper `(c (r a[1:n]0 P<prim> v))`; c-strlen
+--     pops exactly ONE value, and a 2-arg wrapper would under-apply into a
+--     stray partial closure when called full-arity.
+primWrappers : List ( String, String )
+primWrappers =
+    binaryPrims ++ [ ( "", "cn" ) ]
+
+
+unaryPrims : List String
+unaryPrims =
+    [ "c-strlen" ]
 
 
 primOf : String -> Maybe String
@@ -118,6 +189,10 @@ lowerExpression (Node range expr) pos ctx =
         Literal str ->
             Ok [ String_ str ]
 
+        -- Strings are VM string VALUES (UTF-8 bytes); a Char lowers to its
+        -- 1-byte string when it fits Latin-1 (the VM byte-string model),
+        -- otherwise to its UTF-8 encoding (String.length counts code points,
+        -- byte LENGTHS are handled by utf8ByteLength at emission).
         CharLiteral c ->
             Ok [ String_ (String.fromChar c) ]
 
@@ -199,16 +274,15 @@ negation inner ctx =
 functionOrValue : List String -> String -> Context -> Result String (List Instr)
 functionOrValue modName name ctx =
     if not (List.isEmpty modName) then
-        -- A qualified reference can only denote a top-level global, never a
-        -- local.  If the qualifier is the current module it is a qualified
-        -- SELF-reference: resolve `name` against the globals table exactly as an
-        -- unqualified global (same const-thunk vs N-arg-closure logic).  Any
-        -- other qualifier is a foreign module, which M3 (imports) will handle.
+        -- Qualified reference: resolve over the joined token "Mod.member".
+        -- A SELF-qualified ref (Mod == current module) resolves directly;
+        -- other dotted tokens go through the unified resolution order (which
+        -- tries aliases first, then plain globals-membership).
         if modName == ctx.moduleName then
-            resolveGlobal name ctx
+            resolveGlobal (String.join "." (modName ++ [ name ])) ctx
 
         else
-            Err ("imports/foreign modules are M3: " ++ String.join "." modName ++ "." ++ name)
+            resolveName (String.join "." (modName ++ [ name ])) ctx
 
     else if name == "True" then
         Ok [ Boolean_ True ]
@@ -217,12 +291,79 @@ functionOrValue modName name ctx =
         Ok [ Boolean_ False ]
 
     else
+        -- Bare name: local scope first, then alias/global resolution.
         case Scope.resolve name ctx.scope of
             Just idx ->
                 Ok [ Access idx ]
 
             Nothing ->
-                resolveGlobal name ctx
+                resolveName name ctx
+
+
+-- THE UNIFIED NAME RESOLUTION ORDER for a reference token t (bare or dotted):
+--
+--   1. local scope            (bare names only — handled by callers, but a
+--                              dotted token can never be local, so re-check
+--                              here is harmless),
+--   2. the module's alias table rows EXACTLY (prim-dot conveniences,
+--      prelude rows, explicit import-expose rows, self-rows),
+--   3. raw globals MEMBERSHIP — makes plain `import Aux` + `Aux.f` work with
+--      zero registration; also covers self-qualified refs of foreign modules
+--      and bare names that ARE global keys.
+--   4. error "unknown name".
+resolveName : String -> Context -> Result String (List Instr)
+resolveName token ctx =
+    case Scope.resolve token ctx.scope of
+        Just idx ->
+            Ok [ Access idx ]
+
+        Nothing ->
+            let
+                -- Self-qualified spelling of a BARE token (dotted tokens pass
+                -- through unchanged): a module's own names always resolve.
+                qualified =
+                    String.join "." ctx.moduleName ++ "." ++ token
+
+                -- Resolve a token to its global KEY (alias rows first, then
+                -- raw table membership), then emit by the KEY'S OWN ARITY —
+                -- mandatory because an alias row hit says nothing about the
+                -- target being a 0-arg thunk (apply!) or a closure (load).
+                tryTok t =
+                    case resolveImport t ctx.imports of
+                        Just gkey ->
+                            Just (globalRefByKey gkey ctx)
+
+                        Nothing ->
+                            if Dict.member t ctx.globals then
+                                Just (globalRefByKey t ctx)
+
+                            else
+                                Nothing
+            in
+            case tryTok token of
+                Just code ->
+                    code
+
+                Nothing ->
+                    case tryTok qualified of
+                        Just code ->
+                            code
+
+                        Nothing ->
+                            Err ("unknown name: " ++ token)
+
+
+-- Emit the VALUE reference for a resolved global key: 0-arity entries are
+-- thunks and must be APPLIED; everything else (N-arg closures, prim-wrapper
+-- globals) loads directly.
+globalRefByKey : String -> Context -> Result String (List Instr)
+globalRefByKey name ctx =
+    case Dict.get name ctx.globals of
+        Just 0 ->
+            Ok [ Pushmark, Global name, Apply ]
+
+        _ ->
+            Ok [ Global name ]
 
 
 -- Resolve an (unqualified or qualified-self) name against the top-level global
@@ -264,6 +405,15 @@ operatorApplication range op left right ctx =
 
         "/=" ->
             notEqual range left right ctx
+
+        "::" ->
+            -- Cons sugar: `x :: xs` lowers exactly like a 2-arg cons
+            -- application (RTL prim args: xs pushed first).
+            lowerExpression right NonTail ctx
+                |> Result.andThen (\rcode ->
+                    lowerExpression left NonTail ctx
+                        |> Result.map (\lcode -> rcode ++ lcode ++ [ Prim "cons" ])
+                )
 
         _ ->
             case primOf op of
@@ -430,17 +580,17 @@ calleeCode fn ctx =
             lowerExpression fn NonTail ctx
 
 
--- The callee side of name resolution mirrors functionOrValue: an unqualified
--- name checks local scope first, then the global table; a qualified name must
--- be a self-qualified global (foreign modules are M3).
+-- The callee side of name resolution MIRRORS functionOrValue over the joined
+-- token (local scope, then alias rows, then globals membership; a
+-- current-module qualifier resolves straight against the merged table).
 calleeFunctionOrValue : List String -> String -> Context -> Result String (List Instr)
 calleeFunctionOrValue modName name ctx =
     if not (List.isEmpty modName) then
         if modName == ctx.moduleName then
-            resolveGlobal name ctx
+            resolveGlobal (String.join "." (modName ++ [ name ])) ctx
 
         else
-            Err ("imports/foreign modules are M3: " ++ String.join "." modName ++ "." ++ name)
+            resolveName (String.join "." (modName ++ [ name ])) ctx
 
     else
         case Scope.resolve name ctx.scope of
@@ -448,7 +598,7 @@ calleeFunctionOrValue modName name ctx =
                 Ok [ Access idx ]
 
             Nothing ->
-                resolveGlobal name ctx
+                resolveName name ctx
 
 
 lambdaExpr : Lambda -> Context -> Result String (List Instr)
@@ -885,9 +1035,6 @@ label range tag =
     tag ++ "_" ++ String.fromInt range.start.row ++ "_" ++ String.fromInt range.start.column
 
 
--- True iff a pattern is a variable (possibly parenthesized).  Used to decide
--- whether a lambda / let-function / let-destructuring can take the direct
--- binding fast path or must be desugared through the pattern compiler.
 isSimpleVarPattern : Node Pattern.Pattern -> Bool
 isSimpleVarPattern (Node _ pat) =
     case pat of
