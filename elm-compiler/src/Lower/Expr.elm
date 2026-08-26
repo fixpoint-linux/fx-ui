@@ -38,10 +38,11 @@ module Lower.Expr exposing
 -- inline full-arity `P <prim>` fast path.
 
 import Dict exposing (Dict)
-import Elm.Syntax.Expression as Expression exposing (Expression(..), Function, Lambda, LetBlock, LetDeclaration(..))
+import Elm.Syntax.Expression as Expression exposing (Expression(..), Function, Lambda, LetBlock, LetDeclaration(..), CaseBlock, Case)
 import Elm.Syntax.Node as Node exposing (Node(..))
 import Elm.Syntax.Pattern as Pattern exposing (Pattern(..))
 import Elm.Syntax.Range as Range exposing (Range)
+import Lower.Pattern as Pat
 import Lower.Scope as Scope
 import Zinc.Emit as Emit exposing (Instr(..), Target(..))
 
@@ -120,6 +121,9 @@ lowerExpression (Node range expr) pos ctx =
         CharLiteral c ->
             Ok [ String_ (String.fromChar c) ]
 
+        UnitExpr ->
+            Ok [ Symbol "()" ]
+
         Floatable _ ->
             Err "floats are not supported in the M1b subset"
 
@@ -152,6 +156,21 @@ lowerExpression (Node range expr) pos ctx =
 
         LetExpression block ->
             letExpr block pos ctx
+
+        CaseExpression block ->
+            lowerCase range block pos ctx
+
+        RecordExpr setters ->
+            recordExpr setters ctx
+
+        RecordAccess rec nameNode ->
+            recordAccess rec nameNode ctx
+
+        RecordAccessFunction name ->
+            recordAccessFunction name ctx
+
+        RecordUpdateExpression baseName updates ->
+            recordUpdate baseName updates ctx
 
         ListExpr es ->
             listExpr es ctx
@@ -434,7 +453,23 @@ calleeFunctionOrValue modName name ctx =
 
 lambdaExpr : Lambda -> Context -> Result String (List Instr)
 lambdaExpr lambda ctx =
-    patternNames lambda.args
+    -- A lambda whose arguments are all simple variables is compiled directly
+    -- (fast path).  A PATTERN lambda (\x::xs -> e, \(a,b) -> e, ...) is
+    -- desugared by normalizeClauses into a single fresh-variable argument whose
+    -- body is a `case` that re-matches the original patterns.
+    if List.all isSimpleVarPattern lambda.args then
+        emitLambda lambda.args lambda.expression ctx
+
+    else
+        Pat.normalizeClauses [ ( lambda.args, lambda.expression ) ]
+            |> Result.andThen (\( freshArgs, caseNode ) ->
+                emitLambda freshArgs caseNode ctx
+            )
+
+
+emitLambda : List (Node Pattern.Pattern) -> Node Expression -> Context -> Result String (List Instr)
+emitLambda argNodes bodyNode ctx =
+    patternNames argNodes
         |> Result.andThen (\argNames ->
             let
                 -- RTL arg convention: push param1 FIRST so it lands at the
@@ -447,7 +482,7 @@ lambdaExpr lambda ctx =
                 bodyCtx =
                     { ctx | scope = bodyScope }
             in
-            lowerExpression lambda.expression Tail bodyCtx
+            lowerExpression bodyNode Tail bodyCtx
                 |> Result.map (\body ->
                     let
                         grabs =
@@ -461,13 +496,13 @@ lambdaExpr lambda ctx =
 letExpr : LetBlock -> Position -> Context -> Result String (List Instr)
 letExpr block pos ctx =
     bindAll block.declarations ctx
-        |> Result.andThen (\(bcode, finalCtx) ->
+        |> Result.andThen (\(bcode, finalCtx, slots) ->
             lowerExpression block.expression pos finalCtx
                 |> Result.map (\bodyCode ->
                     let
                         endlets =
                             if pos == NonTail then
-                                List.repeat (List.length block.declarations) Endlet
+                                List.repeat slots Endlet
 
                             else
                                 []
@@ -477,35 +512,91 @@ letExpr block pos ctx =
         )
 
 
-bindAll : List (Node LetDeclaration) -> Context -> Result String ( List Instr, Context )
+-- bindAll : lower each declaration, threading the scope; returns the emitted
+-- code, the final context, and the NUMBER OF LET_ SLOTS pushed (used to emit
+-- the matching Endlets in NonTail).  A variable destructuring pushes 1 slot; a
+-- complex destructuring pushes 1 (scrutinee temp) + k (pattern bindings).
+bindAll : List (Node LetDeclaration) -> Context -> Result String ( List Instr, Context, Int )
 bindAll decls ctx =
     case decls of
         [] ->
-            Ok ( [], ctx )
+            Ok ( [], ctx, 0 )
 
         d :: rest ->
             bindOne d ctx
-                |> Result.andThen (\(code, newCtx) ->
+                |> Result.andThen (\(code, newCtx, slots) ->
                     bindAll rest newCtx
-                        |> Result.map (\(codes, finalCtx) -> ( code ++ codes, finalCtx ))
+                        |> Result.map (\(codes, finalCtx, moreSlots) -> ( code ++ codes, finalCtx, slots + moreSlots ))
                 )
 
 
-bindOne : Node LetDeclaration -> Context -> Result String ( List Instr, Context )
+bindOne : Node LetDeclaration -> Context -> Result String ( List Instr, Context, Int )
 bindOne (Node _ decl) ctx =
     case decl of
         LetDestructuring patNode eNode ->
-            patternName patNode
-                |> Result.andThen (\name ->
-                    lowerExpression eNode NonTail ctx
-                        |> Result.map (\code -> ( code ++ [ Let_ ], { ctx | scope = Scope.push name ctx.scope } ))
-                )
+            -- A let-destructuring to a VARIABLE is a plain binding.  A
+            -- let-destructuring to a COMPLEX pattern (`let (a,b) = e in ...`)
+            -- is desugared into a case over the value (see bindDestructuring).
+            if isSimpleVarPattern patNode then
+                patternName patNode
+                    |> Result.andThen (\name ->
+                        lowerExpression eNode NonTail ctx
+                            |> Result.map (\code -> ( code ++ [ Let_ ], { ctx | scope = Scope.push name ctx.scope }, 1 ))
+                    )
+
+            else
+                bindDestructuring patNode eNode ctx
 
         LetFunction fn ->
             lowerLetFunction fn ctx
 
 
-lowerLetFunction : Function -> Context -> Result String ( List Instr, Context )
+-- Desugar a complex-pattern let-binding (`let (a,b) = e in ...`) into a case:
+--
+--     let $t = e in case $t of (a,b) -> <rest>
+--
+-- We push ONE scrutinee temp slot (named "$case", never resolved by name), then
+-- the pattern's tests + bindings (each binding Let_s one slot, reading the
+-- scrutinee at the running slot index).  The failure path throws (Elm requires
+-- exhaustive let patterns).  The block.expression runs AFTER these bindings
+-- (compiled by letExpr with the returned body scope), and letExpr emits the
+-- matching Endlets (1 temp + k bindings) via the returned slot count.
+bindDestructuring : Node Pattern.Pattern -> Node Expression -> Context -> Result String ( List Instr, Context, Int )
+bindDestructuring patNode eNode ctx =
+    lowerExpression eNode NonTail ctx
+        |> Result.andThen (\code ->
+            Pat.compilePattern ctx.moduleName patNode
+                |> Result.andThen (\{ tests, bindings } ->
+                    let
+                        scrutCtx =
+                            { ctx | scope = Scope.push "$case" ctx.scope }
+
+                        slots =
+                            1 + List.length bindings
+                    in
+                    compileBindings bindings 0
+                        |> Result.andThen (\(bindCode, boundNames) ->
+                            let
+                                bodyScope =
+                                    List.foldl Scope.push scrutCtx.scope boundNames
+                            in
+                            Ok
+                                ( code
+                                    ++ [ Let_ ]
+                                    ++ List.concatMap (\t -> t ++ [ Jmpf (TRef "let_bad") ]) tests
+                                    ++ [ Jmp (TRef "let_ok") ]
+                                    ++ [ Label_ "let_bad", String_ "non-exhaustive let pattern", Prim "simple-error" ]
+                                    ++ [ Label_ "let_ok" ]
+                                    ++ bindCode
+                                , { ctx | scope = bodyScope }
+                                , slots
+                                )
+                        )
+                )
+        )
+
+
+lowerLetFunction : Function -> Context -> Result String ( List Instr, Context, Int )
 lowerLetFunction fn ctx =
     case fn.declaration of
         Node _ impl ->
@@ -519,9 +610,9 @@ lowerLetFunction fn ctx =
                 -- the evaluated value directly (no Cur); references to `a` in
                 -- the body then Access the value.
                 lowerExpression impl.expression NonTail ctx
-                    |> Result.map (\code -> ( code ++ [ Let_ ], { ctx | scope = Scope.push name ctx.scope } ))
+                    |> Result.map (\code -> ( code ++ [ Let_ ], { ctx | scope = Scope.push name ctx.scope }, 1 ))
 
-            else
+            else if List.all isSimpleVarPattern impl.arguments then
                 patternNames impl.arguments
                     |> Result.andThen (\argNames ->
                         let
@@ -539,18 +630,209 @@ lowerLetFunction fn ctx =
                                 in
                                 ( [ Cur (grabs ++ body ++ [ Return ]), Let_ ]
                                 , { ctx | scope = Scope.push name ctx.scope }
+                                , 1
                                 )
                             )
                     )
+
+            else
+                -- A let-function with PATTERN arguments desugars to a
+                -- single-fresh-arg lambda whose body is a case (via
+                -- emitLambda), then binds the function name as usual.
+                Pat.normalizeClauses [ ( impl.arguments, impl.expression ) ]
+                    |> Result.andThen (\( freshArgs, caseNode ) ->
+                        emitLambda freshArgs caseNode ctx
+                            |> Result.map (\code -> ( code ++ [ Let_ ], { ctx | scope = Scope.push name ctx.scope }, 1 ))
+                    )
+
+
+-- CASE LOWERING (M2).  `case scrutinee of clauses`.
+--
+-- Emission:
+--     code(scrutinee) e <clause0> <clause1> ... S"non-exhaustive case" P simple-error Lend [d]
+--
+-- The scrutinee is pushed into ONE Let_ temp slot, named "$case" (contains `$`,
+-- illegal in Elm ids, so nested-case shadowing is harmless).  It is never
+-- resolved BY NAME — only by index — so the name is just a constant.  Each
+-- clause is: its pattern tests (source-order, first-match-wins via Jmpf
+-- fallthrough to the next clause), then its bindings (each pushed with Let_,
+-- reading the scrutinee temp via the running slot index), then the body.
+--
+-- ENDLET BALANCE (NonTail): per taken branch there are 1 (temp) + k_i
+-- (bindings) Let_s, so we emit exactly k_i Endlets right after that clause's
+-- body (before its Jmp endLabel) plus ONE trailing Endlet after endLabel for
+-- the temp.  In Tail position we emit ZERO Endlets: the appterm/tail-call frame
+-- reuse discards the temp + bindings naturally.  Clause bodies inherit `pos`,
+-- so a genuine tail call in a clause body emits Appterm.
+lowerCase : Range -> CaseBlock -> Position -> Context -> Result String (List Instr)
+lowerCase range block pos ctx =
+    let
+        endLabel =
+            label range "case_end"
+
+        scrutCtx =
+            { ctx | scope = Scope.push "$case" ctx.scope }
+    in
+    lowerExpression block.expression NonTail ctx
+        |> Result.andThen (\scrutCode ->
+            lowerClauses range (List.indexedMap Tuple.pair block.cases) endLabel pos scrutCtx
+                |> Result.map (\clauseCodes ->
+                    scrutCode
+                        ++ [ Let_ ]
+                        ++ List.concat clauseCodes
+                        ++ [ String_ "non-exhaustive case", Prim "simple-error", Label_ endLabel ]
+                        ++ (if pos == NonTail then [ Endlet ] else [])
+                )
+        )
+
+
+lowerClauses : Range -> List ( Int, Case ) -> String -> Position -> Context -> Result String (List (List Instr))
+lowerClauses caseRange indexed endLabel pos scrutCtx =
+    case indexed of
+        [] ->
+            Ok []
+
+        ( i, clause ) :: rest ->
+            lowerClause caseRange i clause endLabel pos scrutCtx
+                |> Result.andThen (\code ->
+                    lowerClauses caseRange rest endLabel pos scrutCtx
+                        |> Result.map (\codes -> code :: codes)
+                )
+
+
+lowerClause : Range -> Int -> Case -> String -> Position -> Context -> Result String (List Instr)
+lowerClause caseRange i ( patNode, bodyNode ) endLabel pos scrutCtx =
+    let
+        nextLabel =
+            labelIndex caseRange "case_next" i
+    in
+    Pat.compilePattern scrutCtx.moduleName patNode
+        |> Result.andThen (\{ tests, bindings } ->
+            let
+                testCode =
+                    -- Each test fails -> jump to the next clause.
+                    List.concatMap (\t -> t ++ [ Jmpf (TRef nextLabel) ]) tests
+            in
+            compileBindings bindings 0
+                |> Result.andThen (\(bindCode, boundNames) ->
+                    let
+                        bodyScope =
+                            List.foldl Scope.push scrutCtx.scope boundNames
+
+                        bodyCtx =
+                            { scrutCtx | scope = bodyScope }
+                    in
+                    lowerExpression bodyNode pos bodyCtx
+                        |> Result.map (\body ->
+                            testCode
+                                ++ bindCode
+                                ++ body
+                                ++ (if pos == NonTail then List.repeat (List.length boundNames) Endlet else [])
+                                ++ [ Jmp (TRef endLabel), Label_ nextLabel ]
+                        )
+                )
+        )
+
+
+-- Compile the pattern bindings: each binding k reads the scrutinee temp at
+-- slot k (each prior binding's Let_ pushed one slot), then pushes the bound
+-- value with its own Let_.  Returns (bindCode, boundNames in emission order).
+compileBindings : List Pat.Binding -> Int -> Result String ( List Instr, List String )
+compileBindings bindings idx =
+    case bindings of
+        [] ->
+            Ok ( [], [] )
+
+        ( name, path ) :: rest ->
+            compileBindings rest (idx + 1)
+                |> Result.map (\(restCode, restNames) ->
+                    ( Pat.pathInstrs path idx ++ [ Let_ ] ++ restCode
+                    , name :: restNames
+                    )
+                )
+
+
+-- RECORDS (M2): an assoc list of (fieldSymbol, value) cons pairs, built
+-- right-to-left so field j (source order) sits at head.
+--
+--   * construct `{f=e, g=h}`  -> n0 P emptylist, then per setter in REVERSE
+--     source order: code(e); Symbol f; P @p; P cons   (pair = @p of (f,e);
+--     cons prepends it onto the running assoc list).
+--   * access  `r.f`           -> code(r); Symbol f; P assoc; P snd
+--     (assoc pops key=LAST-pushed then list=FIRST-pushed; returns the matched
+--     PAIR, so snd extracts the value).
+--   * accessor `.f`           -> a 1-arg lambda \r -> r.f.
+--   * update  `{r | f=v}`     -> code(r); then per setter: code(v); Symbol f;
+--     P @p; P cons  (PREPEND-SHADOW: cons the new (f,v) pair onto r; assoc's
+--     first-match-wins makes it shadow any older same-field pair).
+recordExpr : List (Node Expression.RecordSetter) -> Context -> Result String (List Instr)
+recordExpr setters ctx =
+    List.foldl
+        (\setter acc ->
+            setterCode setter ctx
+                |> Result.andThen (\code -> acc |> Result.map (\codes -> codes ++ code))
+        )
+        (Ok [ Number_ 0, Prim "emptylist" ])
+        (List.reverse setters)
+
+
+setterCode : Node Expression.RecordSetter -> Context -> Result String (List Instr)
+setterCode (Node _ ( fieldNode, valNode )) ctx =
+    lowerExpression valNode NonTail ctx
+        |> Result.map (\code -> code ++ [ Symbol (nodeString fieldNode), Prim "@p", Prim "cons" ])
+
+
+recordAccess : Node Expression -> Node String -> Context -> Result String (List Instr)
+recordAccess rec nameNode ctx =
+    lowerExpression rec NonTail ctx
+        |> Result.map (\code -> code ++ [ Symbol (nodeString nameNode), Prim "assoc", Prim "snd" ])
+
+
+recordAccessFunction : String -> Context -> Result String (List Instr)
+recordAccessFunction name _ =
+    Ok [ Cur (Grab :: [ Access 0, Symbol name, Prim "assoc", Prim "snd" ] ++ [ Return ]) ]
+
+
+recordUpdate : Node String -> List (Node Expression.RecordSetter) -> Context -> Result String (List Instr)
+recordUpdate baseNode updates ctx =
+    let
+        baseName =
+            nodeString baseNode
+    in
+    resolveBaseRecord baseName ctx
+        |> Result.andThen (\baseCode ->
+            List.foldl
+                (\setter acc ->
+                    setterCode setter ctx
+                        |> Result.andThen (\code -> acc |> Result.map (\codes -> codes ++ code))
+                )
+                (Ok baseCode)
+                updates
+        )
+
+
+-- The base record of an update is a local variable (Elm requires `{r | ...}`
+-- where r is a name).  It cannot be a module global (Elm's type system forbids
+-- updating a module-level value), so a global here is a compile error.
+resolveBaseRecord : String -> Context -> Result String (List Instr)
+resolveBaseRecord name ctx =
+    case Scope.resolve name ctx.scope of
+        Just idx ->
+            Ok [ Access idx ]
+
+        Nothing ->
+            Err ("record update base must be a local variable: " ++ name)
+
+
+labelIndex : Range -> String -> Int -> String
+labelIndex range tag i =
+    label range tag ++ "_" ++ String.fromInt i
 
 
 listExpr : List (Node Expression) -> Context -> Result String (List Instr)
 listExpr es ctx =
     buildList es ctx
         |> Result.map (\codes -> [ Number_ 0, Prim "emptylist" ] ++ codes)
-
-
-buildList : List (Node Expression) -> Context -> Result String (List Instr)
 buildList es ctx =
     case es of
         [] ->
@@ -601,6 +883,22 @@ tupleCode es ctx =
 label : Range -> String -> String
 label range tag =
     tag ++ "_" ++ String.fromInt range.start.row ++ "_" ++ String.fromInt range.start.column
+
+
+-- True iff a pattern is a variable (possibly parenthesized).  Used to decide
+-- whether a lambda / let-function / let-destructuring can take the direct
+-- binding fast path or must be desugared through the pattern compiler.
+isSimpleVarPattern : Node Pattern.Pattern -> Bool
+isSimpleVarPattern (Node _ pat) =
+    case pat of
+        VarPattern _ ->
+            True
+
+        ParenthesizedPattern inner ->
+            isSimpleVarPattern inner
+
+        _ ->
+            False
 
 
 patternNames : List (Node Pattern.Pattern) -> Result String (List String)

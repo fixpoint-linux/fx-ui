@@ -1,8 +1,9 @@
 module Lower.Module exposing (compile)
 
--- M1b module lowering: turn a parsed Elm File into a ZINC-csexp BUNDLE.
+-- M1b/M1c/M2 module lowering: turn a parsed Elm File into a ZINC-csexp BUNDLE.
 --
--- For every top-level FunctionDeclaration we emit one bundle entry
+-- For every top-level FunctionDeclaration (grouped by name; see below) we emit
+-- one bundle entry
 --
 --     ( [len:s]<name> ( c ( r^(arity-1) <body> v ) ) )
 --
@@ -10,9 +11,24 @@ module Lower.Module exposing (compile)
 -- the C/Zig VM).  The body is lowered in Tail position (its final call uses
 -- appterm) with the function's params in de Bruijn scope.
 --
--- We also build the top-level global table (name -> source-arity) used by
--- Expr for name resolution (local scope -> module/global -> prim wrapper) and
--- for the 0-arg-const-vs-N-arg-function value distinction.
+-- M2 ADDS:
+--   * CustomTypeDeclaration ctor DEFUNS.  Each value constructor (name, arity
+--     n) becomes a bundle entry whose body builds
+--
+--         (tag . [a1..an])     via   n0 P emptylist  a[0:n]0 P cons ... @p tag
+--
+--     under RTL: param1 = access(n-1) .. param_n = access(0); the args list is
+--     built by consing arg_n first so the front-to-back list is [a1..an]; @p
+--     pops the args-list then the tag symbol -> (tag . argsList).  Nullary
+--     ctors are 0-arg thunks (referenced via the existing `m g name p` apply).
+--   * TOP-LEVEL GLOBALS are the union of function arities and ctor arities;
+--     a ctor-vs-fn or ctor-vs-ctor name collision is a duplicate error.
+--   * MULTI-CLAUSE / PATTERN-ARG FUNCTIONS are desugared: functions with the
+--     same name are grouped, and any group with >1 clause or a non-variable
+--     argument is rewritten (via Lower.Pattern.normalizeClauses) into a single
+--     function of fresh variable args whose body is a `case` that re-matches
+--     the original patterns.  Single-clause all-variable functions keep the
+--     fast path.
 --
 -- CURRIED PRIM WRAPPERS: the VM prim apply branch is NOT curried, so every
 -- binary operator usable as a value or partially applied gets a curried
@@ -22,8 +38,6 @@ module Lower.Module exposing (compile)
 --
 -- where access 1 = 1st arg (param1), access 0 = 2nd arg (param2), and the prim
 -- pops a1=TOP first, so we push param2 (access 0) then param1 (access 1).
--- Source operator refs (`(+)`, `(+ 1)`) route through these wrappers; direct
--- `lhs OP rhs` keeps the inline full-arity `P <prim>` fast path in Expr.
 --
 -- ARG CONVENTION (RTL): arguments are pushed right-to-left
 -- (`m code(an)..code(a1)`), matching the elmvm gate harness which also pushes
@@ -32,12 +46,15 @@ module Lower.Module exposing (compile)
 
 import Dict exposing (Dict)
 import Elm.Syntax.Declaration as Declaration exposing (Declaration(..))
-import Elm.Syntax.Expression as Expression exposing (Expression, Function)
+import Elm.Syntax.Expression as Expression exposing (Expression, Function, FunctionImplementation)
 import Elm.Syntax.File as File
 import Elm.Syntax.Module as SyntaxModule
 import Elm.Syntax.Node as Node exposing (Node(..))
 import Elm.Syntax.Pattern as Pattern exposing (Pattern(..))
+import Elm.Syntax.Range as Range
+import Elm.Syntax.Type as Type
 import Lower.Expr as Expr
+import Lower.Pattern as Pat
 import Lower.Scope as Scope
 import Zinc.Csexp as Csexp
 import Zinc.Emit as Emit exposing (Instr(..))
@@ -51,35 +68,45 @@ compile file =
     in
     collectFunctions file.declarations
         |> Result.andThen (\funs ->
-            case findDuplicate (List.map Tuple.first funs) of
-                Just dup ->
-                    Err ("duplicate top-level definition: " ++ dup)
+            collectCtors file.declarations
+                |> Result.andThen (\ctors ->
+                    case findDuplicate (List.map Tuple.first funs ++ List.map Tuple.first ctors) of
+                        Just dup ->
+                            Err ("duplicate top-level definition: " ++ dup)
 
-                Nothing ->
-                    let
-                        globals =
-                            buildArityDict funs
-
-                        -- Build the base context once; each function entry gets
-                        -- its own scope.  The module name lets Expr resolve
-                        -- self-qualified references (Module.name) as globals.
-                        baseCtx =
-                            Expr.newContext modName globals
-
-                        entryResult =
-                            List.foldl (compileEntry baseCtx) (Ok []) funs
-                    in
-                    entryResult
-                        |> Result.map (\entries ->
+                        Nothing ->
                             let
-                                wrapperEntries =
-                                    List.map wrapperEntry Expr.binaryPrims
+                                fnGlobals =
+                                    buildArityDict funs
 
-                                bundleEntries =
-                                    entries ++ wrapperEntries
+                                ctorGlobals =
+                                    Dict.fromList ctors
+
+                                -- Union (no collision: findDuplicate caught it above).
+                                globals =
+                                    Dict.union ctorGlobals fnGlobals
+
+                                baseCtx =
+                                    Expr.newContext modName globals
+
+                                fnEntriesResult =
+                                    compileFuns baseCtx funs
                             in
-                            Csexp.list bundleEntries
-                        )
+                            fnEntriesResult
+                                |> Result.map (\fnEntries ->
+                                    let
+                                        ctorEntries =
+                                            List.map (ctorEntry baseCtx) ctors
+
+                                        wrapperEntries =
+                                            List.map wrapperEntry Expr.binaryPrims
+
+                                        bundleEntries =
+                                            fnEntries ++ ctorEntries ++ wrapperEntries
+                                    in
+                                    Csexp.list bundleEntries
+                                )
+                )
         )
 
 
@@ -96,8 +123,8 @@ moduleNameOf file =
 -- Collect the top-level FunctionDeclarations as (name, Function) pairs.
 -- Non-function declarations are tolerated for now EXCEPT Port/Infix
 -- declarations, which the subset never supports (they error).  Alias/CustomType/
--- Destructuring declarations are silently skipped (M2 implements them); if one
--- of their names is referenced the existing "unknown name" error fires.
+-- Destructuring declarations are silently skipped here (CustomType ctor defuns
+-- are collected separately in collectCtors).
 collectFunctions : List (Node Declaration.Declaration) -> Result String (List ( String, Function ))
 collectFunctions decls =
     List.foldr collectOne (Ok []) decls
@@ -122,6 +149,35 @@ collectOne node acc =
                         Nothing ->
                             -- Alias/CustomType/Destructuring: tolerate silently.
                             Ok funs
+
+
+-- Collect the value constructors of every CustomTypeDeclaration as
+-- (name, arity) pairs.
+collectCtors : List (Node Declaration.Declaration) -> Result String (List ( String, Int ))
+collectCtors decls =
+    List.foldr collectCtorOne (Ok []) decls
+
+
+collectCtorOne : Node Declaration.Declaration -> Result String (List ( String, Int )) -> Result String (List ( String, Int ))
+collectCtorOne node acc =
+    case acc of
+        Err msg ->
+            Err msg
+
+        Ok ctors ->
+            case node of
+                Node _ (CustomTypeDeclaration typeDecl) ->
+                    Ok (List.foldl addCtor ctors typeDecl.constructors)
+
+                _ ->
+                    Ok ctors
+
+
+addCtor : Node Type.ValueConstructor -> List ( String, Int ) -> List ( String, Int )
+addCtor node acc =
+    case node of
+        Node _ vc ->
+            ( nodeString vc.name, List.length vc.arguments ) :: acc
 
 
 -- Port/Infix declarations are never supported by the subset; everything else
@@ -162,7 +218,7 @@ buildArityDict funs =
         funs
 
 
--- First duplicate name in the (ordered) function list, if any.
+-- First duplicate name in the (ordered) name list, if any.
 findDuplicate : List String -> Maybe String
 findDuplicate names =
     Tuple.second (List.foldl findDuplicateStep ( Dict.empty, Nothing ) names)
@@ -189,19 +245,108 @@ functionArity fn =
             List.length impl.arguments
 
 
-compileEntry : Expr.Context -> ( String, Function ) -> Result String (List String) -> Result String (List String)
-compileEntry baseCtx ( name, fn ) accResult =
+-- Group flat (name, Function) pairs by name, preserving first-occurrence group
+-- order and within-group clause order.  A multi-clause Elm function is parsed
+-- as several FunctionDeclarations sharing one name.
+groupByName : List ( String, Function ) -> List ( String, List Function )
+groupByName pairs =
+    case pairs of
+        [] ->
+            []
+
+        ( name, fn ) :: rest ->
+            let
+                ( same, others ) =
+                    List.partition (\( n, _ ) -> n == name) rest
+            in
+            ( name, fn :: List.map Tuple.second same ) :: groupByName others
+
+
+compileFuns : Expr.Context -> List ( String, Function ) -> Result String (List String)
+compileFuns baseCtx funs =
+    groupByName funs
+        |> List.foldl (compileGroup baseCtx) (Ok [])
+
+
+compileGroup : Expr.Context -> ( String, List Function ) -> Result String (List String) -> Result String (List String)
+compileGroup baseCtx ( name, funs ) accResult =
     case accResult of
         Err msg ->
             Err msg
 
         Ok acc ->
-            case compileOne baseCtx name fn of
+            case compileGroupOne baseCtx name funs of
                 Err msg ->
                     Err msg
 
                 Ok entry ->
                     Ok (acc ++ [ entry ])
+
+
+compileGroupOne : Expr.Context -> String -> List Function -> Result String String
+compileGroupOne baseCtx name funs =
+    case funs of
+        [ single ] ->
+            -- Fast path: single-clause, all-variable args.
+            if allSimpleVarArgs single then
+                compileOne baseCtx name single
+
+            else
+                desugarAndCompile baseCtx name funs
+
+        _ ->
+            -- Multi-clause function: desugar to a case.
+            desugarAndCompile baseCtx name funs
+
+
+desugarAndCompile : Expr.Context -> String -> List Function -> Result String String
+desugarAndCompile baseCtx name funs =
+    let
+        clauses =
+            List.map clauseOf funs
+    in
+    Pat.normalizeClauses clauses
+        |> Result.andThen (\( freshArgNodes, caseNode ) ->
+            compileOne baseCtx name (synthesize name freshArgNodes caseNode)
+        )
+
+
+clauseOf : Function -> ( List (Node Pattern.Pattern), Node Expression )
+clauseOf fn =
+    case fn.declaration of
+        Node _ impl ->
+            ( impl.arguments, impl.expression )
+
+
+-- Build a single Function whose declaration carries the given variable args
+-- and case body — the normal form normalizeClauses produces.
+synthesize : String -> List (Node Pattern.Pattern) -> Node Expression -> Function
+synthesize name args body =
+    { documentation = Nothing
+    , signature = Nothing
+    , declaration = Node (Node.range body) (FunctionImplementation (Node Range.empty name) args body)
+    }
+
+
+-- True iff every argument pattern is a variable (possibly parenthesized).
+allSimpleVarArgs : Function -> Bool
+allSimpleVarArgs fn =
+    case fn.declaration of
+        Node _ impl ->
+            List.all isSimpleVarPattern impl.arguments
+
+
+isSimpleVarPattern : Node Pattern.Pattern -> Bool
+isSimpleVarPattern (Node _ pat) =
+    case pat of
+        VarPattern _ ->
+            True
+
+        ParenthesizedPattern inner ->
+            isSimpleVarPattern inner
+
+        _ ->
+            False
 
 
 compileOne : Expr.Context -> String -> Function -> Result String String
@@ -233,6 +378,35 @@ withArgs baseCtx argNames =
     -- RTL arg convention: push param1 FIRST so it lands at the deepest slot
     -- access(n-1); param2 -> access(n-2), ..., param_n -> access(0).
     { baseCtx | scope = List.foldl Scope.push baseCtx.scope argNames }
+
+
+-- A value-constructor defun for a ctor of arity n:
+--
+--     ( [len:s]<name> ( c ( r^(n-1)  n0 P emptylist  a[0:n]0 P cons ... a[n-1:n]N P cons  s<name> P @p  v ) ) )
+--
+-- RTL: param1 = access(n-1) .. param_n = access(0).  The args list [a1..an] is
+-- built front-to-back by consing arg_n (access 0) first, then arg_{n-1} (access
+-- 1), ... so the cons chain is [a1, a2, ...] in source order.  @p pops the
+-- args-list then the tag symbol -> (tag . argsList).  Nullary (n=0): no grabs,
+-- body `n0 P emptylist s<name> P @p` — a 0-arg thunk (referenced via the
+-- existing 0-arity `m g name p` apply path).
+ctorEntry : Expr.Context -> ( String, Int ) -> String
+ctorEntry _ ( name, n ) =
+    let
+        grabs =
+            List.repeat (n - 1) Emit.Grab
+
+        argsList =
+            [ Emit.Number_ 0, Emit.Prim "emptylist" ]
+                ++ List.concatMap (\k -> [ Emit.Access k, Emit.Prim "cons" ]) (List.range 0 (n - 1))
+
+        body =
+            argsList ++ [ Emit.Symbol name, Emit.Prim "@p" ]
+
+        code =
+            [ Emit.Cur (grabs ++ body ++ [ Emit.Return ]) ]
+    in
+    Csexp.bundleEntry name (Emit.flatten (Emit.resolve code))
 
 
 -- A 2-arg curried wrapper for a binary prim:  (c (r a[1:n]0 a[1:n]1 P p v)).
