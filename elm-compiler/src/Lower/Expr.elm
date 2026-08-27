@@ -153,12 +153,12 @@ wrapperGlobalName op =
 --     stray partial closure when called full-arity.
 primWrappers : List ( String, String )
 primWrappers =
-    binaryPrims ++ [ ( "", "cn" ) ]
+    binaryPrims ++ [ ( "", "cn" ), ( "", "write-byte" ), ( "", "open" ) ]
 
 
 unaryPrims : List String
 unaryPrims =
-    [ "c-strlen" ]
+    [ "c-strlen", "read-byte", "read-file-as-string", "close", "shen.str->bytes", "shen.bytes->string" ]
 
 
 primOf : String -> Maybe String
@@ -301,7 +301,19 @@ functionOrValue modName name ctx =
                 Ok [ Access idx ]
 
             Nothing ->
-                resolveName name ctx
+                -- M6 stdin/stdout pseudo-globals: rewrite to the *stinput*/
+                -- *stoutput* value lookups (Symbol auto-pushes the var name,
+                -- Prim "value" pops it -> valueGet the stream).  This runs
+                -- AFTER the local-scope check so a local `stdin`/`stdout`
+                -- shadows the pseudo-global.
+                if name == "stdin" then
+                    Ok [ Symbol "*stinput*", Prim "value" ]
+
+                else if name == "stdout" then
+                    Ok [ Symbol "*stoutput*", Prim "value" ]
+
+                else
+                    resolveName name ctx
 
 
 -- THE UNIFIED NAME RESOLUTION ORDER for a reference token t (bare or dotted):
@@ -733,14 +745,26 @@ bindDestructuring patNode eNode ctx =
                             let
                                 bodyScope =
                                     List.foldl Scope.push scrutCtx.scope boundNames
+
+                                -- SITE-UNIQUE labels (same trick as lowerCase):
+                                -- a function can hold SEVERAL destructuring
+                                -- lets, and resolve's addressMap is
+                                -- last-wins — a fixed name would make every
+                                -- earlier site's let_ok/let_bad jump into the
+                                -- LAST site's code.
+                                badLabel =
+                                    label (Node.range patNode) "let_bad"
+
+                                okLabel =
+                                    label (Node.range patNode) "let_ok"
                             in
                             Ok
                                 ( code
                                     ++ [ Let_ ]
-                                    ++ List.concatMap (\t -> t ++ [ Jmpf (TRef "let_bad") ]) tests
-                                    ++ [ Jmp (TRef "let_ok") ]
-                                    ++ [ Label_ "let_bad", String_ "non-exhaustive let pattern", Prim "simple-error" ]
-                                    ++ [ Label_ "let_ok" ]
+                                    ++ List.concatMap (\t -> t ++ [ Jmpf (TRef badLabel) ]) tests
+                                    ++ [ Jmp (TRef okLabel) ]
+                                    ++ [ Label_ badLabel, String_ "non-exhaustive let pattern", Prim "simple-error" ]
+                                    ++ [ Label_ okLabel ]
                                     ++ bindCode
                                 , { ctx | scope = bodyScope }
                                 , slots

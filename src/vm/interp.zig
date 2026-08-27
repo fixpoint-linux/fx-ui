@@ -99,6 +99,18 @@ pub fn vaPush(g: *Gc, a: *types.ValueArray, v: Value) void {
         const new_data = g.allocArray(Value, @intCast(new_cap));
         const ln: usize = @intCast(a.len);
         @memcpy(new_data[0..ln], a.data.?[0..ln]);
+        // M5 fix: the grow copies the OLD elements into a possibly-oldgen
+        // array; barrier them (a copied nursery reference would otherwise go
+        // stale at the next scavenge).  Mirrors applyBundledN / interp apply.
+        if (g.inOldgen(@intFromPtr(new_data))) {
+            var j: usize = 0;
+            while (j < ln) : (j += 1) {
+                if (gc.scan.valueReferencesNursery(g, &a.data.?[j])) {
+                    g.dirtyVectorsAdd(new_data);
+                    break;
+                }
+            }
+        }
         a.data = new_data;
         a.cap = new_cap;
     }
@@ -159,7 +171,20 @@ pub fn envPush(g: *Gc, env: *?[*]Value, env_len: *i32, env_cap: *i32, v: Value) 
         defer guard.end();
         const new_env = g.allocArray(Value, @intCast(new_cap));
         const ln: usize = @intCast(env_len.*);
-        if (ln > 0) @memcpy(new_env[0..ln], env.*.?[0..ln]);
+        if (ln > 0) {
+            @memcpy(new_env[0..ln], env.*.?[0..ln]);
+            // M5 fix: barrier copied env elements on grow (same rationale as
+            // the vaPush grow barrier).
+            if (g.inOldgen(@intFromPtr(new_env))) {
+                var j: usize = 0;
+                while (j < ln) : (j += 1) {
+                    if (gc.scan.valueReferencesNursery(g, &env.*.?[j])) {
+                        g.dirtyVectorsAdd(new_env);
+                        break;
+                    }
+                }
+            }
+        }
         env.* = new_env;
         env_cap.* = new_cap;
     }

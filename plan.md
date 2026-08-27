@@ -28,10 +28,20 @@ reviewed safe-to-ship, committed.
   to vectors `[tag, a1..an]` (absvector + address->); records stay assoc lists;
   composed `main : Int` / `main : String` gate fixtures (mxint/mxstring). Gate 42/42,
   vm-test 78/78.
+- **M6** (I/O + effects runtime, first effects milestone): **DONE** — VM stream seam
+  ported (`src/vm/streams.zig`: write-byte/read-byte/read-file-as-string/open/close +
+  `Vm.streams` registry + real `*stinput*`/`*stoutput*`/`*sterror*` fds); a self-hosted
+  `Runtime.elm` message loop (a `Platform.worker`-style `init`/`update`/`Cmd` effects
+  model compiled by the compiler itself, like Prelude) + `Cmd`/`Sub` alias tables +
+  stdin/stdout pseudo-globals. Gate 45/45 (iofile file round-trip + ioecho stdin
+  echo-until-quit), vm-test 83/83. Also fixed a pre-existing label-collision bug in
+  `bindDestructuring` (site-unique `let_bad`/`let_ok`) and a GC grow-barrier gap in
+  `interp.zig` (byte-identical to shen's reference).
 
 Convention: this document numbers milestones **M1 … MX** where **MX is the terminal
 milestone** (the pure-core Elm runtime delivering `main -> value`). The compiler
-front-end is M1–M3; the runtime-completion work is M4–MX.
+front-end is M1–M3; the runtime-completion work is M4–MX, and the I/O/effects runtime
+(M6) is the first post-MX milestone.
 
 ---
 
@@ -299,7 +309,9 @@ wide-blast-radius on semantics, with subtle full-arity/RTL/auto-push correctness
 ## 11. Deliberate omissions / out of scope
 
 Not in the M1–MX pure-core path: process-execution primitives, `meta_repl`, `defun_freeze`
-perfect hash, stream I/O prims (`write-byte/read-byte/open/close` + `val_string_stream_in`),
-`eval-kl` + marshal layer, `symbol_static`, the trace facility, and a full I/O/effects
-runtime (`Platform`/`Cmd`/`Sub`). These are future milestones with named seams in the VM
-plan; MX deliberately stops at the **pure** `main -> value` runtime.
+perfect hash, `eval-kl` + marshal layer, `symbol_static`, the trace facility, and the
+asynchronous Kernel `Task`/effect-manager half of a full Elm runtime. The stream I/O prims
+(`write-byte/read-byte/read-file-as-string/open/close` + `val_string_stream_in`) and a
+minimal self-hosted `Platform`/`Cmd`/`Sub`-style effects runtime have landed in M6 (sync
+`src/vm` from `shen/zig` when porting the remaining deferred pieces). MX deliberately stops
+at the **pure** `main -> value` runtime.

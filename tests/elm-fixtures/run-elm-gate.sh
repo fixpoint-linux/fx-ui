@@ -14,6 +14,10 @@
 #   compiler -> elm-compiler/       (compiler.js built via build.sh)
 #   fixtures -> tests/elm-fixtures
 #
+# NOTE: M6's iofile fixture resolves input/hello.txt and out/hello.out RELATIVE
+# TO THE PROCESS CWD (the stream prims take plain paths), so the gate MUST be
+# started from the repo root.
+#
 # Exit code 0 iff every check passes.
 
 set -u
@@ -100,6 +104,32 @@ run2() {
   fi
 }
 
+# run_io <name> <fn> <expected> <stdin-file>
+#
+# Like run(), but elmvm's stdin is redirected from "$FIX/input/<stdin-file>"
+# instead of being inherited — the M6 stream-prims fixtures (Cmd.readLine via
+# read-byte on fd 0) consume stdin.  Still checks the printed FINAL MODEL.
+run_io() {
+  local name="$1" fn="$2" exp="$3" stdin="$4"
+  node "$CDIR/run.js" "$FIX/$name.elm" "$OUT/$name.csexp" 2>/dev/null
+  local rc=$?
+  if [ $rc -ne 0 ]; then
+    echo "FAIL $name: node run.js rc=$rc"; fail=$((fail+1)); return
+  fi
+  if head -c 4 "$OUT/$name.csexp" | grep -q '^err '; then
+    echo "FAIL $name: compile error: $(cat "$OUT/$name.csexp")"; fail=$((fail+1)); return
+  fi
+  local mod qname got
+  mod=$(module_name "$FIX/$name.elm")
+  qname="$mod.$fn"
+  got=$("$ELMVM" "$OUT/$name.csexp" "$qname" < "$FIX/input/$stdin" 2>&1)
+  if [ "$got" = "$exp" ]; then
+    echo "PASS $name ($qname < input/$stdin) -> $(echo "$got" | tail -1)"; pass=$((pass+1))
+  else
+    echo "FAIL $name ($qname < input/$stdin): exp[$exp] got[$got]"; fail=$((fail+1))
+  fi
+}
+
 # read_expected <name> -> trims the trailing newline
 read_expected() { cat "$FIX/expected/$1.txt"; }
 
@@ -167,6 +197,15 @@ run floatineq    main  "$(read_expected floatineq)"
 # --- MX: terminal pure-core composed programs (main : Int / String) ---
 run mxint     main   "$(read_expected mxint)"
 run mxstring  main   "$(read_expected mxstring)"
+# --- M6: I/O effects runtime (self-hosted Platform; stream prims) ---
+# iofile: RdFile round-trip — the final String model is printed (printValue
+# wraps it in quotes) AND the raw file is written to out/hello.out.
+run_io iofile  main   "$(read_expected iofile)" hello.txt
+cmp -s "$FIX/out/hello.out" "$FIX/expected/hello.out.txt" &&
+  { echo "PASS iofile out-file cmp"; pass=$((pass+1)); } ||
+  { echo "FAIL iofile out-file cmp: out/hello.out != expected/hello.out.txt"; fail=$((fail+1)); }
+# ioecho: readLine echo-until-quit — echoed lines + the final Int count.
+run_io ioecho  main   "$(read_expected ioecho)" echo.txt
 compile_error dup         "duplicate top-level definition in Dup: f"
 
 rm -rf "$OUT"

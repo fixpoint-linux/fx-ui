@@ -18,3 +18,4 @@ pub const tables = @import("vm/tables.zig");
 pub const parser = @import("vm/parser.zig");
 pub const interp = @import("vm/interp.zig");
 pub const prims = @import("vm/prims.zig");
+pub const streams = @import("vm/streams.zig");

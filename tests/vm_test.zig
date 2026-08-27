@@ -1538,6 +1538,16 @@ fn primExec(
     try std.testing.expectEqual(wm0, g.rootWatermark());
 }
 
+/// Build a GC string Value (used by the M6 stream-prim tests).
+fn strVal(g: *heap.Gc, s: []const u8) types.Value {
+    return values.valString(g, s);
+}
+
+/// Build a number Value (used by the M6 stream-prim tests).
+fn numVal(n: i64) types.Value {
+    return values.valNumber(n);
+}
+
 test "M5 zinctest 1,4,5,6: arithmetic +,-,*,/" {
     var g = try testInit();
     defer g.deinit();
@@ -2042,6 +2052,160 @@ test "M6 loadBundle: entry parsed, defun-registered, callable" {
 
     // Call it: pushmark + global + apply -> nargs 0 -> run the body -> 3.
     try expectRunNum(&g, &v, "(mmg[5:s]plus2p)", 3);
+}
+
+// =====================================================================
+//  M6 — stream I/O prims (streams.zig): string streams + file round-trip
+// =====================================================================
+
+/// The tmpDir is created under .zig-cache/tmp relative to the test's CWD;
+/// resolve its ABSOLUTE path so the prims (plain openat/read/write on the
+/// process cwd) can reach the fixture files.
+fn tmpAbsPath(
+    allocator: std.mem.Allocator,
+    tmp: *std.testing.TmpDir,
+    sub: []const u8,
+) ![]u8 {
+    const io = std.testing.io;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.parent_dir.realPathFile(io, tmp.sub_path[0..], &buf);
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ buf[0..n], sub });
+}
+
+test "M6 streams: string-stream read-byte round-trip then EOF then close" {
+    var g = try testInit();
+    defer g.deinit();
+    var v: state.Vm = undefined;
+    v.init(&g);
+    defer v.deinit();
+    var acc: types.Value = undefined;
+
+    // valStringStreamIn copies 'abc' into the registry; read-byte walks it.
+    const s = v.streams.valStringStreamIn(&g, "abc");
+    try std.testing.expectEqual(@as(i64, 1), s.payload.stream.is_string);
+    try primExec(&g, &v, "read-byte", &.{s}, &acc);
+    try std.testing.expectEqual(@as(i64, 'a'), acc.payload.number);
+    try primExec(&g, &v, "read-byte", &.{s}, &acc);
+    try std.testing.expectEqual(@as(i64, 'b'), acc.payload.number);
+    try primExec(&g, &v, "read-byte", &.{s}, &acc);
+    try std.testing.expectEqual(@as(i64, 'c'), acc.payload.number);
+    // Exhausted: -1 (C EOF parity), repeatedly.
+    try primExec(&g, &v, "read-byte", &.{s}, &acc);
+    try std.testing.expectEqual(@as(i64, -1), acc.payload.number);
+    try primExec(&g, &v, "read-byte", &.{s}, &acc);
+    try std.testing.expectEqual(@as(i64, -1), acc.payload.number);
+    // close frees the slot; a subsequent close of the SAME stale idx is a
+    // no-op (freeStringStream zeroes the slot but keeps n_string_streams, so
+    // the stale file ptr re-resolves to a freed-but-in-range slot -> nil).
+    try primExec(&g, &v, "close", &.{s}, &acc);
+    try std.testing.expectEqual(types.ValTag.nil, acc.tag);
+    try primExec(&g, &v, "close", &.{s}, &acc);
+    try std.testing.expectEqual(types.ValTag.nil, acc.tag);
+}
+
+test "M6 streams: read-file-as-string on a temp file" {
+    var g = try testInit();
+    defer g.deinit();
+    var v: state.Vm = undefined;
+    v.init(&g);
+    defer v.deinit();
+    var acc: types.Value = undefined;
+
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "probe.txt", .data = "hello\n" });
+    const path = try tmpAbsPath(std.testing.allocator, &tmp, "probe.txt");
+    defer std.testing.allocator.free(path);
+
+    try primExec(&g, &v, "read-file-as-string", &.{strVal(&g, path)}, &acc);
+    try std.testing.expectEqualStrings("hello\n", values.strSlice(acc));
+}
+
+test "M6 streams: open 'in' existing file -> file stream read-byte; ENOENT -> string stream of the PATH" {
+    var g = try testInit();
+    defer g.deinit();
+    var v: state.Vm = undefined;
+    v.init(&g);
+    defer v.deinit();
+    var acc: types.Value = undefined;
+
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "in.txt", .data = "Z!" });
+    const path = try tmpAbsPath(std.testing.allocator, &tmp, "in.txt");
+    defer std.testing.allocator.free(path);
+
+    // Existing path: a real FILE stream; read-byte pulls the first byte.
+    try primExec(&g, &v, "open", &.{ strVal(&g, path), strVal(&g, "in") }, &acc);
+    try std.testing.expectEqual(types.ValTag.stream, acc.tag);
+    try std.testing.expectEqual(@as(i64, 1), acc.payload.stream.is_input);
+    try std.testing.expectEqual(@as(i64, 0), acc.payload.stream.is_string);
+    try primExec(&g, &v, "read-byte", &.{acc}, &acc);
+    try std.testing.expectEqual(@as(i64, 'Z'), acc.payload.number);
+
+    // C quirk, ported: open 'in' on a MISSING path yields a STRING stream of
+    // the path bytes, and read-byte over it yields the path's first byte.
+    const missing = try std.fmt.allocPrint(std.testing.allocator, "{s}/nope.bin", .{path[0 .. path.len - "in.txt".len]});
+    defer std.testing.allocator.free(missing);
+    try primExec(&g, &v, "open", &.{ strVal(&g, missing), strVal(&g, "in") }, &acc);
+    try std.testing.expectEqual(@as(i64, 1), acc.payload.stream.is_string);
+    try primExec(&g, &v, "read-byte", &.{acc}, &acc);
+    try std.testing.expectEqual(@as(i64, missing[0]), acc.payload.number);
+}
+
+test "M6 streams: open 'out' write + close + read-file-as-string round-trip" {
+    var g = try testInit();
+    defer g.deinit();
+    var v: state.Vm = undefined;
+    v.init(&g);
+    defer v.deinit();
+    var acc: types.Value = undefined;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpAbsPath(std.testing.allocator, &tmp, "out.txt");
+    defer std.testing.allocator.free(path);
+
+    try primExec(&g, &v, "open", &.{ strVal(&g, path), strVal(&g, "out") }, &acc);
+    try std.testing.expectEqual(types.ValTag.stream, acc.tag);
+    try std.testing.expectEqual(@as(i64, 0), acc.payload.stream.is_input);
+    const s = acc;
+    // write-byte pops (byte, stream); returns the byte written.
+    try primExec(&g, &v, "write-byte", &.{ numVal('o'), s }, &acc);
+    try std.testing.expectEqual(@as(i64, 'o'), acc.payload.number);
+    try primExec(&g, &v, "write-byte", &.{ numVal('k'), s }, &acc);
+    try primExec(&g, &v, "write-byte", &.{ numVal('\n'), s }, &acc);
+    try primExec(&g, &v, "close", &.{s}, &acc);
+    try std.testing.expectEqual(types.ValTag.nil, acc.tag);
+
+    try primExec(&g, &v, "read-file-as-string", &.{strVal(&g, path)}, &acc);
+    try std.testing.expectEqualStrings("ok\n", values.strSlice(acc));
+}
+
+test "M6 streams: close returns nil for string and file streams" {
+    var g = try testInit();
+    defer g.deinit();
+    var v: state.Vm = undefined;
+    v.init(&g);
+    defer v.deinit();
+    var acc: types.Value = undefined;
+
+    // String stream: close frees the slot and returns nil.
+    const ss = v.streams.valStringStreamIn(&g, "abc");
+    try primExec(&g, &v, "close", &.{ss}, &acc);
+    try std.testing.expectEqual(types.ValTag.nil, acc.tag);
+
+    // File stream (temp file, 'out'): close returns nil.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmpAbsPath(std.testing.allocator, &tmp, "c.txt");
+    defer std.testing.allocator.free(path);
+    try primExec(&g, &v, "open", &.{ strVal(&g, path), strVal(&g, "out") }, &acc);
+    try std.testing.expectEqual(@as(i64, 0), acc.payload.stream.is_input);
+    try primExec(&g, &v, "close", &.{acc}, &acc);
+    try std.testing.expectEqual(types.ValTag.nil, acc.tag);
 }
 
 test "M6 loadBundle: keywords, streams, tables, primitive?-names" {

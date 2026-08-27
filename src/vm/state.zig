@@ -24,6 +24,7 @@ const symbols = @import("symbols.zig");
 const tables = @import("tables.zig");
 const values = @import("values.zig");
 const prims = @import("prims.zig");
+const streams = @import("streams.zig");
 const parser = @import("parser.zig");
 
 const Gc = gc.Gc;
@@ -80,6 +81,9 @@ pub const Vm = struct {
     /// C: zincvm.c:2565-2575 newvar — the static counter behind "V_N"
     /// (0-based, same never-reset contract).
     newvar_counter: u32 = 0,
+    /// M6 string-stream registry (streams.zig): fixed array of 8 slots + a
+    /// count, zero-initialized (`.{ }`), so a fresh Vm needs no setup.
+    streams: streams.StreamRegistry = .{},
 
     /// Initialize a Vm into `vm` (caller-provided storage so `&vm.err_slot` /
     /// `&vm.defun_table_cap` / `&vm.values_table_cap` stay stable across the
@@ -245,9 +249,11 @@ pub const Vm = struct {
         // Standard I/O stream variables (C:4057-4069): the bundled
         // stinput/stoutput closures read (value *stinput*) etc.;
         // shen.initialise-environment does not set them — the host must.
-        self.valueSet("*stinput*", values.valStreamIn(null));
-        self.valueSet("*stoutput*", values.valStreamOut(null));
-        self.valueSet("*sterror*", values.valStreamOut(null));
+        // M6: wire the REAL std fds 0/1/2 (the I/O milestone owns these) —
+        // stinput = fd 0 (stdin), stoutput = fd 1 (stdout), sterror = fd 2.
+        self.valueSet("*stinput*", streams.valStreamInFd(0));
+        self.valueSet("*stoutput*", streams.valStreamOutFd(1));
+        self.valueSet("*sterror*", streams.valStreamOutFd(2));
 
         // The metacircular interpreter's global-table / value-table vars
         // must start as empty alists (C:4075, 4081), not the bare symbol

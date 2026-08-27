@@ -28,7 +28,9 @@ const inputs = argv.slice(0, -1);
 
 const sources = inputs.map((p) => fs.readFileSync(p, 'utf8'));
 const prelude = fs.readFileSync(path.join(__dirname, 'src', 'Prelude.elm'), 'utf8');
+const runtime = fs.readFileSync(path.join(__dirname, 'src', 'Runtime.elm'), 'utf8');
 sources.push(prelude);
+sources.push(runtime);
 
 const { Elm } = require('./compiler.js');
 

@@ -5,3 +5,6 @@ zig-out/
 elm-compiler/elm-stuff/
 elm-compiler/compiler.js
 elm-compiler/test-compiler.js
+
+# elm-fixtures generated output (iofile test writes this each gate run)
+tests/elm-fixtures/out/hello.out

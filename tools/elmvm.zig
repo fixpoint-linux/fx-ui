@@ -22,6 +22,7 @@ const values = vm.values;
 const state = vm.state;
 const parser = vm.parser;
 const interp = vm.interp;
+const streams = vm.streams;
 
 const HEAP_BYTES: usize = 16 * 1024 * 1024;
 const RESERVE_BYTES: usize = 64 * 1024 * 1024;
@@ -60,6 +61,14 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("elmvm: bundle loaded 0 entries (bad bundle)\n", .{});
         return error.BadBundle;
     }
+
+    // ---- wire the standard I/O streams (M6) ----
+    // elmvm uses parseBundle directly (not Vm.loadBundle), so the *stinput*/
+    // *stoutput*/*sterror* value variables must be set here — the self-hosted
+    // runtime reads/writes fd 0/1/2 through them.
+    v.valueSet("*stinput*", streams.valStreamInFd(0));
+    v.valueSet("*stoutput*", streams.valStreamOutFd(1));
+    v.valueSet("*sterror*", streams.valStreamOutFd(2));
 
     // ---- build the call snippet: (m <arg atoms> g[len:s]fn p v) ----
     // Args are pushed RIGHT-TO-LEFT (reverse command-line order).  The VM's
@@ -116,6 +125,7 @@ pub fn main(init: std.process.Init) !void {
     g.rootPushPtr(@ptrCast(&code));
     const result = interp.vmExec(&v, @ptrCast(code.?), len) catch |e| {
         g.rootPop();
+        std.debug.print("elmvm: error: {s}\n", .{values.errSlice(v.err_slot)});
         return e;
     };
     g.rootPop();

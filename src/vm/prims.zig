@@ -10,9 +10,9 @@
 //! SCOPE (plan PRIMS deliverable — the pure subset of the ~70 prims.def
 //! entries): the INCLUDE list is the plan's exact list (hot list ops,
 //! arithmetic/comparison, predicates, strings+chars, vectors, control,
-//! tuples/symbols/misc).  DEFERRED to later milestones: stream I/O prims
-//! (write-byte/read-byte/read-file-as-string/open/close — I/O milestone),
-//! eval-kl (bundle/metacircular milestone).  OMITTED: the process subsystem
+//! tuples/symbols/misc), plus the M6 stream I/O prims (write-byte/read-byte/
+//! read-file-as-string/open/close).  DEFERRED to later milestones: eval-kl
+//! (bundle/metacircular milestone).  OMITTED: the process subsystem
 //! (exec-plan/wait/kill/cd/getcwd/getpid/getenv/setenv/glob) and the dead
 //! dispatch cases (length/nth/fail/stinput/stoutput — namespace-2 OS defuns,
 //! never reachable via a prims.def name).
@@ -38,6 +38,7 @@ const state = @import("state.zig");
 const values = @import("values.zig");
 const symbols = @import("symbols.zig");
 const interp = @import("interp.zig");
+const streams = @import("streams.zig");
 
 const Gc = gc.Gc;
 const Value = types.Value;
@@ -110,6 +111,12 @@ pub const prim_table = [_]PrimDef{
     .{ .name = "address->", .arity = 3, .func = primAddressSet },
     .{ .name = "<-address", .arity = 2, .func = primAddressGet },
     .{ .name = "emptylist", .arity = 1, .func = primEmptylist },
+    // ---- stream I/O (M6) ----
+    .{ .name = "write-byte", .arity = 2, .func = streams.primWriteByte },
+    .{ .name = "read-byte", .arity = 1, .func = streams.primReadByte },
+    .{ .name = "read-file-as-string", .arity = 1, .func = streams.primReadFileAsString },
+    .{ .name = "open", .arity = 2, .func = streams.primOpen },
+    .{ .name = "close", .arity = 1, .func = streams.primClose },
     // ---- control / eval ----
     .{ .name = "trap-error", .arity = 2, .func = primTrapError },
     .{ .name = "simple-error", .arity = 1, .func = primSimpleError },

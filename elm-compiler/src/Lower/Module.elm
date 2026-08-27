@@ -260,11 +260,15 @@ compileUnit globals unit =
             -- ORDER MATTERS (first-match-wins): SELF rows first — the
             -- module's own definitions shadow everything (incl. prelude
             -- names) — then user-import expose rows, then the implicit
-            -- prelude. prim-dot keys are dotted so can go last.
+            -- prelude. prim-dot keys are dotted so can go last.  M6 appends
+            -- the Platform.* conveniences (dotted) + the stream-prim bare
+            -- aliases (bare) after the prim-dot rows.
             selfAliases modName exported
                 ++ importAliases unit.file.imports
                 ++ preludeAliasesFor modName
                 ++ primDotAliases
+                ++ platformTable
+                ++ streamPrimAliases
 
         baseCtx =
             Expr.newContext modName globals
@@ -379,6 +383,40 @@ primDotAliases : List ( String, String )
 primDotAliases =
     [ ( "String.append", Expr.wrapperGlobalName "cn" )
     , ( "String.length", Expr.wrapperGlobalName "c-strlen" )
+    ]
+
+
+-- M6 Platform.* conveniences: dotted Elm spellings that rewrite to the
+-- self-hosted runtime's qualified globals (Runtime, the auto-injected
+-- self-hosted effects module — NOT elm/core's Platform, which would collide
+-- at `elm make` time).  Fixtures keep the real-Elm spellings `Platform.worker`
+-- / `Cmd.*` / `Sub.*` without importing anything (documented deviation).
+platformTable : List ( String, String )
+platformTable =
+    [ ( "Platform.worker", "Runtime.worker" )
+    , ( "Cmd.none", "Runtime.cmdNone" )
+    , ( "Cmd.batch", "Runtime.cmdBatch" )
+    , ( "Cmd.writeString", "Runtime.cmdWriteString" )
+    , ( "Cmd.readLine", "Runtime.cmdReadLine" )
+    , ( "Cmd.readFile", "Runtime.cmdReadFile" )
+    , ( "Cmd.writeFile", "Runtime.cmdWriteFile" )
+    , ( "Sub.none", "Runtime.subNone" )
+    ]
+
+
+-- M6 stream-prim bare aliases.  The VM prim names are hyphenated/arrowed
+-- ("write-byte", "shen.str->bytes") — NOT valid Elm identifiers — so the Elm
+-- surface spells them with valid names (writeByte, strToBytes, ...) that
+-- rewrite to the curried wrapper globals keyed "<prim>.curried".
+streamPrimAliases : List ( String, String )
+streamPrimAliases =
+    [ ( "writeByte", Expr.wrapperGlobalName "write-byte" )
+    , ( "readByte", Expr.wrapperGlobalName "read-byte" )
+    , ( "readFilePrim", Expr.wrapperGlobalName "read-file-as-string" )
+    , ( "open", Expr.wrapperGlobalName "open" )
+    , ( "close", Expr.wrapperGlobalName "close" )
+    , ( "strToBytes", Expr.wrapperGlobalName "shen.str->bytes" )
+    , ( "bytesToString", Expr.wrapperGlobalName "shen.bytes->string" )
     ]
 
 
