@@ -15,7 +15,7 @@
 0.16.0 (vm-test 67/67 in Debug+ReleaseSafe+ReleaseFast; `zig build test` clean),
 reviewed safe-to-ship, committed.
 
-**Thread 2 — Elm→ZINC-csexp compiler frontend (`elm-compiler/`): ACTIVE.**
+**Thread 2 — Elm→ZINC-csexp compiler frontend (`elm-compiler/`): DONE.**
 - **M0** (bootstrap + `tools/elmvm.zig` gate harness): DONE — proved the full
   `elm → csexp → elmvm → value` path.
 - **M1a** (emitter infrastructure): DONE — `Zinc/Csexp.elm`, `Zinc/Emit.elm`,
@@ -23,8 +23,11 @@ reviewed safe-to-ship, committed.
 - **M1b** (core expression lowering): **DONE** — `Lower/Expr.elm` + `Lower/Module.elm`,
   functional-core subset, prim curried-wrapper table, RTL/auto-push/tail-position.
 - **M1c** (module wiring): **DONE** — module name, qualified self-refs, dup detection,
-  one-pass arity. Gate 20/20 green (commits 4fcd832, 96f13f3). `Pattern.elm` still a
-  stub (M2). **Next resume point: M2.**
+  one-pass arity. Gate 20/20 green (commits 4fcd832, 96f13f3).
+- **MX** (terminal: pure-core runtime `main -> value`): **DONE** — ADT ctors hardened
+  to vectors `[tag, a1..an]` (absvector + address->); records stay assoc lists;
+  composed `main : Int` / `main : String` gate fixtures (mxint/mxstring). Gate 42/42,
+  vm-test 78/78.
 
 Convention: this document numbers milestones **M1 … MX** where **MX is the terminal
 milestone** (the pure-core Elm runtime delivering `main -> value`). The compiler
@@ -83,13 +86,15 @@ compute arity or reject partial application. **One** emission rule for all calls
 | `[]` / list | `n[1:n]0 P emptylist` / cons chain |
 | Tuple | `@p` right-nested (`(a,b)` → `code(b) code(a) P @p`) |
 | Record | `@p`(symbolFieldName, value) assoc list, right-to-left |
-| ADT / custom type | `@p`(tagSymbol, argsList); each ctor becomes a normal defun |
+| ADT / custom type | `vector[tagSymbol, a1..an]` (absvector + address->); each ctor becomes a normal defun |
 | `True`/`False` in patterns | `= b[4:b]true` / `= b[5:b]false` boolean-atom tests |
 
 **Caveats (document, don't fix):** `cons?` pattern tests also match `@p` values
 (structural, untyped — same as KLambda); wrong-arity calls through variables =
 silent garbage; no `Float` in the M1–M3 subset (M4 adds it); `++` forbidden
-(`String.append`/`List.append` instead).
+(`String.append`/`List.append` instead). Record update `{r|f=v}` PREPENDS a shadow
+pair, so `{r|f=v} == {f=v}` is FALSE when `r` already has `f` (assoc
+first-match-wins keeps ACCESS correct).
 
 ---
 
@@ -252,11 +257,11 @@ fx-ui/tests/elm-fixtures/*.elm + expected/*.txt + run-elm-gate.sh
   overload dispatch (the known untyped bite-point).
 - **Gate:** Float arithmetic end-to-end; mixed Int/Float behavior documented.
 
-### MX — terminal milestone: pure-core Elm runtime `main -> value`  *(tier: pro-coder)*
-- Records/custom-types hardening per the user's choice (vectors + tagged symbols) as the
-  high-fidelity representation (optional refinement over the M2 `@p` structural rep).
-- Full pure-core subset complete: all M1–M4 features composed; an end-to-end **gate on
-  real Elm programs** (`main : Int/String`), run through `elmvm`.
+### MX — terminal milestone: pure-core Elm runtime `main -> value`  *(tier: pro-coder; DONE)*
+- ADT/custom-types hardened to `vector[tag, a1..an]` (index 0 = tag Symbol, indices
+  1..n = args) via absvector + address->; records stay `@p` assoc lists (see §3).
+- Full pure-core subset composed: an end-to-end **gate on real Elm programs**
+  (`main : Int` = mxint, `main : String` = mxstring), run through `elmvm`.
 - Final consolidated review + docs; the runtime is the foundation for a later
   I/O/effects milestone (out of MX scope — pure core only).
 

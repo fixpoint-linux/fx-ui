@@ -38,8 +38,8 @@ module Prelude exposing
 -- over case-expressions, literals, arithmetic and comparisons only.
 --
 -- Representation notes:
---   * Maybe/Result/Order are ordinary ADTs (@p tag/argsList ctors generated
---     by the M2 constructor mechanism, registered under BOTH their bare and
+--   * Maybe/Result/Order are ordinary ADTs (vector[tag, a1..an] ctors generated
+--     by the ctor mechanism, registered under BOTH their bare and
 --     "Prelude."-qualified names).
 --   * Lists are VM cons chains; `x :: xs` sugar lowers through UnConsPattern /
 --     the cons emitter.

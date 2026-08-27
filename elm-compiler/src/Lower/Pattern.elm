@@ -21,7 +21,7 @@ module Lower.Pattern exposing
 --   * unit ()                     -> Symbol "()"
 --   * tuple (a,b)                 -> cons(a, cons(b, ...)) via @p
 --   * list [a,b]                  -> cons(a, cons(b, nil)) via cons
---   * ADT ctor (Tag a1..an)       -> cons(tag, [a1..an]) via @p tag argsList
+--   * ADT ctor (Tag a1..an)       -> vector[tag, a1..an] via absvector + address-> (index 0 = tag Symbol)
 --   * record { f = v, ... }       -> assoc list of (fieldSymbol, value) pairs
 --   * Bool True/False in patterns -> NamedPattern (no BoolPattern variant),
 --     so it is special-cased to a boolean `=` comparison.
@@ -38,6 +38,7 @@ type Step
     | SndStep
     | HdStep
     | TlStep
+    | IdxStep Int
 
 
 -- A value path locates a (sub-)value inside a scrutinee: walk a sequence of
@@ -67,8 +68,8 @@ compilePattern modName (Node _ pat) =
 
 
 -- go : moduleName -> pattern -> value path (relative to scrutinee root)
--- `readPath path = Access 0 :: stepInstrs path` emits a read of the value at
--- `path`, always from the scrutinee temp slot (index 0 in the caller's running
+-- `readPath path = emitRead 0 path` emits a read of the value at `path`,
+-- always from the scrutinee temp slot (index 0 in the caller's running
 -- indexing; the caller re-bases it via pathInstrs).
 go : List String -> Pattern.Pattern -> List Step -> Result String PatternResult
 go modName pat path =
@@ -220,23 +221,16 @@ namedPattern modName qref subs path =
             tag =
                 qref.name
 
-            m =
-                List.length subs
-
-            argConsTests =
-                List.range 0 (m - 1)
-                    |> List.map (\j -> readPath (path ++ [ SndStep ] ++ List.repeat j TlStep) ++ [ Prim "cons?" ])
-
-            emptyTest =
-                [ readPath (path ++ [ SndStep ] ++ List.repeat m TlStep) ++ [ Prim "empty?" ] ]
-
+            -- The absvector? guard MUST precede any <-address: a non-vector
+            -- scrutinee fails the clause cleanly via jmpf instead of crashing
+            -- <-address's unguarded index read.
             baseTests =
-                [ readPath path ++ [ Prim "cons?" ]
-                , readPath path ++ [ Prim "fst", Symbol tag, Prim "=" ]
+                [ readPath path ++ [ Prim "absvector?" ]
+                , readPath (path ++ [ IdxStep 0 ]) ++ [ Symbol tag, Prim "=" ]
                 ]
         in
-        recurseIndexed modName subs (\j -> path ++ [ SndStep ] ++ List.repeat j TlStep ++ [ HdStep ])
-            |> Result.map (\res -> { res | tests = baseTests ++ argConsTests ++ emptyTest ++ res.tests })
+        recurseIndexed modName subs (\j -> path ++ [ IdxStep (j + 1) ])
+            |> Result.map (\res -> { res | tests = baseTests ++ res.tests })
 
 
 mergeResults : PatternResult -> PatternResult -> PatternResult
@@ -248,8 +242,8 @@ mergeResults a b =
 
 -- Read the value at `path` from the scrutinee temp slot (Access 0).
 readPath : List Step -> List Instr
-readPath path =
-    Access 0 :: stepInstrs path
+readPath steps =
+    emitRead 0 steps
 
 
 -- Turn a ValuePath into instructions to load it, rooted at de Bruijn index
@@ -260,31 +254,44 @@ pathInstrs : ValuePath -> Int -> List Instr
 pathInstrs path idx =
     case path of
         VPath steps ->
-            Access idx :: stepInstrs steps
+            emitRead idx steps
 
         VField steps field ->
-            Access idx :: stepInstrs steps ++ [ Symbol field, Prim "assoc", Prim "snd" ]
+            emitRead idx steps ++ [ Symbol field, Prim "assoc", Prim "snd" ]
 
 
-stepInstrs : List Step -> List Instr
-stepInstrs steps =
-    List.concatMap stepInstr steps
+-- Emit a read of the value at `steps` from slot `idx` as ONE prefix/suffix
+-- stream.  Fst/Snd/Hd/Tl stay post-fix prims in the SUFFIX; IdxStep j pushes
+-- Number_ j into the PREFIX (before the Access) and emits `<-address` into the
+-- SUFFIX (after), so with nested vectors the indices stack deepest-first and
+-- each `<-address` dereferences after its index push.  `<-address` pops vec
+-- first then idx, so the index push must precede the vector push.
+emitRead : Int -> List Step -> List Instr
+emitRead idx steps =
+    let
+        ( prefix, suffix ) =
+            List.foldl collectStep ( [], [] ) steps
+    in
+    prefix ++ (Access idx :: suffix)
 
 
-stepInstr : Step -> List Instr
-stepInstr step =
+collectStep : Step -> ( List Instr, List Instr ) -> ( List Instr, List Instr )
+collectStep step ( prefix, suffix ) =
     case step of
         FstStep ->
-            [ Prim "fst" ]
+            ( prefix, suffix ++ [ Prim "fst" ] )
 
         SndStep ->
-            [ Prim "snd" ]
+            ( prefix, suffix ++ [ Prim "snd" ] )
 
         HdStep ->
-            [ Prim "hd" ]
+            ( prefix, suffix ++ [ Prim "hd" ] )
 
         TlStep ->
-            [ Prim "tl" ]
+            ( prefix, suffix ++ [ Prim "tl" ] )
+
+        IdxStep j ->
+            ( Number_ j :: prefix, suffix ++ [ Prim "<-address" ] )
 
 
 -- Desugar a list of (args, body) clauses (from a multi-clause / pattern-arg

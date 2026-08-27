@@ -14,7 +14,8 @@ module Lower.Module exposing (compileSources)
 --
 -- M2 ADDITIONS:
 --   * CustomTypeDeclaration ctor DEFUNS.  Each value constructor (name, arity
---     n) becomes a bundle entry whose body builds (@p tag argsList).
+--     n) becomes a bundle entry whose body builds a vector[tag, a1..an]
+--     (absvector + address->, the MX ADT rep).
 --   * MULTI-CLAUSE / PATTERN-ARG FUNCTIONS are desugared: functions with the
 --     same name are grouped, and any group with >1 clause or a non-variable
 --     argument is rewritten (via Lower.Pattern.normalizeClauses) into a single
@@ -733,22 +734,26 @@ withArgs baseCtx argNames =
 
 
 -- A value-constructor defun for a ctor of arity n, keyed under the module's
--- qualified name.  The @p TAG stays the BARE ctor name (that tag is the ADT
--- runtime representation shared with patterns — Pattern.compilePattern tests
--- Symbol tag).  Nullary (n=0): no grabs — a 0-arg thunk referenced via the
--- existing 0-arity `m g name p` apply path.
+-- qualified name.  The value is a VM VECTOR of size n+1 (the MX ADT rep):
+-- element 0 is the ctor tag Symbol (the BARE name, shared with patterns —
+-- Pattern.compilePattern tests Symbol tag), elements 1..n are the args in
+-- source order.  Construction pushes each (val, idx) pair root-first, then
+-- allocates the vector LAST (so it sits on top) and chains n+1 address-> stores
+-- (each pops vec/idx/val and re-pushes vec).  Nullary (n=0): vector[tag] of
+-- length 1, no grabs — a 0-arg thunk referenced via the existing 0-arity
+-- `m g name p` apply path.
 ctorEntry : List String -> ( String, Int ) -> String
 ctorEntry modName ( name, n ) =
     let
         grabs =
             List.repeat (n - 1) Emit.Grab
 
-        argsList =
-            [ Emit.Number_ 0, Emit.Prim "emptylist" ]
-                ++ List.concatMap (\k -> [ Emit.Access k, Emit.Prim "cons" ]) (List.range 0 (n - 1))
+        pushes =
+            [ Emit.Symbol name, Emit.Number_ 0 ]
+                ++ List.concatMap (\j -> [ Emit.Access (n - j), Emit.Number_ j ]) (List.range 1 n)
 
         body =
-            argsList ++ [ Emit.Symbol name, Emit.Prim "@p" ]
+            pushes ++ [ Emit.Number_ (n + 1), Emit.Prim "absvector" ] ++ List.repeat (n + 1) (Emit.Prim "address->")
 
         code =
             [ Emit.Cur (grabs ++ body ++ [ Emit.Return ]) ]

@@ -164,6 +164,9 @@ run floatcmp     main  "$(read_expected floatcmp)"
 run floatfun     area  "$(read_expected floatfun)"     2.0
 run floatpartial main  "$(read_expected floatpartial)"
 run floatineq    main  "$(read_expected floatineq)"
+# --- MX: terminal pure-core composed programs (main : Int / String) ---
+run mxint     main   "$(read_expected mxint)"
+run mxstring  main   "$(read_expected mxstring)"
 compile_error dup         "duplicate top-level definition in Dup: f"
 
 rm -rf "$OUT"
