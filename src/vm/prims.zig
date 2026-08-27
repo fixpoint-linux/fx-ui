@@ -74,6 +74,7 @@ pub const prim_table = [_]PrimDef{
     // ---- arithmetic + comparison ----
     .{ .name = "+", .arity = 2, .func = primAdd },
     .{ .name = "/", .arity = 2, .func = primDiv },
+    .{ .name = "f/", .arity = 2, .func = primFdiv },
     .{ .name = "*", .arity = 2, .func = primMul },
     .{ .name = "-", .arity = 2, .func = primSub },
     .{ .name = ">", .arity = 2, .func = primGt },
@@ -568,10 +569,11 @@ fn primNToString(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
 }
 
 /// C: zincvm.c:2339-2341 number?.
+/// M4: floats are numbers too (Elm `number?`/`isNumber` parity).
 fn primNumberP(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
     _ = vm;
     const a = interp.vaPop(stack);
-    acc.* = values.valBoolean(a.tag == .number);
+    acc.* = values.valBoolean(a.tag == .number or a.tag == .float);
 }
 
 /// C: zincvm.c:2343-2350 newvar (counter on Vm; pops a spurious arg).
@@ -678,6 +680,11 @@ fn primStr(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
         .number => {
             var buf: [64]u8 = undefined;
             const s = std.fmt.bufPrint(&buf, "{d}", .{a.payload.number}) catch unreachable;
+            acc.* = values.valString(g, s);
+        },
+        .float => {
+            var buf: [64]u8 = undefined;
+            const s = values.floatText(&buf, a.payload.float);
             acc.* = values.valString(g, s);
         },
         .boolean => acc.* = values.valString(
@@ -996,35 +1003,96 @@ fn primVariableP(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
 
 /// C: zincvm.c:2743-2746 + (wrapping — two's-complement, the behavior of
 /// the compiled C on every target we care about).
+///
+/// M4 runtime tag dispatch: (Int,Int) stays wrapping Int; any Float operand
+/// promotes Int->Float and computes in f64 (Elm numeric-literal polymorphism:
+/// 1 + 2.5 = 3.5).  Non-numeric operands throwShen (the guard replaces the
+/// C's silent union-field read on the untyped operand).
 fn primAdd(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
-    _ = vm;
     const a1 = interp.vaPop(stack);
     const a2 = interp.vaPop(stack);
-    acc.* = values.valNumber(a1.payload.number +% a2.payload.number);
+    if ((a1.tag == .float or a1.tag == .number) and
+        (a2.tag == .float or a2.tag == .number))
+    {
+        if (a1.tag == .float or a2.tag == .float) {
+            acc.* = values.valFloat(asFloat(a1) + asFloat(a2));
+        } else {
+            acc.* = values.valNumber(a1.payload.number +% a2.payload.number);
+        }
+    } else {
+        return vm.throwShen("attempt to apply arithmetic to a non-number");
+    }
 }
 
 /// C: zincvm.c:2748-2751 -.
 fn primSub(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
-    _ = vm;
     const a1 = interp.vaPop(stack);
     const a2 = interp.vaPop(stack);
-    acc.* = values.valNumber(a1.payload.number -% a2.payload.number);
+    if ((a1.tag == .float or a1.tag == .number) and
+        (a2.tag == .float or a2.tag == .number))
+    {
+        if (a1.tag == .float or a2.tag == .float) {
+            acc.* = values.valFloat(asFloat(a1) - asFloat(a2));
+        } else {
+            acc.* = values.valNumber(a1.payload.number -% a2.payload.number);
+        }
+    } else {
+        return vm.throwShen("attempt to apply arithmetic to a non-number");
+    }
 }
 
 /// C: zincvm.c:2753-2756 *.
 fn primMul(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
-    _ = vm;
     const a1 = interp.vaPop(stack);
     const a2 = interp.vaPop(stack);
-    acc.* = values.valNumber(a1.payload.number *% a2.payload.number);
+    if ((a1.tag == .float or a1.tag == .number) and
+        (a2.tag == .float or a2.tag == .number))
+    {
+        if (a1.tag == .float or a2.tag == .float) {
+            acc.* = values.valFloat(asFloat(a1) * asFloat(a2));
+        } else {
+            acc.* = values.valNumber(a1.payload.number *% a2.payload.number);
+        }
+    } else {
+        return vm.throwShen("attempt to apply arithmetic to a non-number");
+    }
 }
 
-/// C: zincvm.c:2758-2761 /.  Division by zero traps (C: SIGFPE; Zig: panic).
+/// C: zincvm.c:2758-2761 /.  Elm `//` — INT-only division (Elm splits integer
+/// `//` from float `/`; the latter is the separate `f/` prim).  Division by
+/// zero traps (C: SIGFPE; Zig: panic).
 fn primDiv(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
-    _ = vm;
     const a1 = interp.vaPop(stack);
     const a2 = interp.vaPop(stack);
-    acc.* = values.valNumber(@divTrunc(a1.payload.number, a2.payload.number));
+    if (a1.tag == .number and a2.tag == .number) {
+        acc.* = values.valNumber(@divTrunc(a1.payload.number, a2.payload.number));
+    } else {
+        return vm.throwShen("attempt to apply arithmetic to a non-number");
+    }
+}
+
+/// M4 `f/` — Elm `/`: ALWAYS f64 division, promoting Int->Float so 2 / 3 =
+/// 0.666... (and x / 0.0 = Infinity, matching Elm's float division).
+fn primFdiv(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
+    const a1 = interp.vaPop(stack);
+    const a2 = interp.vaPop(stack);
+    if ((a1.tag == .float or a1.tag == .number) and
+        (a2.tag == .float or a2.tag == .number))
+    {
+        acc.* = values.valFloat(asFloat(a1) / asFloat(a2));
+    } else {
+        return vm.throwShen("attempt to apply arithmetic to a non-number");
+    }
+}
+
+/// M4 numeric promote: a .number/.float Value as f64.  Callers guarantee the
+/// tag is numeric (see the dispatch guards in the arithmetic/comparison prims).
+fn asFloat(v: Value) f64 {
+    return switch (v.tag) {
+        .float => v.payload.float,
+        .number => @floatFromInt(v.payload.number),
+        else => unreachable,
+    };
 }
 
 // =====================================================================
@@ -1046,6 +1114,18 @@ fn primEq(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
         acc.* = values.valBoolean(std.mem.eql(u8, values.symSlice(a1), values.symSlice(a2)));
     } else if (a1.tag == .boolean and a2.tag == .boolean) {
         acc.* = values.valBoolean(a1.payload.boolean == a2.payload.boolean);
+    } else if ((a1.tag == .float or a1.tag == .number) and
+        (a2.tag == .float or a2.tag == .number))
+    {
+        // M4: promote Int/Float so = and /= treat 2 == 2.0 as true (Elm
+        // parity + consistency with the promoted < <= > >=).  The Int/Int
+        // branch above already handled both-number, so asFloat sees at least
+        // one .float here; both sides are numeric so else=>unreachable is
+        // unreached.  IEEE NaN!=NaN preserved.  NOTE: the review fix's
+        // literal `a1.tag == .float or a2.tag == .float` guard was widened
+        // to both-numeric so a float-vs-nonnumber mismatch (2.0 == "x")
+        // still falls through to false instead of panicking in asFloat.
+        acc.* = values.valBoolean(asFloat(a1) == asFloat(a2));
     } else if ((a1.tag == .cons and a2.tag == .symbol) or
         (a1.tag == .symbol and a2.tag == .cons))
     {
@@ -1064,12 +1144,23 @@ fn primEq(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
 }
 
 /// C: zincvm.c:2789-2792 <.
+/// M4 runtime tag dispatch: promote Int/Float across the comparison (2 < 2.5
+/// is true); non-numeric operands compare False (unchanged).
 fn primLt(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
     _ = vm;
     const a1 = interp.vaPop(stack);
     const a2 = interp.vaPop(stack);
-    acc.* = values.valBoolean(a1.tag == .number and a2.tag == .number and
-        a1.payload.number < a2.payload.number);
+    if ((a1.tag == .float or a1.tag == .number) and
+        (a2.tag == .float or a2.tag == .number))
+    {
+        if (a1.tag == .float or a2.tag == .float) {
+            acc.* = values.valBoolean(asFloat(a1) < asFloat(a2));
+        } else {
+            acc.* = values.valBoolean(a1.payload.number < a2.payload.number);
+        }
+    } else {
+        acc.* = values.valBoolean(false);
+    }
 }
 
 /// C: zincvm.c:2793-2796 <=.
@@ -1077,8 +1168,17 @@ fn primLe(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
     _ = vm;
     const a1 = interp.vaPop(stack);
     const a2 = interp.vaPop(stack);
-    acc.* = values.valBoolean(a1.tag == .number and a2.tag == .number and
-        a1.payload.number <= a2.payload.number);
+    if ((a1.tag == .float or a1.tag == .number) and
+        (a2.tag == .float or a2.tag == .number))
+    {
+        if (a1.tag == .float or a2.tag == .float) {
+            acc.* = values.valBoolean(asFloat(a1) <= asFloat(a2));
+        } else {
+            acc.* = values.valBoolean(a1.payload.number <= a2.payload.number);
+        }
+    } else {
+        acc.* = values.valBoolean(false);
+    }
 }
 
 /// C: zincvm.c:2797-2801 <-address (no bounds guard — parity crash).
@@ -1095,8 +1195,17 @@ fn primGt(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
     _ = vm;
     const a1 = interp.vaPop(stack);
     const a2 = interp.vaPop(stack);
-    acc.* = values.valBoolean(a1.tag == .number and a2.tag == .number and
-        a1.payload.number > a2.payload.number);
+    if ((a1.tag == .float or a1.tag == .number) and
+        (a2.tag == .float or a2.tag == .number))
+    {
+        if (a1.tag == .float or a2.tag == .float) {
+            acc.* = values.valBoolean(asFloat(a1) > asFloat(a2));
+        } else {
+            acc.* = values.valBoolean(a1.payload.number > a2.payload.number);
+        }
+    } else {
+        acc.* = values.valBoolean(false);
+    }
 }
 
 /// C: zincvm.c:2807-2810 >=.
@@ -1104,8 +1213,17 @@ fn primGe(vm: *Vm, acc: *Value, stack: *ValueArray) VmError!void {
     _ = vm;
     const a1 = interp.vaPop(stack);
     const a2 = interp.vaPop(stack);
-    acc.* = values.valBoolean(a1.tag == .number and a2.tag == .number and
-        a1.payload.number >= a2.payload.number);
+    if ((a1.tag == .float or a1.tag == .number) and
+        (a2.tag == .float or a2.tag == .number))
+    {
+        if (a1.tag == .float or a2.tag == .float) {
+            acc.* = values.valBoolean(asFloat(a1) >= asFloat(a2));
+        } else {
+            acc.* = values.valBoolean(a1.payload.number >= a2.payload.number);
+        }
+    } else {
+        acc.* = values.valBoolean(false);
+    }
 }
 
 // =====================================================================

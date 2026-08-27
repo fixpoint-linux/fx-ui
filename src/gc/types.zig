@@ -31,6 +31,7 @@ pub const ValTag = enum(u32) {
     error_ = 9, // VAL_ERROR (renamed; error is a Zig keyword)
     vector = 10, // VAL_VECTOR
     stream = 11, // VAL_STREAM
+    float = 12, // VAL_FLOAT (M4)
 
     pub fn char(self: ValTag) u8 {
         return switch (self) {
@@ -46,6 +47,7 @@ pub const ValTag = enum(u32) {
             .error_ => 'e',
             .vector => 'v',
             .stream => 's',
+            .float => 'F',
         };
     }
 };
@@ -75,6 +77,7 @@ pub const Value = extern struct {
             is_input: i32,
             is_string: i32,
         },
+        float: f64, // double (M4)
     },
 };
 
@@ -102,7 +105,8 @@ pub const Opcode = enum(u32) {
     symbol = 14, // OP_SYMBOL   's'
     boolean = 15, // OP_BOOLEAN  'b'
     prim = 16, // OP_PRIM     'P'
-    count = 17, // OP_COUNT (sentinel / char_to_opcode default)
+    float = 17, // OP_FLOAT    'F' (M4)
+    count = 18, // OP_COUNT (sentinel / char_to_opcode default)
 };
 
 /// C: zinctypes.h char_to_opcode — translate a csexp opcode character to the
@@ -126,6 +130,7 @@ pub fn charToOpcode(c: u8) Opcode {
         's' => .symbol,
         'b' => .boolean,
         'P' => .prim,
+        'F' => .float,
         else => .count,
     };
 }
@@ -151,6 +156,7 @@ pub fn opcodeToChar(op: Opcode) u8 {
         .symbol => 's',
         .boolean => 'b',
         .prim => 'P',
+        .float => 'F',
         .count => '?',
     };
 }

@@ -40,6 +40,11 @@ pub fn valNumber(n: i64) Value {
     return .{ .tag = .number, .payload = .{ .number = n } };
 }
 
+/// M4 val_float — an f64 literal (no GC allocation).
+pub fn valFloat(f: f64) Value {
+    return .{ .tag = .float, .payload = .{ .float = f } };
+}
+
 /// C: zincvm.c:270-273 val_boolean.
 pub fn valBoolean(b: bool) Value {
     return .{ .tag = .boolean, .payload = .{ .boolean = @intFromBool(b) } };
@@ -228,6 +233,27 @@ pub fn errSlice(v: Value) []const u8 {
 //  Printing — C: zincvm.c:383-404 print_value, 901-955 str_value
 // ---------------------------------------------------------------------
 
+/// M4 float renderer — Elm String.fromFloat parity: NaN/±Infinity as the
+/// canonical tokens, finite as Zig `{d}` shortest-round-trip decimal, with a
+/// trailing ".0" appended when the text has no '.'/'e'/'E' (so 2.0 prints
+/// "2.0", DISTINGUISHABLE from Int "2").  Returns either a static literal or a
+/// slice of `buf`; shared by printValue/strValue (and primStr via pub).
+pub fn floatText(buf: []u8, v: f64) []const u8 {
+    if (std.math.isNan(v)) return "NaN";
+    if (std.math.isPositiveInf(v)) return "Infinity";
+    if (std.math.isNegativeInf(v)) return "-Infinity";
+    const s = std.fmt.bufPrint(buf, "{d}", .{v}) catch unreachable;
+    if (std.mem.indexOfAny(u8, s, ".eE") == null) {
+        const n = s.len;
+        if (n + 2 <= buf.len) {
+            buf[n] = '.';
+            buf[n + 1] = '0';
+            return buf[0 .. n + 2];
+        }
+    }
+    return s;
+}
+
 /// C: zincvm.c:383-404 print_value — full printed form (cons as [cons X . Y]).
 /// `writer` is any `std.io` writer (anytype); testable without stdout.
 pub fn printValue(writer: anytype, v: Value) !void {
@@ -253,6 +279,10 @@ pub fn printValue(writer: anytype, v: Value) !void {
         .error_ => try writer.print("[error \"{s}\"]", .{errSlice(v)}),
         .vector => try writer.print("[vector {d}]", .{v.payload.vector.len}),
         .stream => try writer.print("[stream {s}]", .{if (v.payload.stream.is_input != 0) "in" else "out"}),
+        .float => {
+            var buf: [64]u8 = undefined;
+            try writer.writeAll(floatText(&buf, v.payload.float));
+        },
     }
 }
 
@@ -291,6 +321,10 @@ pub fn strValue(writer: anytype, v: Value, depth: u32) !void {
         .prim => try writer.print("<prim {s}>", .{primSlice(v)}),
         .vector => try writer.print("<vector {d}>", .{v.payload.vector.len}),
         .stream => try writer.writeAll("<stream>"),
+        .float => {
+            var buf: [64]u8 = undefined;
+            try writer.writeAll(floatText(&buf, v.payload.float));
+        },
         else => try writer.writeAll("<unknown>"),
     }
 }
@@ -311,6 +345,7 @@ pub fn deepEqual(a: Value, b: Value, depth: u32) bool {
             std.mem.eql(u8, strSlice(a), strSlice(b)),
         .symbol => return std.mem.eql(u8, symSlice(a), symSlice(b)),
         .boolean => return a.payload.boolean == b.payload.boolean,
+        .float => return a.payload.float == b.payload.float,
         .nil => return true,
         .cons => return deepEqual(a.payload.cons.car.?.*, b.payload.cons.car.?.*, depth + 1) and
             deepEqual(a.payload.cons.cdr.?.*, b.payload.cons.cdr.?.*, depth + 1),

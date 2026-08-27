@@ -130,6 +130,7 @@ binaryPrims =
     , ( "-", "-" )
     , ( "*", "*" )
     , ( "//", "/" )
+    , ( "/", "f/" )
     , ( "==", "=" )
     , ( "<", "<" )
     , ( "<=", "<=" )
@@ -199,8 +200,8 @@ lowerExpression (Node range expr) pos ctx =
         UnitExpr ->
             Ok [ Symbol "()" ]
 
-        Floatable _ ->
-            Err "floats are not supported in the M1b subset"
+        Floatable f ->
+            Ok [ Float_ f ]
 
         Negation inner ->
             negation inner ctx
@@ -265,6 +266,9 @@ negation inner ctx =
 
         Node _ (Hex n) ->
             Ok [ Number_ (-n) ]
+
+        Node _ (Floatable f) ->
+            Ok [ Float_ (-f) ]
 
         _ ->
             lowerExpression inner NonTail ctx

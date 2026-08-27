@@ -155,6 +155,15 @@ run shortcircuit main      "$(read_expected shortcircuit)"
 run biglist    main       "$(read_expected biglist)"
 run strings    main       "$(read_expected strings)"
 run2 multimod  auxlib     main       "$(read_expected multimod)"
+# --- M4: floats ---
+run floatlit     main  "$(read_expected floatlit)"
+run floatarith   main  "$(read_expected floatarith)"
+run floatdiv     main  "$(read_expected floatdiv)"
+run floatmix     main  "$(read_expected floatmix)"
+run floatcmp     main  "$(read_expected floatcmp)"
+run floatfun     area  "$(read_expected floatfun)"     2.0
+run floatpartial main  "$(read_expected floatpartial)"
+run floatineq    main  "$(read_expected floatineq)"
 compile_error dup         "duplicate top-level definition in Dup: f"
 
 rm -rf "$OUT"

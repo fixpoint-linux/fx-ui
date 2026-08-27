@@ -66,11 +66,16 @@ pub fn main(init: std.process.Init) !void {
     // apply pops them top-first into argbuf, so the LAST-pushed arg lands in
     // argbuf[0] = first command-line arg = param1.  This is consistent with the
     // compiler's currying env layout (param_i = access(n-i)).
-    var argvals: [64]i64 = undefined;
+    // Int args (no '.'/'e'/'E') emit `n[len:n]<text>` (parse+reformat keeps the
+    // int path byte-identical to M0); float args emit `F[len:F]<text>` (the
+    // VM's parseFloat reads the raw text).
+    var argstrs: [64][]const u8 = undefined;
+    var argisfloat: [64]bool = undefined;
     var nargs: usize = 0;
     while (it.next()) |arg| {
         if (nargs >= 64) return error.TooManyArgs;
-        argvals[nargs] = try std.fmt.parseInt(i64, arg, 10);
+        argstrs[nargs] = arg;
+        argisfloat[nargs] = isFloatArg(arg);
         nargs += 1;
     }
     var snip_buf: [1024]u8 = undefined;
@@ -82,10 +87,15 @@ pub fn main(init: std.process.Init) !void {
     var i: usize = nargs;
     while (i > 0) {
         i -= 1;
-        const val = argvals[i];
-        var numbuf: [32]u8 = undefined;
-        const numstr = try std.fmt.bufPrint(&numbuf, "{d}", .{val});
-        const atom = try std.fmt.bufPrint(snip_buf[snip_len..], "n[{d}:n]{s}", .{ numstr.len, numstr });
+        const arg = argstrs[i];
+        const atom = if (argisfloat[i])
+            try std.fmt.bufPrint(snip_buf[snip_len..], "F[{d}:F]{s}", .{ arg.len, arg })
+        else blk: {
+            const val = try std.fmt.parseInt(i64, arg, 10);
+            var numbuf: [32]u8 = undefined;
+            const numstr = try std.fmt.bufPrint(&numbuf, "{d}", .{val});
+            break :blk try std.fmt.bufPrint(snip_buf[snip_len..], "n[{d}:n]{s}", .{ numstr.len, numstr });
+        };
         snip_len += atom.len;
     }
     const g_atom = try std.fmt.bufPrint(snip_buf[snip_len..], "g[{d}:s]{s}", .{ fn_name.len, fn_name });
@@ -120,4 +130,16 @@ pub fn main(init: std.process.Init) !void {
 fn usage() noreturn {
     std.debug.print("usage: elmvm <bundle.csexp> <fn-name> [arg ...]\n", .{});
     std.process.exit(2);
+}
+
+/// M4 float-arg heuristic: an arg is a float literal iff it contains a
+/// '.'/'e'/'E' or is one of the canonical non-finite tokens (parseFloat
+/// accepts all four).  Everything else takes the int path (unchanged).
+fn isFloatArg(arg: []const u8) bool {
+    if (std.mem.eql(u8, arg, "NaN") or std.mem.eql(u8, arg, "Infinity") or
+        std.mem.eql(u8, arg, "-Infinity")) return true;
+    for (arg) |c| {
+        if (c == '.' or c == 'e' or c == 'E') return true;
+    }
+    return false;
 }

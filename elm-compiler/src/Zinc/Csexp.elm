@@ -1,6 +1,7 @@
 module Zinc.Csexp exposing
     ( utf8ByteLength
     , numberAtom
+    , floatAtom
     , symbolAtom
     , stringAtom
     , booleanAtom
@@ -17,6 +18,7 @@ module Zinc.Csexp exposing
 --   'n' number   (len = byte length of the decimal text; may be negative)
 --   'S' string   (len = byte length of the UTF-8 bytes)
 --   'b' boolean  (len = 4 for "true", 5 for "false")
+--   'F' float    (len = byte length of String.fromFloat's decimal/scientific text)
 --
 -- A LIST is  (elem elem ...)  with single-space separators, and a BUNDLE is a
 -- list of (name code) entries.
@@ -63,6 +65,11 @@ atom typeChar payload =
 numberAtom : Int -> String
 numberAtom n =
     atom 'n' (String.fromInt n)
+
+
+floatAtom : Float -> String
+floatAtom f =
+    atom 'F' (String.fromFloat f)
 
 
 symbolAtom : String -> String

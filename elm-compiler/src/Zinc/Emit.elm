@@ -59,6 +59,7 @@ type Instr
     | Jmpf Target
     | Jmp Target
     | Number_ Int
+    | Float_ Float
     | Symbol String
     | String_ String
     | Boolean_ Bool
@@ -172,6 +173,9 @@ instrText instr =
 
         Number_ n ->
             Just ("n " ++ Csexp.numberAtom n)
+
+        Float_ f ->
+            Just ("F " ++ Csexp.floatAtom f)
 
         Symbol name ->
             Just ("s " ++ Csexp.symbolAtom name)

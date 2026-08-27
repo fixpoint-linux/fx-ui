@@ -756,14 +756,16 @@ ctorEntry modName ( name, n ) =
     Csexp.bundleEntry (qualify modName name) (Emit.flatten (Emit.resolve code))
 
 
--- A 2-arg curried wrapper for a binary prim, keyed "<prim>.curried".
--- Identical duplicates across compilation units are harmless (defunSet:
--- later store wins with byte-identical bodies).
+-- A 2-arg curried wrapper for a binary prim, keyed "<op>.curried" — the
+-- OPERATOR name when present (so `(/)` -> "/.curried", `(//)` -> "//.curried"),
+-- else the prim name (preserving "cn.curried").  Identical duplicates across
+-- compilation units are harmless (defunSet: later store wins with
+-- byte-identical bodies).
 wrapperEntry : ( String, String ) -> String
-wrapperEntry ( _, prim ) =
+wrapperEntry ( op, prim ) =
     let
         name =
-            Expr.wrapperGlobalName prim
+            Expr.wrapperGlobalName (if op == "" then prim else op)
 
         body =
             [ Emit.Access 0, Emit.Access 1, Emit.Prim prim, Emit.Return ]

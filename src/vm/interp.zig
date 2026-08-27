@@ -583,7 +583,7 @@ pub fn vmExecEnv(
 
         switch (in.op) {
             // C:3230-3232 — literal loads.
-            .number, .string, .symbol, .boolean => {
+            .number, .string, .symbol, .boolean, .float => {
                 acc = in.operand;
                 vaPush(g, &stack, acc);
                 pc += 1;

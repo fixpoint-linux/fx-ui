@@ -120,6 +120,7 @@ pub fn parseCsexpAtom(ps: *ParseState, g: *Gc, sym: *SymbolInterner) ParseError!
             }
         },
         'b' => v = values.valBoolean(std.mem.eql(u8, buf[0..ulen], "true")),
+        'F' => v = values.valFloat(std.fmt.parseFloat(f64, buf[0..ulen]) catch 0),
         else => return error.ParseError, // unknown csexp type
     }
     return v;
@@ -181,7 +182,7 @@ fn parseBody(ps: *ParseState, g: *Gc, sym: *SymbolInterner, out: *?[*]Instr) Par
         advance(ps);
         switch (c) {
             'm', 'p', 'r', 'v', 'e', 'd', 't' => {}, // no operand
-            'a', 'f', 'j', 'n', 'g', 's', 'P', 'S', 'b' => {
+            'a', 'f', 'j', 'n', 'g', 's', 'P', 'S', 'b', 'F' => {
                 instr.operand = try parseCsexpAtom(ps, g, sym);
             },
             'c' => {
@@ -472,6 +473,11 @@ pub fn printInstr(writer: anytype, code: [*]Instr, len: i32, indent: usize) !voi
             },
             .boolean => {
                 try writer.writeAll("boolean ");
+                try values.printValue(writer, in.operand);
+                try writer.writeAll("\n");
+            },
+            .float => {
+                try writer.writeAll("float ");
                 try values.printValue(writer, in.operand);
                 try writer.writeAll("\n");
             },

@@ -277,6 +277,38 @@ test "M0 str_value of a long list exceeds 4096 chars (Test 14c shape)" {
 }
 
 // =====================================================================
+//  M4 — floats: val_float tag, print/str goldens, deep_equal semantics
+// =====================================================================
+
+test "M4 valFloat tag + print_value/str_value goldens" {
+    var g = try testInit();
+    defer g.deinit();
+
+    const f = values.valFloat(2.0);
+    try std.testing.expectEqual(types.ValTag.float, f.tag);
+    try std.testing.expectEqual(@as(f64, 2.0), f.payload.float);
+
+    try std.testing.expectEqualStrings("2.0", printValueOf(values.valFloat(2.0)));
+    try std.testing.expectEqualStrings("1.5", printValueOf(values.valFloat(1.5)));
+    try std.testing.expectEqualStrings("-0.5", printValueOf(values.valFloat(-0.5)));
+    try std.testing.expectEqualStrings("NaN", printValueOf(values.valFloat(std.math.nan(f64))));
+    try std.testing.expectEqualStrings("Infinity", printValueOf(values.valFloat(std.math.inf(f64))));
+    try std.testing.expectEqualStrings("-Infinity", printValueOf(values.valFloat(-std.math.inf(f64))));
+    try std.testing.expectEqualStrings("2.0", strValueOf(values.valFloat(2.0)));
+}
+
+test "M4 deep_equal float semantics" {
+    try std.testing.expect(values.deepEqual(values.valFloat(1.5), values.valFloat(1.5), 0));
+    try std.testing.expect(!values.deepEqual(values.valFloat(1.5), values.valFloat(2.5), 0));
+    // IEEE: NaN != NaN.
+    try std.testing.expect(!values.deepEqual(values.valFloat(std.math.nan(f64)), values.valFloat(std.math.nan(f64)), 0));
+    // Int 2 vs Float 2.0 are UNEQUAL under deepEqual (tag-distinct early
+    // return) — structural equality does NOT promote (decision 3, unchanged;
+    // only scalar =/</= via primEq promotes per the M4 review fix-1).
+    try std.testing.expect(!values.deepEqual(values.valNumber(2), values.valFloat(2.0), 0));
+}
+
+// =====================================================================
 //  M0 — forced-scavenge survival (uses only the GC API)
 // =====================================================================
 
@@ -715,6 +747,66 @@ fn expectRunNum(g: *heap.Gc, v: *state.Vm, src: [:0]const u8, want: i64) !void {
     g.rootPop();
     try std.testing.expectEqual(types.ValTag.number, got.tag);
     try std.testing.expectEqual(want, got.payload.number);
+    try std.testing.expectEqual(wm0, g.rootWatermark());
+}
+
+/// Mirror of expectRunNum asserting a FLOAT result (tag == .float).  The
+/// arith/dispatch fixtures use exactly-representable values (halves/quarters),
+/// so exact f64 equality is sound.
+fn expectRunFloat(g: *heap.Gc, v: *state.Vm, src: [:0]const u8, want: f64) !void {
+    const wm0 = g.rootWatermark();
+    var sym = symbols.SymbolInterner.init();
+    defer sym.deinit();
+    var code: ?[*]types.Instr = null;
+    const len = try parser.parseBytecode(g, &sym, src, &code);
+    parser.resolveJumps(code.?, len);
+    g.rootPushPtr(@ptrCast(&code));
+    const got = interp.vmExec(v, @ptrCast(code.?), len) catch |e| {
+        g.rootPop();
+        return e;
+    };
+    g.rootPop();
+    try std.testing.expectEqual(types.ValTag.float, got.tag);
+    try std.testing.expectEqual(want, got.payload.float);
+    try std.testing.expectEqual(wm0, g.rootWatermark());
+}
+
+test "M4 float arith dispatch (+, f/, mixed < promote)" {
+    var g = try testInit();
+    defer g.deinit();
+    var v: state.Vm = undefined;
+    v.init(&g);
+    defer v.deinit();
+
+    // (m F1.5 F2.5 g+ p): a1=top=2.5, a2=1.5 -> 4.0.
+    try expectRunFloat(&g, &v, "(mF[3:F]1.5F[3:F]2.5g[1:s]+p)", 4.0);
+    // (m F2.0 F7.0 gf/ p): RTL — push rhs=2.0 first, lhs=7.0 last (top),
+    // so a1/a2 = 7.0/2.0 = 3.5 (matches the compiler's binop emission).
+    try expectRunFloat(&g, &v, "(mF[3:F]2.0F[3:F]7.0g[2:s]f/p)", 3.5);
+}
+
+test "M4 mixed Int/Float comparison promotes" {
+    var g = try testInit();
+    defer g.deinit();
+    var v: state.Vm = undefined;
+    v.init(&g);
+    defer v.deinit();
+
+    // (m F2.5 n2 g< p): a1=top=2 (Int), a2=2.5 (Float) -> 2 < 2.5 = true.
+    const wm0 = g.rootWatermark();
+    var sym = symbols.SymbolInterner.init();
+    defer sym.deinit();
+    var code: ?[*]types.Instr = null;
+    const len = try parser.parseBytecode(&g, &sym, "(mF[3:F]2.5n[1:n]2g[1:s]<p)", &code);
+    parser.resolveJumps(code.?, len);
+    g.rootPushPtr(@ptrCast(&code));
+    const got = interp.vmExec(&v, @ptrCast(code.?), len) catch |e| {
+        g.rootPop();
+        return e;
+    };
+    g.rootPop();
+    try std.testing.expectEqual(types.ValTag.boolean, got.tag);
+    try std.testing.expectEqual(@as(i32, 1), got.payload.boolean);
     try std.testing.expectEqual(wm0, g.rootWatermark());
 }
 
@@ -1473,6 +1565,10 @@ test "M5 zinctest 7-11,24,25: comparisons =,<,>,<=,>=" {
     try expectRunBool(&g, &v, "(mn[1:n]2n[1:n]1g[1:s]=p)", false);
     // cross-type = never crashes: number vs string is false.
     try expectRunBool(&g, &v, "(mS[1:S]1n[1:n]1g[1:s]=p)", false);
+    // M4: mixed Int/Float = promotes (2 == 2.0 is true, Elm parity).
+    try expectRunBool(&g, &v, "(mF[3:F]2.0n[1:n]2g[1:s]=p)", true);
+    // M4: float-vs-nonnumber still falls through to false (no asFloat panic).
+    try expectRunBool(&g, &v, "(mS[1:S]xF[3:F]2.0g[1:s]=p)", false);
 }
 
 test "M5 zinctest 12-16: type predicates" {
@@ -1483,6 +1579,9 @@ test "M5 zinctest 12-16: type predicates" {
     defer v.deinit();
     try expectRunBool(&g, &v, "(mn[2:n]42g[7:s]number?p)", true);
     try expectRunBool(&g, &v, "(ms[5:s]hellog[7:s]symbol?p)", true);
+    // M4: number? recognizes floats (review fix-2).
+    try expectRunBool(&g, &v, "(mF[3:F]2.0g[7:s]number?p)", true);
+    try expectRunBool(&g, &v, "(mS[3:S]2.0g[7:s]number?p)", false);
     try expectRunBool(&g, &v, "(mb[4:b]trueg[8:s]boolean?p)", true);
     try expectRunBool(&g, &v, "(mS[2:S]hig[7:s]string?p)", true);
     try expectRunBool(&g, &v, "(mn[2:n]42g[7:s]string?p)", false);
