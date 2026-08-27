@@ -269,6 +269,7 @@ compileUnit globals unit =
                 ++ primDotAliases
                 ++ platformTable
                 ++ streamPrimAliases
+                ++ processPrimAliases
 
         baseCtx =
             Expr.newContext modName globals
@@ -412,6 +413,18 @@ platformTable =
     , ( "Io.readFile", "Runtime.taskReadFile" )
     , ( "Io.writeString", "Runtime.taskWriteString" )
     , ( "Io.writeFile", "Runtime.taskWriteFile" )
+    , ( "Io.exec", "Runtime.taskExec" )
+    , ( "Io.getenv", "Runtime.taskGetenv" )
+    , ( "Io.setenv", "Runtime.taskSetenv" )
+    , ( "Io.cd", "Runtime.taskCd" )
+    , ( "Io.getcwd", "Runtime.taskGetcwd" )
+    , ( "Io.getpid", "Runtime.taskGetpid" )
+    , ( "Io.glob", "Runtime.taskGlob" )
+    , ( "Plan.str", "Runtime.tStr" )
+    , ( "Plan.num", "Runtime.tNum" )
+    , ( "Plan.sym", "Runtime.tSym" )
+    , ( "Plan.nil", "Runtime.tNil" )
+    , ( "Plan.cons", "Runtime.tCons" )
     , ( "Sub.none", "Runtime.subNone" )
     ]
 
@@ -429,6 +442,24 @@ streamPrimAliases =
     , ( "close", Expr.wrapperGlobalName "close" )
     , ( "strToBytes", Expr.wrapperGlobalName "shen.str->bytes" )
     , ( "bytesToString", Expr.wrapperGlobalName "shen.bytes->string" )
+    ]
+
+
+-- M8 process-prim bare aliases: the VM prim names are hyphenated ("exec-plan",
+-- "getenv", ...) — some are valid Elm identifiers (cd/getenv/getpid/glob/intern)
+-- but none is a `binaryPrims`/`unaryPrims` row, so the Runtime spells them with
+-- camelCase names that rewrite to the curried wrapper globals keyed
+-- "<prim>.curried".  `intern` backs the Plan.* tagged-value builders.
+processPrimAliases : List ( String, String )
+processPrimAliases =
+    [ ( "execPlanPrim", Expr.wrapperGlobalName "exec-plan" )
+    , ( "getenvPrim", Expr.wrapperGlobalName "getenv" )
+    , ( "setenvPrim", Expr.wrapperGlobalName "setenv" )
+    , ( "cdPrim", Expr.wrapperGlobalName "cd" )
+    , ( "getcwdPrim", Expr.wrapperGlobalName "getcwd" )
+    , ( "getpidPrim", Expr.wrapperGlobalName "getpid" )
+    , ( "globPrim", Expr.wrapperGlobalName "glob" )
+    , ( "intern", Expr.wrapperGlobalName "intern" )
     ]
 
 

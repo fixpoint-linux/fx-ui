@@ -54,6 +54,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/vm.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
         .imports = &.{ .{ .name = "gc", .module = gc_mod } },
     });
 
@@ -113,6 +114,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("tools/elmvm.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
         .imports = &.{
             .{ .name = "gc", .module = gc_mod },
             .{ .name = "vm", .module = vm_mod },
@@ -294,6 +296,7 @@ fn addVmTestSet(
         .root_source_file = b.path("src/vm.zig"),
         .target = target,
         .optimize = opt,
+        .link_libc = true,
         .imports = &.{ .{ .name = "gc", .module = gc_mod } },
     });
 
@@ -301,6 +304,7 @@ fn addVmTestSet(
         .root_source_file = b.path("tests/vm_test.zig"),
         .target = target,
         .optimize = opt,
+        .link_libc = true,
         .imports = &.{
             .{ .name = "gc", .module = gc_mod },
             .{ .name = "vm", .module = vm_mod },

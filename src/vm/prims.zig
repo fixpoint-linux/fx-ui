@@ -39,6 +39,7 @@ const values = @import("values.zig");
 const symbols = @import("symbols.zig");
 const interp = @import("interp.zig");
 const streams = @import("streams.zig");
+const execplan = @import("execplan.zig");
 
 const Gc = gc.Gc;
 const Value = types.Value;
@@ -117,6 +118,14 @@ pub const prim_table = [_]PrimDef{
     .{ .name = "read-file-as-string", .arity = 1, .func = streams.primReadFileAsString },
     .{ .name = "open", .arity = 2, .func = streams.primOpen },
     .{ .name = "close", .arity = 1, .func = streams.primClose },
+    // ---- process execution (M8, execplan.zig; B: no wait/kill) ----
+    .{ .name = "exec-plan", .arity = 1, .func = execplan.primExecPlan },
+    .{ .name = "cd", .arity = 1, .func = execplan.primCd },
+    .{ .name = "getcwd", .arity = 0, .func = execplan.primGetcwd },
+    .{ .name = "getpid", .arity = 0, .func = execplan.primGetpid },
+    .{ .name = "getenv", .arity = 1, .func = execplan.primGetenv },
+    .{ .name = "setenv", .arity = 2, .func = execplan.primSetenv },
+    .{ .name = "glob", .arity = 1, .func = execplan.primGlob },
     // ---- control / eval ----
     .{ .name = "trap-error", .arity = 2, .func = primTrapError },
     .{ .name = "simple-error", .arity = 1, .func = primSimpleError },

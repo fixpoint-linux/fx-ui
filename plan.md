@@ -46,6 +46,16 @@ reviewed safe-to-ship, committed.
   spellings via `Lower.Module.platformTable`. Gate 48/48 (taskpure/taskseq/taskattempt
   + iofile/ioecho rewritten to the Task spelling), vm-test 83/83. TRUE nonblocking
   (poll/select VM seam) is a separate future milestone — deliberately out of scope.
+- **M8** (process execution): **DONE** — the declarative plan-runner `exec-plan` +
+  the 7 env/cwd prims (`cd`/`getcwd`/`getpid`/`getenv`/`setenv`/`glob`; `wait`/`kill`
+  excluded — they exist only for background processes). `src/vm/execplan.zig` synced
+  from `shen/zig` (verbatim minus the native-only `is_wasm` gates and the wait/kill
+  prims + test accessors); `build.zig` links libc on the vm/elmvm/vm-test modules;
+  the prims registered in `src/vm/prims.zig`. Elm surface: `Io.exec`/`Io.getenv`/
+  `Io.setenv`/`Io.cd`/`Io.getcwd`/`Io.getpid`/`Io.glob` leaf Tasks + `Plan.*` tagged-
+  list builders (`str`/`num`/`sym`/`nil`/`cons` + `intern`) building the Shen TAGGED-LIST
+  demarshal plan format; `decodeExec`/`decodeStringList` walk the tagged results.
+  Gate 51/51 (execpipe pipeline / execenv env+cwd / execglob), vm-test unchanged.
 
 Convention: this document numbers milestones **M1 … MX** where **MX is the terminal
 milestone** (the pure-core Elm runtime delivering `main -> value`). The compiler
@@ -317,7 +327,8 @@ wide-blast-radius on semantics, with subtle full-arity/RTL/auto-push correctness
 
 ## 11. Deliberate omissions / out of scope
 
-Not in the M1–MX pure-core path: process-execution primitives, `meta_repl`, `defun_freeze`
+Not in the M1–MX pure-core path: ~~process-execution primitives~~ (landed in M8 — `exec-plan` +
+`cd`/`getcwd`/`getpid`/`getenv`/`setenv`/`glob`, `wait`/`kill` excluded), `meta_repl`, `defun_freeze`
 perfect hash, `eval-kl` + marshal layer, `symbol_static`, the trace facility, and the
 ~~asynchronous Kernel `Task`/effect-manager half of a full Elm runtime~~ (landed in M7 as a
 cooperative Task monad + effect-manager loop). The stream I/O prims

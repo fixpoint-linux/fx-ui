@@ -2508,3 +2508,153 @@ test "M7 stress: defun mutation under forced scavenges keeps table integrity" {
     // wm0 + 1: the junk guard root is still held (its defer ends later).
     try std.testing.expectEqual(wm0 + 1, g.rootWatermark());
 }
+
+// =====================================================================
+//  M8 — process execution (execplan.zig): primExecPlan + env/cwd + glob
+// =====================================================================
+
+/// The tagged-list demarshal accessors (mirror execplan's tdl probes without
+/// the page_allocator decode structs).  [cons H T] = cons(sym "cons",
+/// cons(H, cons(T, nil))), so tdlFirst == payload of [tag X] == head of a
+/// tagged list, and tdlSecond == the tail T.
+fn tdlFirst(v: types.Value) types.Value {
+    return v.payload.cons.cdr.?.*.payload.cons.car.?.*;
+}
+
+fn tdlSecond(v: types.Value) types.Value {
+    return v.payload.cons.cdr.?.*.payload.cons.cdr.?.*.payload.cons.car.?.*;
+}
+
+/// [symbol X] = cons(sym "symbol", cons(sym X, nil)).  valSymbol interns into
+/// the symbol table's own allocator (never the GC heap), so the inner cons's
+/// interior pointers cannot move before the outer valCons roots it.
+fn taggedSym(g: *heap.Gc, v: *state.Vm, name: []const u8) types.Value {
+    const inner = values.valCons(g, symbols.valSymbol(&v.symbols, name), values.valNil());
+    return values.valCons(g, symbols.valSymbol(&v.symbols, "symbol"), inner);
+}
+
+test "M8 process: primExecPlan decodes + runs a two-command pipeline" {
+    var g = try testInit();
+    defer g.deinit();
+    var v: state.Vm = undefined;
+    v.init(&g);
+    defer v.deinit();
+    const ep = vm.execplan;
+
+    // argv1 = [string echo] [string -n] [string hi]
+    var e = ep.makeTaggedString(&v, "echo");
+    var e_g = g.rootValue(&e); defer e_g.end();
+    var n = ep.makeTaggedString(&v, "-n");
+    var n_g = g.rootValue(&n); defer n_g.end();
+    var hi = ep.makeTaggedString(&v, "hi");
+    var hi_g = g.rootValue(&hi); defer hi_g.end();
+    var argv1 = ep.makeTaggedNil(&v);
+    var argv1_g = g.rootValue(&argv1); defer argv1_g.end();
+    // Prepend in reverse so the head is argv[0]: [echo -n hi].
+    argv1 = ep.makeTaggedCons(&v, hi, argv1);
+    argv1 = ep.makeTaggedCons(&v, n, argv1);
+    argv1 = ep.makeTaggedCons(&v, e, argv1);
+
+    // argv2 = [string tr] [string i] [string o]
+    var tr = ep.makeTaggedString(&v, "tr");
+    var tr_g = g.rootValue(&tr); defer tr_g.end();
+    var ich = ep.makeTaggedString(&v, "i");
+    var ich_g = g.rootValue(&ich); defer ich_g.end();
+    var o1 = ep.makeTaggedString(&v, "o");
+    var o1_g = g.rootValue(&o1); defer o1_g.end();
+    var argv2 = ep.makeTaggedNil(&v);
+    var argv2_g = g.rootValue(&argv2); defer argv2_g.end();
+    // Prepend in reverse so the head is argv[0]: [tr i o].
+    argv2 = ep.makeTaggedCons(&v, o1, argv2);
+    argv2 = ep.makeTaggedCons(&v, ich, argv2);
+    argv2 = ep.makeTaggedCons(&v, tr, argv2);
+
+    // cmd = [Argv Redirs Sub]: empty redirs + plain sub are both [cons].
+    var nil = ep.makeTaggedNil(&v);
+    var nil_g = g.rootValue(&nil); defer nil_g.end();
+    var cmd1 = ep.makeTaggedCons(&v, argv1, ep.makeTaggedCons(&v, nil, ep.makeTaggedCons(&v, nil, ep.makeTaggedNil(&v))));
+    var cmd1_g = g.rootValue(&cmd1); defer cmd1_g.end();
+    var cmd2 = ep.makeTaggedCons(&v, argv2, ep.makeTaggedCons(&v, nil, ep.makeTaggedCons(&v, nil, ep.makeTaggedNil(&v))));
+    var cmd2_g = g.rootValue(&cmd2); defer cmd2_g.end();
+
+    // pipeline = [cmd1 cmd2]; chain = [[symbol seq] pipeline]; program = [chain].
+    var pipeline = ep.makeTaggedCons(&v, cmd1, ep.makeTaggedCons(&v, cmd2, ep.makeTaggedNil(&v)));
+    var pipeline_g = g.rootValue(&pipeline); defer pipeline_g.end();
+    var seq = taggedSym(&g, &v, "seq");
+    var seq_g = g.rootValue(&seq); defer seq_g.end();
+    var chain = ep.makeTaggedCons(&v, seq, ep.makeTaggedCons(&v, pipeline, ep.makeTaggedNil(&v)));
+    var chain_g = g.rootValue(&chain); defer chain_g.end();
+    var program = ep.makeTaggedCons(&v, chain, ep.makeTaggedNil(&v));
+    var program_g = g.rootValue(&program); defer program_g.end();
+
+    var acc: types.Value = undefined;
+    try primExec(&g, &v, "exec-plan", &.{program}, &acc);
+
+    // Result = [cons [number code] [cons [string out] [cons [string err] [cons]]]].
+    const codeTag = tdlFirst(acc);
+    const outList = tdlSecond(acc);
+    const outTag = tdlFirst(outList);
+    const errList = tdlSecond(outList);
+    const errTag = tdlFirst(errList);
+    try std.testing.expectEqual(@as(i64, 0), tdlFirst(codeTag).payload.number);
+    try std.testing.expectEqualStrings("ho", values.strSlice(tdlFirst(outTag)));
+    try std.testing.expectEqualStrings("", values.strSlice(tdlFirst(errTag)));
+}
+
+test "M8 process: setenv/getenv round-trip and unset fallback" {
+    var g = try testInit();
+    defer g.deinit();
+    var v: state.Vm = undefined;
+    v.init(&g);
+    defer v.deinit();
+
+    var acc: types.Value = undefined;
+    try primExec(&g, &v, "setenv", &.{ strVal(&g, "FX_M8_TEST"), strVal(&g, "hello") }, &acc);
+    try std.testing.expectEqual(types.ValTag.boolean, acc.tag);
+    try std.testing.expectEqual(@as(i32, 1), acc.payload.boolean);
+
+    try primExec(&g, &v, "getenv", &.{strVal(&g, "FX_M8_TEST")}, &acc);
+    try std.testing.expectEqual(types.ValTag.string, acc.tag);
+    try std.testing.expectEqualStrings("hello", values.strSlice(acc));
+
+    try primExec(&g, &v, "getenv", &.{strVal(&g, "FX_M8_TEST_UNSET")}, &acc);
+    try std.testing.expectEqualStrings("", values.strSlice(acc));
+}
+
+test "M8 process: glob returns a sorted tagged list of names" {
+    var g = try testInit();
+    defer g.deinit();
+    var v: state.Vm = undefined;
+    v.init(&g);
+    defer v.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.parent_dir.realPathFile(std.testing.io, tmp.sub_path[0..], &buf);
+    const dir = try std.fmt.allocPrint(std.testing.allocator, "{s}", .{buf[0..n]});
+    defer std.testing.allocator.free(dir);
+    const pattern = try std.fmt.allocPrint(std.testing.allocator, "{s}/*.txt", .{dir});
+    defer std.testing.allocator.free(pattern);
+
+    for ([_][]const u8{ "c.txt", "a.txt", "b.txt" }) |name| {
+        var f = try tmp.dir.createFile(std.testing.io, name, .{});
+        f.close(std.testing.io);
+    }
+
+    var acc: types.Value = undefined;
+    try primExec(&g, &v, "glob", &.{strVal(&g, pattern)}, &acc);
+
+    // Sorted ascending: [a.txt b.txt c.txt], then the empty tagged list [cons].
+    const s1 = tdlFirst(acc);
+    const rest1 = tdlSecond(acc);
+    const s2 = tdlFirst(rest1);
+    const rest2 = tdlSecond(rest1);
+    const s3 = tdlFirst(rest2);
+    const rest3 = tdlSecond(rest2);
+    try std.testing.expectEqualStrings("a.txt", values.strSlice(tdlFirst(s1)));
+    try std.testing.expectEqualStrings("b.txt", values.strSlice(tdlFirst(s2)));
+    try std.testing.expectEqualStrings("c.txt", values.strSlice(tdlFirst(s3)));
+    try std.testing.expect(std.mem.eql(u8, "cons", values.symSlice(rest3.payload.cons.car.?.*)));
+    try std.testing.expectEqual(types.ValTag.nil, rest3.payload.cons.cdr.?.*.tag);
+}

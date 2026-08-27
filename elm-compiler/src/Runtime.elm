@@ -25,6 +25,13 @@ type Task x a
     | TaskReadLine
     | TaskReadFile String
     | TaskWriteFile String String
+    | TaskExec a
+    | TaskGetenv String
+    | TaskSetenv String String
+    | TaskCd String
+    | TaskGetcwd
+    | TaskGetpid
+    | TaskGlob String
 
 
 type alias Cmd msg = List (Task Never msg)
@@ -103,6 +110,27 @@ runTask task =
             in
             Ok ()
 
+        TaskExec plan ->
+            Ok (decodeExec (execPlanPrim plan))
+
+        TaskGetenv name ->
+            Ok (getenvPrim name)
+
+        TaskSetenv name value ->
+            Ok (setenvPrim name value)
+
+        TaskCd path ->
+            Ok (cdPrim path)
+
+        TaskGetcwd ->
+            Ok (getcwdPrim ())
+
+        TaskGetpid ->
+            Ok (getpidPrim ())
+
+        TaskGlob pattern ->
+            Ok (decodeStringList (globPrim pattern))
+
 
 cmdNone = []
 
@@ -167,6 +195,34 @@ taskWriteFile path contents =
     TaskWriteFile path contents
 
 
+taskExec plan =
+    TaskExec plan
+
+
+taskGetenv name =
+    TaskGetenv name
+
+
+taskSetenv name value =
+    TaskSetenv name value
+
+
+taskCd path =
+    TaskCd path
+
+
+taskGetcwd =
+    TaskGetcwd
+
+
+taskGetpid =
+    TaskGetpid
+
+
+taskGlob pattern =
+    TaskGlob pattern
+
+
 subNone = ()
 
 
@@ -218,3 +274,86 @@ readLineGo acc =
 
     else
         readLineGo (b :: acc)
+
+
+-- ---- M8 process execution: tagged-plan builders + result decoders ----
+-- The exec-plan value is the Shen TAGGED-LIST demarshal format, built from
+-- plain cons cells + interned symbol tags:
+--   [cons]       = [intern "cons"]
+--   [cons H T]   = [intern "cons", H, T]
+--   [string S]   = [intern "string", S]
+--   [number N]   = [intern "number", N]
+--   [symbol X]   = [intern "symbol", intern X]
+-- These are the ONLY way to build a plan; decodeExec/decodeStringList walk
+-- the matching tagged results back to plain values.
+
+tStr s =
+    intern "string" :: s :: []
+
+
+tNum n =
+    intern "number" :: n :: []
+
+
+tSym x =
+    intern "symbol" :: intern x :: []
+
+
+tNil =
+    intern "cons" :: []
+
+
+tCons h t =
+    intern "cons" :: h :: t :: []
+
+
+-- primExecPlan returns [cons [number code] [cons [string out] [cons [string
+-- err] [cons]]]] -> (code, out, err).
+decodeExec r =
+    case r of
+        _ :: codeTag :: outList :: _ ->
+            case outList of
+                _ :: outTag :: errList :: _ ->
+                    case errList of
+                        _ :: errTag :: _ :: _ ->
+                            ( decodeNumber codeTag, decodeString outTag, decodeString errTag )
+
+                        _ ->
+                            ( 0, "", "" )
+
+                _ ->
+                    ( 0, "", "" )
+
+        _ ->
+            ( 0, "", "" )
+
+
+-- primGlob returns [cons [string s1] [cons [string s2] [cons]]] -> [String].
+decodeStringList r =
+    case r of
+        _ :: [] ->
+            []
+
+        _ :: (_ :: s :: _) :: rest :: [] ->
+            s :: decodeStringList rest
+
+        _ ->
+            []
+
+
+decodeNumber v =
+    case v of
+        _ :: n :: _ ->
+            n
+
+        _ ->
+            0
+
+
+decodeString v =
+    case v of
+        _ :: s :: _ ->
+            s
+
+        _ ->
+            ""

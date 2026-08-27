@@ -153,12 +153,14 @@ wrapperGlobalName op =
 --     stray partial closure when called full-arity.
 primWrappers : List ( String, String )
 primWrappers =
-    binaryPrims ++ [ ( "", "cn" ), ( "", "write-byte" ), ( "", "open" ) ]
+    binaryPrims ++ [ ( "", "cn" ), ( "", "write-byte" ), ( "", "open" ), ( "", "setenv" ) ]
 
 
 unaryPrims : List String
 unaryPrims =
-    [ "c-strlen", "read-byte", "read-file-as-string", "close", "shen.str->bytes", "shen.bytes->string" ]
+    [ "c-strlen", "read-byte", "read-file-as-string", "close", "shen.str->bytes", "shen.bytes->string"
+    , "intern", "exec-plan", "cd", "getenv", "glob", "getcwd", "getpid"
+    ]
 
 
 primOf : String -> Maybe String

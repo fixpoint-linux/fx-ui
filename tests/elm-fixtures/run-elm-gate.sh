@@ -210,6 +210,10 @@ run_io ioecho  main   "$(read_expected ioecho)" echo.txt
 run taskpure     main   "$(read_expected taskpure)"
 run taskseq      main   "$(read_expected taskseq)"
 run taskattempt  main   "$(read_expected taskattempt)"
+# --- M8: process execution (exec-plan + env/cwd prims) ---
+run execpipe     main   "$(read_expected execpipe)"
+run execenv      main   "$(read_expected execenv)"
+run execglob     main   "$(read_expected execglob)"
 compile_error dup         "duplicate top-level definition in Dup: f"
 
 rm -rf "$OUT"
