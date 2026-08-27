@@ -37,6 +37,15 @@ reviewed safe-to-ship, committed.
   echo-until-quit), vm-test 83/83. Also fixed a pre-existing label-collision bug in
   `bindDestructuring` (site-unique `let_bad`/`let_ok`) and a GC grow-barrier gap in
   `interp.zig` (byte-identical to shen's reference).
+- **M7** (async Kernel: Task monad + effect-manager loop): **DONE** — a cooperative
+  `Task x a` ADT (succeed/fail/andThen/onError + stream leaves) replaces M6's flat
+  `Eff` list; `Cmd msg = List (Task Never msg)`; a `runTask` scheduler (mutual tail
+  calls, constant-stack andThen steps) + the generalized `drive`/`runOne` effect-manager
+  loop; `Task.map/map2/sequence/perform/attempt` + `Cmd.map` surface, all desugared to
+  andThen+succeed+fail (no extra ctors). Fixtures keep real-Elm `Task.*`/`Cmd.*`/`Io.*`
+  spellings via `Lower.Module.platformTable`. Gate 48/48 (taskpure/taskseq/taskattempt
+  + iofile/ioecho rewritten to the Task spelling), vm-test 83/83. TRUE nonblocking
+  (poll/select VM seam) is a separate future milestone — deliberately out of scope.
 
 Convention: this document numbers milestones **M1 … MX** where **MX is the terminal
 milestone** (the pure-core Elm runtime delivering `main -> value`). The compiler
@@ -310,8 +319,10 @@ wide-blast-radius on semantics, with subtle full-arity/RTL/auto-push correctness
 
 Not in the M1–MX pure-core path: process-execution primitives, `meta_repl`, `defun_freeze`
 perfect hash, `eval-kl` + marshal layer, `symbol_static`, the trace facility, and the
-asynchronous Kernel `Task`/effect-manager half of a full Elm runtime. The stream I/O prims
+~~asynchronous Kernel `Task`/effect-manager half of a full Elm runtime~~ (landed in M7 as a
+cooperative Task monad + effect-manager loop). The stream I/O prims
 (`write-byte/read-byte/read-file-as-string/open/close` + `val_string_stream_in`) and a
 minimal self-hosted `Platform`/`Cmd`/`Sub`-style effects runtime have landed in M6 (sync
-`src/vm` from `shen/zig` when porting the remaining deferred pieces). MX deliberately stops
+`src/vm` from `shen/zig` when porting the remaining deferred pieces). TRUE nonblocking
+(poll/select VM seam) remains out of scope. MX deliberately stops
 at the **pure** `main -> value` runtime.

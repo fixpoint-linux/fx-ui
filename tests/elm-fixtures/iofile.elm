@@ -1,11 +1,14 @@
 module IoFile exposing (main)
 
--- M6 gate: file round-trip.  RdFile reads hello.txt, update builds the final
--- model, WrFile writes it back to out/hello.out; the loop then returns the
--- final String model (printed by elmvm).
+-- M7 gate: file round-trip via the Task kernel.  Io.readFile reads hello.txt
+-- (a Task Never String), update builds the final model, Io.writeFile writes it
+-- back to out/hello.out through a nullary Saved msg (the write must route
+-- through a msg, else `()` becomes the delivered msg — message-delivery trap);
+-- the loop then returns the final String model (printed by elmvm).
 
 type Msg
     = Loaded String
+    | Saved
 
 
 main =
@@ -13,7 +16,7 @@ main =
 
 
 init () =
-    ( "", Cmd.readFile "tests/elm-fixtures/input/hello.txt" Loaded )
+    ( "", Task.perform Loaded (Io.readFile "tests/elm-fixtures/input/hello.txt") )
 
 
 update msg model =
@@ -23,4 +26,7 @@ update msg model =
                 out =
                     String.append "echo:" contents
             in
-            ( out, Cmd.writeFile "tests/elm-fixtures/out/hello.out" out )
+            ( out, Task.perform (always Saved) (Io.writeFile "tests/elm-fixtures/out/hello.out" out) )
+
+        Saved ->
+            ( model, Cmd.none )

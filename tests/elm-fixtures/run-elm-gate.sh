@@ -206,6 +206,10 @@ cmp -s "$FIX/out/hello.out" "$FIX/expected/hello.out.txt" &&
   { echo "FAIL iofile out-file cmp: out/hello.out != expected/hello.out.txt"; fail=$((fail+1)); }
 # ioecho: readLine echo-until-quit — echoed lines + the final Int count.
 run_io ioecho  main   "$(read_expected ioecho)" echo.txt
+# --- M7: async Kernel (Task monad + effect-manager loop) ---
+run taskpure     main   "$(read_expected taskpure)"
+run taskseq      main   "$(read_expected taskseq)"
+run taskattempt  main   "$(read_expected taskattempt)"
 compile_error dup         "duplicate top-level definition in Dup: f"
 
 rm -rf "$OUT"

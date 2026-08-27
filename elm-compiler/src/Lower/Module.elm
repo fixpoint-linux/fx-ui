@@ -386,20 +386,32 @@ primDotAliases =
     ]
 
 
--- M6 Platform.* conveniences: dotted Elm spellings that rewrite to the
--- self-hosted runtime's qualified globals (Runtime, the auto-injected
--- self-hosted effects module — NOT elm/core's Platform, which would collide
--- at `elm make` time).  Fixtures keep the real-Elm spellings `Platform.worker`
--- / `Cmd.*` / `Sub.*` without importing anything (documented deviation).
+-- M6/M7 Platform.*/Cmd.*/Task.*/Io.* conveniences: dotted Elm spellings that
+-- rewrite to the self-hosted runtime's qualified globals (Runtime, the
+-- auto-injected self-hosted effects module — NOT elm/core's Platform, which
+-- would collide at `elm make` time).  Fixtures keep the real-Elm spellings
+-- `Platform.worker` / `Cmd.*` / `Task.*` / `Io.*` without importing anything
+-- (documented deviation).  `Io.*` is the VM stream-effect namespace (mirrors
+-- real Elm's Http.getString/Time.now returning `Task Never a`).
 platformTable : List ( String, String )
 platformTable =
     [ ( "Platform.worker", "Runtime.worker" )
     , ( "Cmd.none", "Runtime.cmdNone" )
     , ( "Cmd.batch", "Runtime.cmdBatch" )
-    , ( "Cmd.writeString", "Runtime.cmdWriteString" )
-    , ( "Cmd.readLine", "Runtime.cmdReadLine" )
-    , ( "Cmd.readFile", "Runtime.cmdReadFile" )
-    , ( "Cmd.writeFile", "Runtime.cmdWriteFile" )
+    , ( "Cmd.map", "Runtime.cmdMap" )
+    , ( "Task.succeed", "Runtime.taskSucceed" )
+    , ( "Task.fail", "Runtime.taskFail" )
+    , ( "Task.map", "Runtime.taskMap" )
+    , ( "Task.map2", "Runtime.taskMap2" )
+    , ( "Task.andThen", "Runtime.taskAndThen" )
+    , ( "Task.onError", "Runtime.taskOnError" )
+    , ( "Task.sequence", "Runtime.taskSequence" )
+    , ( "Task.perform", "Runtime.taskPerform" )
+    , ( "Task.attempt", "Runtime.taskAttempt" )
+    , ( "Io.readLine", "Runtime.taskReadLine" )
+    , ( "Io.readFile", "Runtime.taskReadFile" )
+    , ( "Io.writeString", "Runtime.taskWriteString" )
+    , ( "Io.writeFile", "Runtime.taskWriteFile" )
     , ( "Sub.none", "Runtime.subNone" )
     ]
 
