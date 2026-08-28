@@ -902,13 +902,7 @@ pub fn vmExecEnv(
             // val_symbol interns on the C heap only — no GC alloc).
             .global => {
                 const nm = if (in.operand.tag == .symbol) values.symSlice(in.operand) else "";
-                if (nm.len > 0 and !vm.defunHas(nm)) {
-                    var buf: [256]u8 = undefined;
-                    const msg = std.fmt.bufPrint(&buf, "global not found: {s}", .{nm})
-                        catch "global not found";
-                    return vm.throwShen(msg);
-                }
-                acc = vm.defunGet(nm);
+                acc = try vm.defunGetChecked(nm);
                 vaPush(g, &stack, acc);
                 pc += 1;
             },

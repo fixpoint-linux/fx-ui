@@ -202,6 +202,20 @@ pub const Vm = struct {
         return symbols.valSymbol(&self.symbols, name);
     }
 
+    /// Single-probe .global fetch: one defunLookup instead of the
+    /// defunHas + defunGet double probe.  The prim/symbol fallback in
+    /// defunGet is unreachable for a missing non-empty name (that throws),
+    /// so only the empty-name edge (non-symbol operand) routes through
+    /// defunGet, preserving its intern-"" behavior.
+    pub fn defunGetChecked(self: *Vm, name: []const u8) VmError!types.Value {
+        if (tables.defunLookup(self.defun_table, tables.DEFUN_TABLE_CAP, name)) |v| return v;
+        if (name.len == 0) return self.defunGet(name);
+        var buf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "global not found: {s}", .{name})
+            catch "global not found";
+        return self.throwShen(msg);
+    }
+
     /// C: zincvm.c:624-642 defun_has — probe without the fallback.
     pub fn defunHas(self: *Vm, name: []const u8) bool {
         return tables.defunHas(self.defun_table, tables.DEFUN_TABLE_CAP, name);

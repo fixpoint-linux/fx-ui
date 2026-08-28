@@ -1069,6 +1069,32 @@ test "M4 global lookup of an unknown name throws ShenError" {
     try std.testing.expectEqual(wm0, g.rootWatermark());
 }
 
+test "M11 .global single-probe: bundled defun resolves, missing throws" {
+    var g = try testInit();
+    defer g.deinit();
+    var v: state.Vm = undefined;
+    v.init(&g);
+    defer v.deinit();
+
+    // Hit path: one defunLookup (no defunHas pre-probe, no fallback).
+    v.defunSet("m11glob", values.valNumber(42));
+    const wm0 = g.rootWatermark();
+    try expectRunNum(&g, &v, "(g[7:s]m11glob)", 42);
+
+    // Miss path (non-empty name): the same ShenError the M4 test asserts.
+    var sym = symbols.SymbolInterner.init();
+    defer sym.deinit();
+    var code: ?[*]types.Instr = null;
+    const len = try parser.parseBytecode(&g, &sym, "(g[9:s]nomissing)", &code);
+    parser.resolveJumps(code.?, len);
+    g.rootPushPtr(@ptrCast(&code));
+    {
+        defer g.rootPop();
+        try std.testing.expectError(error.ShenError, interp.vmExec(&v, @ptrCast(code.?), len));
+    }
+    try std.testing.expectEqual(wm0, g.rootWatermark());
+}
+
 test "M4 apply non-callable: hard stop outside trap, throw inside trap" {
     var g = try testInit();
     defer g.deinit();
