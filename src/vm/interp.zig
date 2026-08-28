@@ -492,6 +492,42 @@ fn peelOverArgs(
 //  The eval loop — C: zincvm.c:3154-3466 vm_exec_env
 // =====================================================================
 
+/// M10 frame-stack pool: acquire a CallFrame array for one vmExecEnv entry.
+/// A hit reuses an idle pooled array (all-null at rest by the clean-only-
+/// live-range invariant, so no @memset needed); a miss allocates a fresh
+/// old-gen array whose body gcalloc_internal already zeroes.  No allocation
+/// on the hit path — the array moves pool-slot -> local with no collect
+/// possible mid-transfer (the pool slot is a persistent root).
+fn frameStackAcquire(vm: *Vm) [*]types.CallFrame {
+    if (vm.frame_pool_live > 0) {
+        vm.frame_pool_live -= 1;
+        const arr = vm.frame_pool[vm.frame_pool_live].?;
+        vm.frame_pool[vm.frame_pool_live] = null;
+        vm.frame_pool_hits += 1;
+        return arr;
+    }
+    vm.frame_pool_misses += 1;
+    return vm.gc.allocArrayOldgen(types.CallFrame, types.CALL_STACK_DEPTH);
+}
+
+/// M10 frame-stack pool: release `arr` back to the pool on vmExecEnv exit.
+/// MUST contain no allocation — the only live reference during the transfer
+/// is the (still-rooted) local slot on the way in and the persistent pool
+/// slot on the way out, so no collect can move the array mid-copy.
+/// Clears ONLY the used range [0..sp): every pop site nulls its slot and
+/// pushes write slot[sp] then increment, so the dirtied slots are a subset
+/// of [0..sp) — the array is all-null at rest, making the full-capacity
+/// drain scan (collect.zig) cheap and retention-free.  When the pool is
+/// full the array is dropped: its pages are never queued, so it is never
+/// scanned and needs no clearing (graceful degradation to per-call alloc).
+fn frameStackRelease(vm: *Vm, arr: [*]types.CallFrame, sp: i32) void {
+    if (vm.frame_pool_live < state.FRAME_POOL_MAX) {
+        @memset(arr[0..@intCast(sp)], std.mem.zeroes(types.CallFrame));
+        vm.frame_pool[vm.frame_pool_live] = arr;
+        vm.frame_pool_live += 1;
+    }
+}
+
 /// C: zincvm.c:3154-3466 vm_exec_env.  THE ROOTING CRUX — see the module
 /// doc for the full contract.  Every root push is annotated with its C line;
 /// the single defer rootPopTo(entry_wm) covers ALL exits (break-to-done,
@@ -548,18 +584,25 @@ pub fn vmExecEnv(
     }
 
     // ---- call-frame stack (C:3182-3191): one old-gen CALLFRAME_ARRAY per
-    // vmExecEnv call (65536 x 48 B ≈ 3 MB, zeroed by the allocator; the
-    // explicit C memset is retained for parity).  allocatepage's LASTRESORT
-    // may run a full collect HERE with only roots (1)-(5) live — same as C.
-    var frame_stack: [*]types.CallFrame =
-        g.allocArrayOldgen(types.CallFrame, types.CALL_STACK_DEPTH);
-    @memset(frame_stack[0..types.CALL_STACK_DEPTH], std.mem.zeroes(types.CallFrame));
+    // vmExecEnv call, REUSED from the Vm frame-stack pool (M10).  Fresh
+    // arrays are zeroed by gcalloc_internal; pooled arrays are all-null at
+    // rest (release clears the used range).  allocatepage's LASTRESORT may
+    // run a full collect HERE with only roots (1)-(5) live — same as C.
+    var frame_stack: [*]types.CallFrame = frameStackAcquire(vm);
     // C allocates a GC-heap int for frames_sp so it survives longjmp
     // (C:3186-3188).  Zig error unwinding runs defers before this frame
     // dies, so a plain native local is safe (plan DECISION A); the
     // ROOT_CALLFRAME_ARRAY np below is never dereferenced at scan time.
     var frames_sp: i32 = 0;
     g.rootPushCallframeArray(frame_stack, &frames_sp); // (6) — C:3195
+    // Release the frame stack back to the pool on EVERY exit.  Registered
+    // AFTER the rootPopTo(entry_wm) defer above, so defers run it FIRST
+    // (reverse order) while root (8) below still pins frame_stack, and
+    // BEFORE the entry_wm pop truncates the shadow stack.  Zig `defer`
+    // evaluates its expression at scope exit, reading frames_sp's CURRENT
+    // value — so a deep-call error unwind clears the true used range, never
+    // the 0 frames_sp held here at registration time.
+    defer frameStackRelease(vm, frame_stack, frames_sp);
 
     var pc: i32 = 0;
     var cur_code = code; // current body's Instr array head (?*Instr)

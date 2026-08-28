@@ -36,6 +36,19 @@ const Gc = gc.Gc;
 /// error.ShenError is the longjmp (catchable at a CatchSite).
 pub const VmError = error{ ShenError, Halt };
 
+/// M10 frame-stack pool: max idle old-gen CALLFRAME_ARRAYs held for reuse
+/// across vmExecEnv entries (see interp.zig frameStackAcquire/Release).
+/// Bounded to real vmExecEnv nesting depth — outer entry + trap-error body,
+/// or outer entry + N>A peel = 2 (a trap-error body is sequential with its
+/// handler, so trap-error alone never nests past 2; the depth-3 case of a
+/// peel inside a trap-error body degrades gracefully by dropping one array).
+/// Retaining more than the nesting depth never pays off (the LIFO free-list
+/// can only hand them back at that depth) and pins ~3 MB per extra array:
+/// at 3 idle arrays (9 MB) the base live set exceeds the grown 32 MB heap's
+/// old-gen threshold (8 MB), forcing a failed grow_heap per old-gen alloc on
+/// reserve-constrained heaps.  2 x 3 MB = 6 MB stays under the threshold.
+pub const FRAME_POOL_MAX: usize = 2;
+
 /// C: zincvm.h CatchFrame — DECISION A shape.  Stack-allocated at each
 /// catch site (trap-error in M5, the host harness): push by setting
 /// `.parent = vm.catch_chain; vm.catch_chain = &site;` and restore the
@@ -87,6 +100,19 @@ pub const Vm = struct {
     /// M6 string-stream registry (streams.zig): fixed array of 8 slots + a
     /// count, zero-initialized (`.{ }`), so a fresh Vm needs no setup.
     streams: streams.StreamRegistry = .{},
+    /// M10 frame-stack pool: a LIFO free-list of up to FRAME_POOL_MAX idle
+    /// old-gen CALLFRAME_ARRAYs (65536 x 48 B ≈ 3 MB each), reused across
+    /// vmExecEnv entries instead of bump-allocating a fresh array per call.
+    /// Each slot is a PERSISTENT ROOT_PTR pushed at init (err_slot
+    /// precedent), so an idle pooled array is pinned below every vmExecEnv
+    /// entry watermark — its full-capacity drain scan (collect.zig) then
+    /// sees an all-null body and pins nothing.
+    frame_pool: [FRAME_POOL_MAX]?[*]types.CallFrame = .{null} ** FRAME_POOL_MAX,
+    /// Number of non-null entries in frame_pool[0..frame_pool_live).
+    frame_pool_live: usize = 0,
+    /// Instrumentation (instr_exec precedent): pool hits/misses across runs.
+    frame_pool_hits: u64 = 0,
+    frame_pool_misses: u64 = 0,
 
     /// Initialize a Vm into `vm` (caller-provided storage so `&vm.err_slot` /
     /// `&vm.defun_table_cap` / `&vm.values_table_cap` stay stable across the
@@ -125,6 +151,11 @@ pub const Vm = struct {
 
         g.rootPushValue(&vm.err_slot);
 
+        // M10: persistent pool-slot roots (err_slot precedent), pushed at
+        // init and popped in reverse at deinit so idle pooled arrays stay
+        // pinned below every vmExecEnv entry watermark.
+        for (0..FRAME_POOL_MAX) |i| g.rootPushPtr(@ptrCast(&vm.frame_pool[i]));
+
         vm.initGlobals();
     }
 
@@ -133,6 +164,13 @@ pub const Vm = struct {
         const a = std.heap.page_allocator;
         a.free(vm.defun_table[0..@as(usize, @intCast(vm.defun_table_cap))]);
         a.free(vm.values_table[0..@as(usize, @intCast(vm.values_table_cap))]);
+        // Pop the pool-slot roots in reverse (LIFO) BEFORE err_slot to keep
+        // the root stack balanced.
+        var i = FRAME_POOL_MAX;
+        while (i > 0) {
+            i -= 1;
+            vm.gc.rootPop(); // frame_pool[i]
+        }
         vm.gc.rootPop(); // err_slot
         vm.symbols.deinit();
         vm.* = undefined;

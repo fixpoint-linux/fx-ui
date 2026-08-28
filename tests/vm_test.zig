@@ -351,9 +351,14 @@ test "M0 Vm skeleton roots err_slot once" {
     v.init(&g);
     defer v.deinit();
 
-    try std.testing.expectEqual(wm + 1, g.rootWatermark());
+    // err_slot (1) + the M10 frame-pool slot roots (FRAME_POOL_MAX).
+    try std.testing.expectEqual(wm + 1 + state.FRAME_POOL_MAX, g.rootWatermark());
     try std.testing.expectEqual(@as(*heap.Gc, &g), v.gc);
     try std.testing.expectEqual(types.ValTag.nil, v.err_slot.tag);
+    // The pool starts empty with no instrumentation yet.
+    try std.testing.expectEqual(@as(usize, 0), v.frame_pool_live);
+    try std.testing.expectEqual(@as(u64, 0), v.frame_pool_hits);
+    try std.testing.expectEqual(@as(u64, 0), v.frame_pool_misses);
 }
 
 // =====================================================================
@@ -2657,4 +2662,320 @@ test "M8 process: glob returns a sorted tagged list of names" {
     try std.testing.expectEqualStrings("c.txt", values.strSlice(tdlFirst(s3)));
     try std.testing.expect(std.mem.eql(u8, "cons", values.symSlice(rest3.payload.cons.car.?.*)));
     try std.testing.expectEqual(types.ValTag.nil, rest3.payload.cons.cdr.?.*.tag);
+}
+
+// =====================================================================
+//  M10 — frame-stack pool (interp.frameStackAcquire/Release)
+// =====================================================================
+
+/// Build a `depth`-level arity-1 cur+apply chain whose deepest body applies
+/// the simple-error primitive with every frame still live (the cd9be11
+/// retention shape: a stale cf.env / cf.stack.data in the pooled array would
+/// pin the per-level env arrays through the drain scan).  Returns the top
+/// program code; the chain stays reachable only via closure_code, so the
+/// caller must root the returned pointer before the next allocation.  Pops
+/// its own build roots back to the entry watermark.
+fn buildThrowingChain(g: *heap.Gc, v: *state.Vm, depth: usize) ![*]types.Instr {
+    const wm0 = g.rootWatermark();
+    const a = std.heap.page_allocator;
+    const nilv: types.Value = .{ .tag = .nil, .payload = .{ .number = 0 } };
+    const slots = try a.alloc(?[*]types.Instr, depth + 1);
+    defer a.free(slots);
+    const boom = symbols.valSymbol(&v.symbols, "simple-error");
+
+    const deepest = g.allocArray(types.Instr, 4);
+    deepest[0] = .{ .op = .pushmark, .operand = nilv, .closure_code = null, .closure_len = 0, .jmp_target = 0 };
+    deepest[1] = .{ .op = .string, .operand = values.valString(g, "boom"), .closure_code = null, .closure_len = 0, .jmp_target = 0 };
+    deepest[2] = .{ .op = .global, .operand = boom, .closure_code = null, .closure_len = 0, .jmp_target = 0 };
+    deepest[3] = .{ .op = .apply, .operand = nilv, .closure_code = null, .closure_len = 0, .jmp_target = 0 };
+    slots[depth] = deepest;
+    g.rootPushPtr(@ptrCast(&slots[depth]));
+
+    var i: usize = depth;
+    while (i > 0) {
+        i -= 1;
+        const arr = g.allocArray(types.Instr, 5);
+        arr[0] = .{ .op = .pushmark, .operand = nilv, .closure_code = null, .closure_len = 0, .jmp_target = 0 };
+        arr[1] = .{ .op = .access, .operand = values.valNumber(0), .closure_code = null, .closure_len = 0, .jmp_target = 0 };
+        arr[2] = .{ .op = .cur, .operand = nilv, .closure_code = @ptrCast(slots[i + 1].?), .closure_len = 4, .jmp_target = 0 };
+        arr[3] = .{ .op = .apply, .operand = nilv, .closure_code = null, .closure_len = 0, .jmp_target = 0 };
+        arr[4] = .{ .op = .ret, .operand = nilv, .closure_code = null, .closure_len = 0, .jmp_target = 0 };
+        slots[i] = arr;
+        g.rootPushPtr(@ptrCast(&slots[i]));
+    }
+
+    const top_arr = g.allocArray(types.Instr, 4);
+    top_arr[0] = .{ .op = .pushmark, .operand = nilv, .closure_code = null, .closure_len = 0, .jmp_target = 0 };
+    top_arr[1] = .{ .op = .number, .operand = values.valNumber(42), .closure_code = null, .closure_len = 0, .jmp_target = 0 };
+    top_arr[2] = .{ .op = .cur, .operand = nilv, .closure_code = @ptrCast(slots[0].?), .closure_len = 5, .jmp_target = 0 };
+    top_arr[3] = .{ .op = .apply, .operand = nilv, .closure_code = null, .closure_len = 0, .jmp_target = 0 };
+
+    g.rootPopTo(wm0);
+    return top_arr;
+}
+
+/// Build a k-level Elm-style over-application peel chain: each level is an
+/// arity-1 closure whose body over-applies the next level (two args into a
+/// 1-param closure), nesting one vmExecEnv per level; each level then returns
+/// a fixed 1-arg closure (KONST, which ignores its arg and returns 7) so the
+/// unwind applies the leftover arg to KONST instead of throwing.  The top
+/// program returns 7 with a total vmExecEnv nesting depth of k + 1 (the
+/// top thunk + k nested peels).  Pops its own build roots; the caller roots
+/// the returned top code before the next allocation.
+fn buildPeelChain(g: *heap.Gc, k: usize) ![*]types.Instr {
+    std.debug.assert(k >= 2);
+    const wm0 = g.rootWatermark();
+    const a = std.heap.page_allocator;
+    const nilv: types.Value = .{ .tag = .nil, .payload = .{ .number = 0 } };
+
+    // KONST: the fixed arity-1 closure every level returns on unwind.
+    const konstant = g.allocArray(types.Instr, 2);
+    konstant[0] = .{ .op = .number, .operand = values.valNumber(7), .closure_code = null, .closure_len = 0, .jmp_target = 0 };
+    konstant[1] = .{ .op = .ret, .operand = nilv, .closure_code = null, .closure_len = 0, .jmp_target = 0 };
+    var konstant_slot: ?[*]types.Instr = konstant;
+    g.rootPushPtr(@ptrCast(&konstant_slot));
+
+    const levels = try a.alloc(?[*]types.Instr, k);
+    defer a.free(levels);
+
+    // Base level L_k: body = cur(KONST) ret  (returns KONST, arity 1).
+    const base = g.allocArray(types.Instr, 2);
+    base[0] = .{ .op = .cur, .operand = nilv, .closure_code = @ptrCast(konstant), .closure_len = 2, .jmp_target = 0 };
+    base[1] = .{ .op = .ret, .operand = nilv, .closure_code = null, .closure_len = 0, .jmp_target = 0 };
+    levels[k - 1] = base;
+    g.rootPushPtr(@ptrCast(&levels[k - 1]));
+
+    // Levels L_{k-1} .. L_1: pushmark number access0 cur(next) apply cur(KONST) ret.
+    var i: usize = k - 1;
+    while (i > 0) {
+        i -= 1;
+        const arr = g.allocArray(types.Instr, 7);
+        arr[0] = .{ .op = .pushmark, .operand = nilv, .closure_code = null, .closure_len = 0, .jmp_target = 0 };
+        arr[1] = .{ .op = .number, .operand = values.valNumber(1), .closure_code = null, .closure_len = 0, .jmp_target = 0 };
+        arr[2] = .{ .op = .access, .operand = values.valNumber(0), .closure_code = null, .closure_len = 0, .jmp_target = 0 };
+        arr[3] = .{ .op = .cur, .operand = nilv, .closure_code = @ptrCast(levels[i + 1].?), .closure_len = if (i + 1 == k - 1) 2 else 7, .jmp_target = 0 };
+        arr[4] = .{ .op = .apply, .operand = nilv, .closure_code = null, .closure_len = 0, .jmp_target = 0 };
+        arr[5] = .{ .op = .cur, .operand = nilv, .closure_code = @ptrCast(konstant), .closure_len = 2, .jmp_target = 0 };
+        arr[6] = .{ .op = .ret, .operand = nilv, .closure_code = null, .closure_len = 0, .jmp_target = 0 };
+        levels[i] = arr;
+        g.rootPushPtr(@ptrCast(&levels[i]));
+    }
+
+    // Top thunk: over-apply L_1 with two args (42, 43).
+    const top_arr = g.allocArray(types.Instr, 5);
+    top_arr[0] = .{ .op = .pushmark, .operand = nilv, .closure_code = null, .closure_len = 0, .jmp_target = 0 };
+    top_arr[1] = .{ .op = .number, .operand = values.valNumber(42), .closure_code = null, .closure_len = 0, .jmp_target = 0 };
+    top_arr[2] = .{ .op = .number, .operand = values.valNumber(43), .closure_code = null, .closure_len = 0, .jmp_target = 0 };
+    top_arr[3] = .{ .op = .cur, .operand = nilv, .closure_code = @ptrCast(levels[0].?), .closure_len = 7, .jmp_target = 0 };
+    top_arr[4] = .{ .op = .apply, .operand = nilv, .closure_code = null, .closure_len = 0, .jmp_target = 0 };
+
+    g.rootPopTo(wm0);
+    return top_arr;
+}
+
+test "M10 frame-stack pool: sequential vmExec calls reuse one array" {
+    var g = try testInit();
+    defer g.deinit();
+    var v: state.Vm = undefined;
+    v.init(&g);
+    defer v.deinit();
+    const wm0 = g.rootWatermark();
+
+    // First call misses (fresh ~3 MB old-gen array), then releases to pool.
+    try expectRunNum(&g, &v, "(mn[1:n]2n[1:n]1g[1:s]+t)", 3);
+    try std.testing.expectEqual(@as(u64, 1), v.frame_pool_misses);
+    try std.testing.expectEqual(@as(u64, 0), v.frame_pool_hits);
+    try std.testing.expectEqual(@as(usize, 1), v.frame_pool_live);
+
+    // Every later call hits the pooled array: misses stay 1, hits climb.
+    var i: usize = 0;
+    while (i < 50) : (i += 1) {
+        try expectRunNum(&g, &v, "(mn[1:n]2n[1:n]1g[1:s]+t)", 3);
+    }
+    try std.testing.expectEqual(@as(u64, 1), v.frame_pool_misses);
+    try std.testing.expectEqual(@as(u64, 50), v.frame_pool_hits);
+    try std.testing.expectEqual(@as(usize, 1), v.frame_pool_live);
+    try std.testing.expectEqual(wm0, g.rootWatermark());
+}
+
+test "M10 frame-stack pool: error unwind clears the used range (retention regression)" {
+    var g = try testInit();
+    defer g.deinit();
+    var v: state.Vm = undefined;
+    v.init(&g);
+    defer v.deinit();
+    const wm0 = g.rootWatermark();
+
+    // Clean floor: a trivial call pools one clean array; a full collect then
+    // leaves only that array live (the result scalar has no GC payload).
+    try expectRunNum(&g, &v, "(mn[1:n]2n[1:n]1g[1:s]+t)", 3);
+    g.collect(.@"test");
+    const clean = g.allocatedPages();
+
+    // Deep apply chain whose deepest body throws (simple-error) with all
+    // `depth` frames still live — the cd9be11 retention shape.  A stale
+    // cf.env/cf.stack.data pointer left in the pooled array would pin the
+    // per-level env arrays through every later full collect; release's
+    // clear-only-live-range invariant must prevent that.
+    const depth: usize = 300;
+    // Keep ONLY the program root (the chain stays reachable via closure_code).
+    var top: ?[*]types.Instr = try buildThrowingChain(&g, &v, depth);
+    g.rootPushPtr(@ptrCast(&top));
+
+    // The throw unwinds all `depth` frames; release clears [0..depth).
+    try std.testing.expectError(error.ShenError, interp.vmExec(&v, @ptrCast(top.?), 4));
+
+    // The released array is back in the pool, all-null across the used range
+    // — the make-or-break invariant, checked white-box.
+    try std.testing.expectEqual(@as(usize, 1), v.frame_pool_live);
+    const pooled = v.frame_pool[0].?;
+    var j: usize = 0;
+    while (j <= depth) : (j += 1) {
+        try std.testing.expect(pooled[j].code == null);
+        try std.testing.expect(pooled[j].env == null);
+        try std.testing.expect(pooled[j].stack.data == null);
+    }
+
+    // Drop the program root and force a full collect: the only extra live
+    // object over the clean floor is the retained error value (a few pages).
+    // A stale env pointer would pin ~depth env arrays and blow past +32.
+    g.rootPop(); // top
+    g.collect(.@"test");
+    const after = g.allocatedPages();
+    try std.testing.expect(after <= clean + 32);
+
+    // Idle pooled array + repeated forced collects -> pages stay stable.
+    g.collect(.@"test");
+    try std.testing.expectEqual(after, g.allocatedPages());
+    try std.testing.expectEqual(wm0, g.rootWatermark());
+}
+
+test "M10 frame-stack pool: reentrancy (trap-error + peel) keeps the pool bounded" {
+    var g = try testInit();
+    defer g.deinit();
+    var v: state.Vm = undefined;
+    v.init(&g);
+    defer v.deinit();
+    const wm0 = g.rootWatermark();
+
+    // Plain call establishes the single-array baseline.
+    try expectRunNum(&g, &v, "(mn[1:n]2n[1:n]1g[1:s]+t)", 3);
+    try std.testing.expectEqual(@as(u64, 1), v.frame_pool_misses);
+    try std.testing.expectEqual(@as(usize, 1), v.frame_pool_live);
+
+    // trap-error nests vmExecEnv twice (throwing body, then handler),
+    // SEQUENTIALLY — the handler reuses the body's released array.  Misses
+    // cap at 2 (nesting depth), never growing with the number of calls, and
+    // the LIFO free-list means a nested call can never alias an outer frame.
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        try expectRunStr(
+            &g,
+            &v,
+            "(mc(S[6:S]caughtv)c(mS[4:S]oopsg[12:s]simple-errorpv)g[10:s]trap-errorp)",
+            "caught",
+        );
+    }
+    try std.testing.expectEqual(@as(u64, 2), v.frame_pool_misses);
+    try std.testing.expectEqual(@as(usize, 2), v.frame_pool_live);
+
+    // N>A peel nests one extra vmExecEnv per over-application step; a single
+    // step (3 args into a 2-param fn returning a 1-param fn) keeps the pool
+    // at depth 2, and the result (7 == env[0]) proves no aliasing.
+    var k: usize = 0;
+    while (k < 20) : (k += 1) {
+        try expectRunNum(&g, &v, "(mn[1:n]9n[1:n]8n[1:n]7c(rc(a[1:n]2v)v)p)", 7);
+    }
+    try std.testing.expectEqual(@as(u64, 2), v.frame_pool_misses);
+    try std.testing.expectEqual(@as(usize, 2), v.frame_pool_live);
+    try std.testing.expect(v.frame_pool_hits > 0);
+    try std.testing.expectEqual(wm0, g.rootWatermark());
+}
+
+test "M10 frame-stack pool: pool-full drop branch (deep peel overflows the cap)" {
+    // Larger than testInit: depth-3 nesting needs 3 simultaneously-live
+    // ~3 MB arrays (~9 MB), which would sit just above the 16 MB heap's
+    // 8 MB old-gen threshold and churn grow_heap (the SF-1 failure mode).
+    // The test only verifies the drop branch, so give it headroom.
+    var g = try heap.Gc.init(.{
+        .heap_bytes = 64 * 1024 * 1024,
+        .reserve_bytes = 256 * 1024 * 1024,
+    });
+    defer g.deinit();
+    var v: state.Vm = undefined;
+    v.init(&g);
+    defer v.deinit();
+    const wm0 = g.rootWatermark();
+
+    // k nested peel levels + the top thunk = k + 1 simultaneous vmExecEnv
+    // entries, one past FRAME_POOL_MAX.  Every level over-applies the next,
+    // so each acquisition during the descent is a fresh alloc (all entries
+    // are live at once); on unwind the pool fills to FRAME_POOL_MAX and the
+    // last release hits the drop branch.  (Depth is kept one above the cap
+    // so the ~3 MB/array peak stays well within the 16 MB semi-space.)
+    const k: usize = state.FRAME_POOL_MAX; // depth 4 > cap 3
+    const depth: u64 = @intCast(k + 1); // + the top thunk
+    const cap: u64 = @intCast(state.FRAME_POOL_MAX);
+
+    var run: usize = 0;
+    while (run < 2) : (run += 1) {
+        var top: ?[*]types.Instr = try buildPeelChain(&g, k);
+        g.rootPushPtr(@ptrCast(&top));
+        const got = try interp.vmExec(&v, @ptrCast(top.?), 5);
+        g.rootPop();
+        try std.testing.expectEqual(types.ValTag.number, got.tag);
+        try std.testing.expectEqual(@as(i64, 7), got.payload.number);
+    }
+
+    // Run 1 allocated `depth` fresh arrays (all misses) and dropped the
+    // excess beyond the cap; run 2 reused the `cap` retained arrays and
+    // re-allocated the other `depth - cap` (the drop branch).  live stays
+    // capped at `cap` throughout — the drop path must re-allocate correctly
+    // with no corruption.
+    try std.testing.expectEqual(depth + (depth - cap), v.frame_pool_misses);
+    try std.testing.expectEqual(cap, v.frame_pool_hits);
+    try std.testing.expectEqual(state.FRAME_POOL_MAX, v.frame_pool_live);
+    try std.testing.expectEqual(wm0, g.rootWatermark());
+}
+
+test "M10 frame-stack pool: reuse clears only the live range (deep then shallow)" {
+    var g = try testInit();
+    defer g.deinit();
+    var v: state.Vm = undefined;
+    v.init(&g);
+    defer v.deinit();
+    const wm0 = g.rootWatermark();
+
+    const deep: usize = 300;
+    const shallow: usize = 3;
+
+    // Deep throw: dirties slots [0..deep); the error unwind leaves every
+    // frame live, so release clears the whole [0..deep) range.
+    var top: ?[*]types.Instr = try buildThrowingChain(&g, &v, deep);
+    g.rootPushPtr(@ptrCast(&top));
+    try std.testing.expectError(error.ShenError, interp.vmExec(&v, @ptrCast(top.?), 4));
+    g.rootPop();
+    try std.testing.expectEqual(@as(usize, 1), v.frame_pool_live);
+
+    // Shallow throw REUSES the same pooled array: dirties [0..shallow),
+    // release clears only that range — the induction step that makes
+    // "clear only [0..sp)" sufficient across reuse.
+    var top2: ?[*]types.Instr = try buildThrowingChain(&g, &v, shallow);
+    g.rootPushPtr(@ptrCast(&top2));
+    try std.testing.expectError(error.ShenError, interp.vmExec(&v, @ptrCast(top2.?), 4));
+    g.rootPop();
+
+    // The pooled array must be all-null across BOTH ranges: [0..shallow)
+    // cleared by this release, [shallow..deep) still null from the deep
+    // release (and never re-dirtied).  Any stale cf.env / cf.stack.data
+    // would pin a dead env array through the full-capacity drain scan.
+    try std.testing.expectEqual(@as(usize, 1), v.frame_pool_live);
+    const pooled = v.frame_pool[0].?;
+    var j: usize = 0;
+    while (j < deep) : (j += 1) {
+        try std.testing.expect(pooled[j].code == null);
+        try std.testing.expect(pooled[j].env == null);
+        try std.testing.expect(pooled[j].stack.data == null);
+    }
+    try std.testing.expectEqual(wm0, g.rootWatermark());
 }
