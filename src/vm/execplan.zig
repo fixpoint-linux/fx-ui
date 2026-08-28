@@ -114,13 +114,15 @@ const ca = std.heap.page_allocator;
 // =====================================================================
 
 /// C: ROP_SEQ/ROP_AND/ROP_OR.  `and`/`or` are Zig keywords -> and_/or_.
-const ChainOp = enum { seq, and_, or_ };
+/// (pub for the M9 async exec: the host classifies a decoded plan.)
+pub const ChainOp = enum { seq, and_, or_ };
 
 /// C: RR_IN/RR_OUT/RR_APPEND/RR_DUP/RR_HDOC/RR_HSTR.
-const RedirKind = enum { in, out, append, dup, hdoc, hstr };
+/// (pub for the M9 async exec: single-command classification reads redirs.)
+pub const RedirKind = enum { in, out, append, dup, hdoc, hstr };
 
 /// C: RRedir.  path/body own page_allocator [:0]u8 copies (decode-time).
-const RRedir = struct {
+pub const RRedir = struct {
     kind: RedirKind = .in,
     fd: i32 = 0, // 0 / 1 / 2
     path: ?[:0]u8 = null, // in/out/append target path (owned)
@@ -131,15 +133,15 @@ const RRedir = struct {
 
 /// C: RCmd.  argv is a page_allocator sentinel(null)-terminated pointer
 /// array (C's char** NULL-terminated); argv.len == argc.
-const RCmd = struct {
+pub const RCmd = struct {
     argv: [:null]const ?[*:0]const u8 = &[_:null]?[*:0]const u8{}, // empty (subshell) default
     redirs: []RRedir = &[_]RRedir{},
     sub: ?*RProg = null, // null = plain command; else nested program (argv.len == 0)
 };
 
-const RPipe = struct { cmds: []RCmd = &[_]RCmd{} };
-const RChain = struct { op: ChainOp = .seq, pipe: RPipe = .{} };
-const RProg = struct { chains: []RChain = &[_]RChain{} };
+pub const RPipe = struct { cmds: []RCmd = &[_]RCmd{} };
+pub const RChain = struct { op: ChainOp = .seq, pipe: RPipe = .{} };
+pub const RProg = struct { chains: []RChain = &[_]RChain{} };
 
 const PLAN_MAX_CHAINS = 256;
 const PLAN_MAX_CMDS = 64;
@@ -360,6 +362,8 @@ fn freeZ(p: [*:0]const u8) void {
 
 // =====================================================================
 //  Freeing — C: zincvm.c:1219-1248 cmd_free/pipe_free/plan_free
+//  (planFree is pub for the M9 async exec: the host frees the decoded plan
+//  it holds across the fork+waitpid lifetime.)
 // =====================================================================
 
 fn cmdFree(c: *RCmd) void {
@@ -385,7 +389,8 @@ fn pipeFree(pp: *RPipe) void {
     pp.* = .{};
 }
 
-fn planFree(p: *RProg) void {
+/// C: zincvm.c:1239-1248 plan_free.  (pub for the M9 async exec.)
+pub fn planFree(p: *RProg) void {
     for (p.chains) |*ch| pipeFree(&ch.pipe);
     if (p.chains.len != 0) ca.free(p.chains);
     p.* = .{};
@@ -710,8 +715,10 @@ fn openBodyTmpfile(body: [:0]const u8) i32 {
 /// C: zincvm.c:1448-1489 apply_redirects — sequential left-to-right dup2
 /// application gives POSIX semantics directly (2>&1 before >file snapshots
 /// the old stdout into fd 2; no lookahead needed).  Open failure:
-/// write(2) + return -1 (caller _exit(1)).
-fn applyRedirects(c: *RCmd) i32 {
+/// write(2) + return -1 (caller _exit(1)).  (pub for the M9 async exec's
+/// fork path — although the async fast path only runs REDIRECT-FREE single
+/// commands, the helper is part of the shared child-side surface.)
+pub fn applyRedirects(c: *RCmd) i32 {
     for (c.redirs) |*r| {
         switch (r.kind) {
             .in => {
@@ -755,8 +762,9 @@ fn applyRedirects(c: *RCmd) i32 {
 
 /// C: zincvm.c:1494-1532 child_builtin — builtins runnable INSIDE pipeline/
 /// subshell children.  Writes to fd 1/2 (already redirected).  Returns exit
-/// code, or -1 when argv[0] is not a builtin.
-fn childBuiltin(argc: usize, argv: [:null]const ?[*:0]const u8) i32 {
+/// code, or -1 when argv[0] is not a builtin.  (pub for the M9 async exec:
+/// a single-command plan that names a builtin runs it in the forked child.)
+pub fn childBuiltin(argc: usize, argv: [:null]const ?[*:0]const u8) i32 {
     if (argc == 0 or argv[0] == null) return -1;
     const a0 = std.mem.sliceTo(argv[0].?, 0);
     if (std.mem.eql(u8, a0, "echo")) {
@@ -827,8 +835,9 @@ fn isChildBuiltin(a0: []const u8) bool {
 /// CURRENT process with fds 0/1/2 saved and restored around it (POSIX
 /// simple-command semantics for builtins inside a subshell: (cd /; pwd)
 /// must let the cd affect the subshell process).  Only ever called with
-/// in_child==1; the parent exec-plan path forks instead.
-fn runBuiltinInprocess(c: *RCmd, outfd: i32, errfd: i32) i32 {
+/// in_child==1; the parent exec-plan path forks instead.  (pub for the M9
+/// async exec's shared child-side surface.)
+pub fn runBuiltinInprocess(c: *RCmd, outfd: i32, errfd: i32) i32 {
     const sav0 = dup(0);
     const sav1 = dup(1);
     const sav2 = dup(2);
@@ -891,7 +900,8 @@ fn wirePipeTmpfds(pp: *RPipe) i32 {
 /// (= std.c.W = linux.W); IFEXITED/EXITSTATUS match glibc.  TERMSIG returns
 /// a SIG enum, so the signal arm re-derives from the raw status bits —
 /// identical to glibc's WTERMSIG(s) = s & 0x7f (and C's 128+sig).
-fn waitStatusCode(st: u32) i32 {
+/// (pub for the M9 async exec: the host computes the exit code from waitpid.)
+pub fn waitStatusCode(st: u32) i32 {
     if (std.posix.W.IFEXITED(st)) return std.posix.W.EXITSTATUS(st);
     return 128 + @as(i32, @intCast(st & 0x7f));
 }

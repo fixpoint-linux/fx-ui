@@ -1,4 +1,4 @@
-module Runtime exposing (worker)
+module Runtime exposing (worker, program)
 
 -- M7 self-hosted async Kernel runtime (compiled by the compiler itself, like
 -- Prelude).  NAMED `Runtime` (not `Platform`) because elm/core already ships a
@@ -40,11 +40,26 @@ type alias Cmd msg = List (Task Never msg)
 type alias Sub msg = ()
 
 
+-- M9: a Program is returned by `program` as DATA (vector[Program, m0, c0,
+-- updateFn], tag = bare symbol 'Program') so the HOST event loop
+-- (src/vm/effectloop.zig) can drive the effects natively — real out-of-order
+-- concurrency the synchronous worker cannot express.
+type Program m c u
+    = Program m c u
+
+
 worker config =
     let
         ( m0, c0 ) = config.init ()
     in
     drive config.update m0 c0
+
+
+program config =
+    let
+        ( m0, c0 ) = config.init ()
+    in
+    Program m0 c0 config.update
 
 
 drive update model cmd =

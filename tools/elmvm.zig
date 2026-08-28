@@ -23,6 +23,7 @@ const state = vm.state;
 const parser = vm.parser;
 const interp = vm.interp;
 const streams = vm.streams;
+const effectloop = vm.effectloop;
 
 const HEAP_BYTES: usize = 16 * 1024 * 1024;
 const RESERVE_BYTES: usize = 64 * 1024 * 1024;
@@ -123,7 +124,7 @@ pub fn main(init: std.process.Init) !void {
     const len = try parser.parseBytecode(&g, &v.symbols, snippet_z, &code);
     parser.resolveJumps(code.?, len);
     g.rootPushPtr(@ptrCast(&code));
-    const result = interp.vmExec(&v, @ptrCast(code.?), len) catch |e| {
+    var result = interp.vmExec(&v, @ptrCast(code.?), len) catch |e| {
         g.rootPop();
         std.debug.print("elmvm: error: {s}\n", .{values.errSlice(v.err_slot)});
         return e;
@@ -132,7 +133,25 @@ pub fn main(init: std.process.Init) !void {
 
     var outbuf: [16384]u8 = undefined;
     var w: std.Io.Writer = .fixed(&outbuf);
-    try values.printValue(&w, result);
+
+    // ---- M9: auto-detect a Program vector and drive the host event loop ----
+    // main returns Program m0 c0 update as DATA when the fixture uses
+    // Platform.program; root the result across the loop, drive it to the final
+    // model, then print that model.  Otherwise print the (sync) result as
+    // today — the 51 sync fixtures are unchanged.
+    g.rootPushValue(&result);
+    defer g.rootPop();
+    if (effectloop.isProgram(result)) {
+        var final = effectloop.runProgram(&v, result) catch |e| {
+            std.debug.print("elmvm: error: {s}\n", .{values.errSlice(v.err_slot)});
+            return e;
+        };
+        g.rootPushValue(&final);
+        defer g.rootPop();
+        try values.printValue(&w, final);
+    } else {
+        try values.printValue(&w, result);
+    }
     try std.Io.File.writeStreamingAll(std.Io.File.stdout(), io, w.buffered());
     try std.Io.File.writeStreamingAll(std.Io.File.stdout(), io, "\n");
 }

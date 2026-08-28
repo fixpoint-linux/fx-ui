@@ -56,6 +56,19 @@ reviewed safe-to-ship, committed.
   list builders (`str`/`num`/`sym`/`nil`/`cons` + `intern`) building the Shen TAGGED-LIST
   demarshal plan format; `decodeExec`/`decodeStringList` walk the tagged results.
   Gate 51/51 (execpipe pipeline / execenv env+cwd / execglob), vm-test unchanged.
+- **M9** (TRUE nonblocking async): **DONE** — a HOST-SIDE effect-manager event loop
+  (Design A; `src/vm/effectloop.zig` + `src/vm/hostcall.zig`). The VM runs each call
+  as deep native `vmExecEnv` recursion (stream prims block natively), so effects run
+  in the HOST: `main` returns a Program as DATA (vector `[Program, m0, c0, update]`,
+  tag = bare symbol `'Program'`; `Platform.program`/`Runtime.program`); the host loop
+  interprets each Task natively (CEK machine over the Task ADT) with nonblocking I/O
+  via `std.posix.poll`, applies continuation closures via `applyClosureN` (a fresh
+  `vmExecEnv` call), feeds msgs to update, and loops. `readFile` opens `O_NONBLOCK`
+  and drains available bytes; `exec` runs a single command async (fork+execvp, piped
+  stdout/stderr polled + `waitpid WNOHANG`); complex plans/redirects fall back to the
+  sync `exec-plan`; `write`/`writeFile`/env/cwd/getpid/glob are synchronous. Multiple
+  independent effects in flight complete OUT OF ORDER — proven by `asyncorder`
+  (slow `sleep 1` exec + fast read: model `"file,ran"`). Gate 52/52; vm-test 86/86.
 
 Convention: this document numbers milestones **M1 … MX** where **MX is the terminal
 milestone** (the pure-core Elm runtime delivering `main -> value`). The compiler
@@ -334,6 +347,8 @@ perfect hash, `eval-kl` + marshal layer, `symbol_static`, the trace facility, an
 cooperative Task monad + effect-manager loop). The stream I/O prims
 (`write-byte/read-byte/read-file-as-string/open/close` + `val_string_stream_in`) and a
 minimal self-hosted `Platform`/`Cmd`/`Sub`-style effects runtime have landed in M6 (sync
-`src/vm` from `shen/zig` when porting the remaining deferred pieces). TRUE nonblocking
-(poll/select VM seam) remains out of scope. MX deliberately stops
+`src/vm` from `shen/zig` when porting the remaining deferred pieces). ~~TRUE nonblocking
+(poll/select VM seam) remains out of scope.~~ TRUE nonblocking async has landed in M9
+(a host-side effect-manager event loop with `std.posix.poll` + nonblocking readFile/exec).
+MX deliberately stops
 at the **pure** `main -> value` runtime.

@@ -397,6 +397,7 @@ primDotAliases =
 platformTable : List ( String, String )
 platformTable =
     [ ( "Platform.worker", "Runtime.worker" )
+    , ( "Platform.program", "Runtime.program" )
     , ( "Cmd.none", "Runtime.cmdNone" )
     , ( "Cmd.batch", "Runtime.cmdBatch" )
     , ( "Cmd.map", "Runtime.cmdMap" )

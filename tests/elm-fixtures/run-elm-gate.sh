@@ -214,6 +214,10 @@ run taskattempt  main   "$(read_expected taskattempt)"
 run execpipe     main   "$(read_expected execpipe)"
 run execenv      main   "$(read_expected execenv)"
 run execglob     main   "$(read_expected execglob)"
+# --- M9: TRUE nonblocking async (host event loop drives a Program) ---
+run asyncorder   main   "$(read_expected asyncorder)"
+run fastexec     main   "$(read_expected fastexec)"
+run asyncpure    main   "$(read_expected asyncpure)"
 compile_error dup         "duplicate top-level definition in Dup: f"
 
 rm -rf "$OUT"
