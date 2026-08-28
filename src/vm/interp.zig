@@ -55,6 +55,15 @@
 //!   lambda field through the rooted acc slot (5) after each allocation.
 //!   [EPILOGUE] the defer rootPopTo(entry_wm) above covers every exit,
 //!   including error returns.
+//!   [ENV OWNERSHIP] the current env array (slot 3) has exactly ONE referee:
+//!   closure Values hold only valLambda COPIES of an env (values.zig:154 —
+//!   the running array is never stored into a closure), saved CallFrames hold
+//!   OTHER arrays (ownership transfers &env<->cf.env atomically at apply push
+//!   and popFramePushAcc), and nested vmExecEnv entries pass freshly-built
+//!   arrays that the prologue COPIES (:569-584).  This invariant is what makes
+//!   the appterm N==A tail-env REUSE safe (the old env is dead after the tail
+//!   jump); the reused array's tail [new_env_len..env_cap) must be nil-cleared
+//!   and env_cap must remain the TRUE physical capacity.
 
 const std = @import("std");
 const gc = @import("gc");
@@ -985,12 +994,49 @@ pub fn vmExecEnv(
                     }
 
                     if (acc.tag == .lambda and nargs == arity) {
-                        // N==A — EXISTING tail-jump path, byte-identical
-                        // (pc = 0, no new CallFrame — frame reuse).
+                        // N==A — tail-jump path (pc = 0, no new CallFrame —
+                        // frame reuse).  M11: REUSE the current env array when
+                        // it fits.  The old env is DEAD here: a closure Value
+                        // holds only a valLambda COPY of its env (values.zig),
+                        // saved CallFrames hold OTHER arrays (ownership moves
+                        // atomically at apply push / popFramePushAcc), and
+                        // nested vmExecEnv entries COPied their init_env in the
+                        // prologue — so the current array's ONLY referee is the
+                        // rooted &env slot (3).  Reuse is therefore safe with
+                        // no liveness analysis, provided the dead tail is
+                        // cleared (the drain scans VALUE_ARRAYs by full
+                        // capacity) and env_cap stays the TRUE physical
+                        // capacity (envPush growth math reads it).
                         const lambda_env_len = acc.payload.lambda.env_len;
                         const new_env_len = lambda_env_len + nargs;
-                        const ne = g.allocArray(Value, @intCast(new_env_len));
-                        // cur_code set AFTER the alloc from the rooted acc — the
+                        const reuse = env != null and env_cap >= new_env_len;
+                        const ne: [*]Value = if (reuse) env.? else g.allocArray(Value, @intCast(new_env_len));
+                        // new_cap is the array's TRUE physical capacity: on
+                        // reuse that is the retained env_cap (NOT new_env_len —
+                        // faking it would break envPush's grow bounds); on a
+                        // miss it is the exact-size alloc.
+                        const new_cap: i32 = if (reuse) env_cap else new_env_len;
+                        if (reuse) {
+                            if (env_cap > new_env_len) {
+                                // Tail clear: [new_env_len..env_cap) still holds
+                                // the dead caller's stale refs; nil them so the
+                                // full-capacity drain scan pins nothing.
+                                const tail: usize = @intCast(new_env_len);
+                                const cap: usize = @intCast(env_cap);
+                                @memset(ne[tail..cap], values.valNil());
+                            }
+                            vm.env_reuse_hits += 1;
+                        } else {
+                            vm.env_reuse_misses += 1;
+                        }
+                        // NO-ALLOC WINDOW (load-bearing): between `ne = env.?`
+                        // above and `env = ne` below there must be NO GC
+                        // allocation — `ne` is a raw copy of the rooted slot's
+                        // pointer and would go stale if a collect moved the
+                        // array.  Today every statement here is alloc-free
+                        // (memcpy/stores are no-ops, dirtyVectorsAdd uses
+                        // page_allocator), so `ne` stays fresh.
+                        // cur_code set AFTER any alloc from the rooted acc — the
                         // rooted cur_code slot (7) makes any interim value safe,
                         // and reading acc fresh after the alloc matches C:3423-3425.
                         cur_code = acc.payload.lambda.code;
@@ -1019,7 +1065,7 @@ pub fn vmExecEnv(
                         }
                         env = ne;
                         env_len = new_env_len;
-                        env_cap = new_env_len;
+                        env_cap = new_cap;
                         g.rootPop(); // argbuf — C:3451
                         pc = 0;
                     } else {

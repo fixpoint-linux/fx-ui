@@ -113,6 +113,13 @@ pub const Vm = struct {
     /// Instrumentation (instr_exec precedent): pool hits/misses across runs.
     frame_pool_hits: u64 = 0,
     frame_pool_misses: u64 = 0,
+    /// M11 tail-env reuse (interp.zig appterm N==A): hits = a tail call
+    /// reused the current env array (the dead caller env fits the new
+    /// arity); misses = a tail call had to allocate a fresh exact-size env
+    /// array (first tail call after a frame restore, or the new env is
+    /// larger than the retained physical capacity).
+    env_reuse_hits: u64 = 0,
+    env_reuse_misses: u64 = 0,
 
     /// Initialize a Vm into `vm` (caller-provided storage so `&vm.err_slot` /
     /// `&vm.defun_table_cap` / `&vm.values_table_cap` stay stable across the

@@ -2979,3 +2979,225 @@ test "M10 frame-stack pool: reuse clears only the live range (deep then shallow)
     }
     try std.testing.expectEqual(wm0, g.rootWatermark());
 }
+
+// =====================================================================
+//  M11 — appterm tail-env reuse (interp.zig appterm N==A)
+// =====================================================================
+
+/// Number of decimal digits of `v` (for csexp `a[<len>:n]<v>` access operands).
+fn ndigits(v: usize) usize {
+    var d: usize = 1;
+    var x = v;
+    while (x >= 10) : (x /= 10) d += 1;
+    return d;
+}
+
+/// Build the M11 retention-test branchy self-loop BODY (no `(c ...)` wrapper)
+/// into `buf`, returning the plain slice.  Arity 2: loop(n, a) binds K
+/// let-values — each a cons chain of L literal conses — on ODD n, and
+/// tail-jumps with env_len == 2 on EVEN n.  The odd path leaves the K lets in
+/// the reused env array's [2..cap) tail, exactly the shape a missing tail-clear
+/// would retain through the drain's full-capacity VALUE_ARRAY scan.
+fn branchyBody(buf: []u8, K: usize, L: usize) []const u8 {
+    const BIND: usize = 24; // odd-path start (after the even tail-call path)
+    const odd_tail: usize = 9; // m n1 a<K> P+ n1 a<K+1> P- g branch t
+    const RET: usize = BIND + K * (2 * L + 2) + odd_tail;
+
+    var n: usize = 0;
+    const put = struct {
+        fn f(b: []u8, i: *usize, s: []const u8) void {
+            @memcpy(b[i.*..][0..s.len], s);
+            i.* += s.len;
+        }
+    }.f;
+    const putNum = struct {
+        fn f(b: []u8, i: *usize, v: usize) void {
+            const s = std.fmt.bufPrint(b[i.*..], "{d}", .{v}) catch unreachable;
+            i.* += s.len;
+        }
+    }.f;
+
+    // 0..6: base-case check; the j[<len>:n]<RET> at index 6 skips to the ret.
+    put(buf, &n, "rn[1:n]0a[1:n]1P[1:s]=f[1:n]7a[1:n]0j[");
+    putNum(buf, &n, ndigits(RET));
+    put(buf, &n, ":n]");
+    putNum(buf, &n, RET);
+    // 7..14: parity check (n == (n/2)*2); jmpf to BIND when odd.
+    put(buf, &n, "n[1:n]2a[1:n]1P[1:s]/n[1:n]2P[1:s]*a[1:n]1P[1:s]=f[");
+    putNum(buf, &n, ndigits(BIND));
+    put(buf, &n, ":n]");
+    putNum(buf, &n, BIND);
+    // 15..23: EVEN path — no lets, tail-call branch(n-1, a+1).
+    put(buf, &n, "mn[1:n]1a[1:n]0P[1:s]+n[1:n]1a[1:n]1P[1:s]-g[6:s]brancht");
+    // ODD path: K lets, each a chain of L literal conses.
+    var k: usize = 0;
+    while (k < K) : (k += 1) {
+        put(buf, &n, "n[1:n]1n[1:n]1P[4:s]cons");
+        var l: usize = 1;
+        while (l < L) : (l += 1) put(buf, &n, "n[1:n]1P[4:s]cons");
+        put(buf, &n, "e");
+    }
+    // Odd tail call reads n/a at the fixed post-let offsets (access K / K+1).
+    put(buf, &n, "mn[1:n]1a[");
+    putNum(buf, &n, ndigits(K));
+    put(buf, &n, ":n]");
+    putNum(buf, &n, K);
+    put(buf, &n, "P[1:s]+n[1:n]1a[");
+    putNum(buf, &n, ndigits(K + 1));
+    put(buf, &n, ":n]");
+    putNum(buf, &n, K + 1);
+    put(buf, &n, "P[1:s]-g[6:s]branchtv");
+    return buf[0..n];
+}
+
+test "M11 tail-env reuse: deep self-recursion reuses one env array" {
+    var g = try testInit();
+    defer g.deinit();
+    var v: state.Vm = undefined;
+    v.init(&g);
+    defer v.deinit();
+    const wm0 = g.rootWatermark();
+
+    // loop(n, acc) = if n==0 acc else loop(n-1, acc+1) — a defun-registered
+    // closure whose body tail-calls itself via g[loop] (appterm N==A).
+    // Body [r n0 a1 P= f7 a0 j16 m n1 a0 P+ n1 a1 P- g loop t v].
+    const loop = try expectRunVal(&g, &v,
+        "(c(rn[1:n]0a[1:n]1P[1:s]=f[1:n]7a[1:n]0j[2:n]16mn[1:n]1a[1:n]0P[1:s]+n[1:n]1a[1:n]1P[1:s]-g[4:s]looptv))");
+    try std.testing.expectEqual(types.ValTag.lambda, loop.tag);
+    v.defunSet("loop", loop);
+
+    // loop(2000, 0) == 2000; all 2000 tail calls reuse the apply-built env
+    // array (misses stay 0 — the apply path's initial alloc is not counted).
+    try expectRunNum(&g, &v, "(mn[1:n]0n[4:n]2000g[4:s]loopp)", 2000);
+    try std.testing.expectEqual(@as(u64, 2000), v.env_reuse_hits);
+    try std.testing.expectEqual(@as(u64, 0), v.env_reuse_misses);
+    try std.testing.expectEqual(wm0, g.rootWatermark());
+}
+
+test "M11 tail-env reuse: closure args survive scavenges (aliasing probe)" {
+    var g = try testInit();
+    defer g.deinit();
+    var v: state.Vm = undefined;
+    v.init(&g);
+    defer v.deinit();
+    const wm0 = g.rootWatermark();
+
+    const id = try expectRunVal(&g, &v, "(c(a[1:n]0v))");
+    v.defunSet("id", id);
+
+    // loop(n, f): if n==0 apply f to 0; else tail-call loop(n-1, cur(identity)).
+    // The argbuf carries a FRESH closure each iteration whose env is a valLambda
+    // COPY of the loop env, so the reused array's write barrier must keep the
+    // closure chain alive across scavenges.
+    const loop = try expectRunVal(&g, &v,
+        "(c(rn[1:n]0a[1:n]1P[1:s]=f[2:n]10mn[1:n]0a[1:n]0pvmc(a[1:n]0v)n[1:n]1a[1:n]1P[1:s]-g[4:s]looptv))");
+    v.defunSet("loop", loop);
+
+    var i: usize = 0;
+    while (i < 3) : (i += 1) {
+        try expectRunNum(&g, &v, "(mg[2:s]idn[4:n]3000g[4:s]loopp)", 0);
+        g.collectNursery(.@"test");
+    }
+    try std.testing.expectEqual(@as(u64, 9000), v.env_reuse_hits);
+    try std.testing.expectEqual(@as(u64, 0), v.env_reuse_misses);
+    try std.testing.expectEqual(wm0, g.rootWatermark());
+}
+
+test "M11 tail-env reuse: stale tail cleared (retention regression)" {
+    var g = try testInit();
+    defer g.deinit();
+    var v: state.Vm = undefined;
+    v.init(&g);
+    defer v.deinit();
+    const wm0 = g.rootWatermark();
+
+    // branch(n, a): ODD n binds 30 let-values (each a 30-cons chain — big
+    // garbage) then tail-jumps; EVEN n tail-jumps with env_len == 2.  The odd
+    // path grows the env array to cap 64 and the even path reuses it with
+    // env_len == 2, leaving [2..cap) stale unless the tail-clear nils it.
+    var body_buf: [16384]u8 = undefined;
+    const body = branchyBody(&body_buf, 30, 30);
+    var prog: [16384]u8 = undefined;
+    const src = std.fmt.bufPrintZ(&prog, "(c({s}))", .{body}) catch unreachable;
+    const branch = try expectRunVal(&g, &v, src);
+    v.defunSet("branch", branch);
+
+    // branch(200, 0) == 200.  The last odd iteration (n==1) binds the 30
+    // cons-chains and tail-jumps; the base case then leaves the env array dead
+    // but still in the remembered set (old-gen + dirty from those stores).
+    try expectRunNum(&g, &v, "(mn[1:n]0n[3:n]200g[6:s]branchp)", 200);
+    const before = g.allocatedPages();
+    g.collectNursery(.@"test");
+    // The post-run scavenge scans the dead-but-dirty env array by FULL capacity:
+    // a missing tail-clear would promote the 30 stale cons-chains (~84 pages),
+    // while the cleared tail promotes nothing.
+    const after = g.allocatedPages();
+    try std.testing.expect(after - before <= 16);
+    try std.testing.expectEqual(wm0, g.rootWatermark());
+}
+
+test "M11 tail-env reuse: mutual recursion with differing arities" {
+    var g = try testInit();
+    defer g.deinit();
+    var v: state.Vm = undefined;
+    v.init(&g);
+    defer v.deinit();
+    const wm0 = g.rootWatermark();
+
+    // f(n, a) arity 2: if n==0 a else g(n-1, a+1, 0); g(n, a, b) arity 3:
+    // if n==0 a+b else f(n-1, a+1).  Arities alternate 2,3,2,3… so the retained
+    // env array (cap 3) is reused both when the callee env shrinks (3->2, tail
+    // cleared) and grows back (2->3) — one miss on the first 2->3 transition.
+    const f = try expectRunVal(&g, &v,
+        "(c(rn[1:n]0a[1:n]1P[1:s]=f[1:n]7a[1:n]0j[2:n]17mn[1:n]0n[1:n]1a[1:n]0P[1:s]+n[1:n]1a[1:n]1P[1:s]-g[1:s]gtv))");
+    v.defunSet("f", f);
+    const gg = try expectRunVal(&g, &v,
+        "(c(rrn[1:n]0a[1:n]2P[1:s]=f[2:n]10a[1:n]0a[1:n]1P[1:s]+j[2:n]19mn[1:n]1a[1:n]1P[1:s]+n[1:n]1a[1:n]2P[1:s]-g[1:s]ftv))");
+    v.defunSet("g", gg);
+
+    // f(1000, 0) == 1000.
+    try expectRunNum(&g, &v, "(mn[1:n]0n[4:n]1000g[1:s]fp)", 1000);
+    // One miss (first f->g grows the env 2->3); every later tail call reuses.
+    try std.testing.expectEqual(@as(u64, 999), v.env_reuse_hits);
+    try std.testing.expectEqual(@as(u64, 1), v.env_reuse_misses);
+    try std.testing.expectEqual(wm0, g.rootWatermark());
+}
+
+test "M11 tail-env reuse: interactions (peel, trap-error, partial)" {
+    var g = try testInit();
+    defer g.deinit();
+    var v: state.Vm = undefined;
+    v.init(&g);
+    defer v.deinit();
+    const wm0 = g.rootWatermark();
+
+    // (1) N>A peel inside a tail loop: each iteration over-applies a 2-param
+    // fn to 3 args (result 7) and adds it to the accumulator — loop(100, 0)
+    // == 700.  The peel runs a NESTED vmExecEnv whose init_env is a fresh
+    // array, so the loop's reused env array is never aliased.
+    const loop = try expectRunVal(&g, &v,
+        "(c(rn[1:n]0a[1:n]1P[1:s]=f[1:n]7a[1:n]0j[2:n]21ma[1:n]0mn[1:n]9n[1:n]8n[1:n]7c(rc(a[1:n]2v)v)pP[1:s]+n[1:n]1a[1:n]1P[1:s]-g[4:s]looptv))");
+    v.defunSet("loop", loop);
+    try expectRunNum(&g, &v, "(mn[1:n]0n[3:n]100g[4:s]loopp)", 700);
+
+    // (2) trap-error inside a tail-loop body: each iteration catches a
+    // simple-error (handler returns 1) and adds it — loop2(50, 0) == 50.
+    const loop2 = try expectRunVal(&g, &v,
+        "(c(rn[1:n]0a[1:n]1P[1:s]=f[1:n]7a[1:n]0j[2:n]19ma[1:n]0c(n[1:n]1v)c(mS[4:S]oopsg[12:s]simple-errorpv)g[10:s]trap-errorpP[1:s]+n[1:n]1a[1:n]1P[1:s]-g[5:s]loop2tv))");
+    v.defunSet("loop2", loop2);
+    try expectRunNum(&g, &v, "(mn[1:n]0n[2:n]50g[5:s]loop2p)", 50);
+
+    // (3) N<A partial built in TAIL position then applied later: mk(x) tail-
+    // calls add with 1 arg (buildPartialClosure copies the env), returning
+    // add(x); applying it to 6 yields 11.
+    const add = try expectRunVal(&g, &v, "(c(rma[1:n]1a[1:n]0g[1:s]+pv))");
+    v.defunSet("add", add);
+    const mk = try expectRunVal(&g, &v, "(c(ma[1:n]0g[3:s]addt))");
+    v.defunSet("mk", mk);
+    const p5 = try expectRunVal(&g, &v, "(mn[1:n]5g[2:s]mkp)");
+    try std.testing.expectEqual(types.ValTag.lambda, p5.tag);
+    v.defunSet("p5", p5);
+    try expectRunNum(&g, &v, "(mn[1:n]6g[2:s]p5p)", 11);
+
+    try std.testing.expectEqual(wm0, g.rootWatermark());
+}
