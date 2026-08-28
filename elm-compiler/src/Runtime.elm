@@ -42,7 +42,7 @@ type alias Sub msg = ()
 
 -- M9: a Program is returned by `program` as DATA (vector[Program, m0, c0,
 -- updateFn], tag = bare symbol 'Program') so the HOST event loop
--- (src/vm/effectloop.zig) can drive the effects natively — real out-of-order
+-- (src/effectloop.zig) can drive the effects natively — real out-of-order
 -- concurrency the synchronous worker cannot express.
 type Program m c u
     = Program m c u

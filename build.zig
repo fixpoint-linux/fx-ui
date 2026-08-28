@@ -21,6 +21,17 @@ pub fn build(b: *std.Build) void {
     // target and optimize options) will be listed when running `zig build --help`
     // in this directory.
 
+    // ---- zinc-vm package dependency (VM extraction P2) ----
+    // The collector and the ZINC VM are owned by the ../zinc-vm package (the
+    // single shared executor); fx-ui no longer compiles its own src/gc* +
+    // src/vm* copies.  The package exports both modules by name ("gc", "vm"),
+    // so every consumer keeps its `@import("gc")` / `@import("vm")` calls
+    // UNCHANGED.  This top-level instance carries the command-line optimize;
+    // the per-mode gate below builds its own dependency instances.
+    const zinc = b.dependency("zinc_vm", .{ .target = target, .optimize = optimize });
+    const gc_mod = zinc.module("gc");
+    const vm_mod = zinc.module("vm");
+
     // This creates a module, which represents a collection of source files alongside
     // some compilation options, such as optimization mode and linked system libraries.
     // Zig modules are the preferred way of making Zig code available to consumers.
@@ -39,23 +50,6 @@ pub fn build(b: *std.Build) void {
         // Later on we'll use this module as the root module of a test executable
         // which requires us to specify a target.
         .target = target,
-    });
-
-    // ---- Shen GC module (plan DECISION 3) ----
-    // The collector is a standalone importable module rooted at src/gc.zig.
-    const gc_mod = b.addModule("gc", .{
-        .root_source_file = b.path("src/gc.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    // ---- Shen ZINC VM module (src/vm.zig re-exports parser/interp/state) ----
-    const vm_mod = b.createModule(.{
-        .root_source_file = b.path("src/vm.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .imports = &.{ .{ .name = "gc", .module = gc_mod } },
     });
 
     // Here we define an executable. An executable needs to have a root module
@@ -107,6 +101,21 @@ pub fn build(b: *std.Build) void {
     // by passing `--prefix` or `-p`.
     b.installArtifact(exe);
 
+    // ---- consumer-side M9 effect loop (src/effectloop.zig) ----
+    // The HOST-SIDE effect-manager event loop is fx-ui-ONLY — it is NOT part
+    // of the zinc-vm package — so it lives here as a local module over the
+    // package's vm (state/values/interp/prims/execplan/hostcall).
+    const effectloop_mod = b.createModule(.{
+        .root_source_file = b.path("src/effectloop.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "gc", .module = gc_mod },
+            .{ .name = "vm", .module = vm_mod },
+        },
+    });
+
     // ---- `elmvm`: the M0 gate harness (tools/elmvm.zig) ----
     // A CLI wrapper that loads a csexp bundle and runs one function, proving
     // the ZINC VM parser/interp end-to-end before any Elm codegen exists.
@@ -118,6 +127,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "gc", .module = gc_mod },
             .{ .name = "vm", .module = vm_mod },
+            .{ .name = "effectloop", .module = effectloop_mod },
         },
     });
     const elmvm = b.addExecutable(.{
@@ -201,12 +211,9 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_tests.step);
 
     // ---- Shen GC test step + permanent multi-mode gate (units A-C) ----
-    // addGcTestSet creates a fully self-contained gc module + gc_test module +
-    // addTest + run + T9 expected-panic exe for ONE hardcoded optimize mode,
-    // and returns the run step.  std.debug.assert inside the gc module is gated
-    // by THAT module's own optimize, so the same source is exercised under
-    // every mode the gate cares about — that is what makes ReleaseSafe a real
-    // safety gate rather than a Debug-only check.
+    // The gc/vm TEST SUITES are owned by the zinc-vm package (fx-ui's local
+    // copies were removed in extraction P2); these steps drive the package's
+    // test files through a consumer-side per-mode dependency instance.
     const gc_test_step = b.step("gc-test", "Run Shen GC tests (honours -Doptimize)");
     gc_test_step.dependOn(addGcTestSet(b, target, optimize));
     test_step.dependOn(gc_test_step);
@@ -245,23 +252,21 @@ pub fn build(b: *std.Build) void {
 /// SAFETY-ENFORCEMENT (unit C): build one self-contained Shen GC test set
 /// compiled at `opt` and return its run step.  Because each mode needs its own
 /// gc module (std.debug.assert inside the collector is gated by that module's
-/// optimize), every call builds an independent gc_mod + gc_test_mod + addTest +
-/// run + T9 expected-panic exe.  Named top-level modules (b.addModule) are NOT
-/// used here to avoid duplicate "gc" module names across the 3 gate instances;
-/// the unnamed modules (b.createModule) carry their own .optimize.
+/// optimize), every call resolves its OWN zinc-vm dependency instance at that
+/// optimize mode — the package's exported "gc" module therefore carries `opt`,
+/// exactly like the pre-extraction per-mode b.createModule instances — then
+/// wires gc_test (from the package) + addTest + run + the T9 expected-panic
+/// exe (also from the package).
 fn addGcTestSet(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     opt: std.builtin.OptimizeMode,
 ) *std.Build.Step {
-    const gc_mod = b.createModule(.{
-        .root_source_file = b.path("src/gc.zig"),
-        .target = target,
-        .optimize = opt,
-    });
+    const zinc = b.dependency("zinc_vm", .{ .target = target, .optimize = opt });
+    const gc_mod = zinc.module("gc");
 
     const gc_test_mod = b.createModule(.{
-        .root_source_file = b.path("tests/gc_test.zig"),
+        .root_source_file = zinc.path("tests/gc_test.zig"),
         .target = target,
         .optimize = opt,
         .imports = &.{ .{ .name = "gc", .module = gc_mod } },
@@ -277,7 +282,7 @@ fn addGcTestSet(
     // abort() are signal-based (nondeterministic for expect_term), hence the
     // handler-normalized exit code.
     const t9_mod = b.createModule(.{
-        .root_source_file = b.path("tests/root_ptr_panic.zig"),
+        .root_source_file = zinc.path("tests/root_ptr_panic.zig"),
         .target = target,
         .optimize = opt,
         .imports = &.{ .{ .name = "gc", .module = gc_mod } },
@@ -296,31 +301,21 @@ fn addGcTestSet(
 }
 
 /// Build one self-contained Shen VM test set compiled at `opt` and return its
-/// run step (plan M0, mirroring addGcTestSet).  Each mode gets its OWN unnamed
-/// gc module + vm module + vm_test module (b.createModule, so no top-level
-/// "gc"/"vm" module-name clashes across the gate's three instances); the vm
-/// module imports the mode's gc module and the vm_test module imports both.
+/// run step (plan M0, mirroring addGcTestSet).  Each mode gets its OWN zinc-vm
+/// dependency instance (so the package's "gc"/"vm" modules carry that mode's
+/// optimize, with no module-name clashes across the gate's three instances);
+/// the vm_test module (from the package) imports both.
 fn addVmTestSet(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     opt: std.builtin.OptimizeMode,
 ) *std.Build.Step {
-    const gc_mod = b.createModule(.{
-        .root_source_file = b.path("src/gc.zig"),
-        .target = target,
-        .optimize = opt,
-    });
-
-    const vm_mod = b.createModule(.{
-        .root_source_file = b.path("src/vm.zig"),
-        .target = target,
-        .optimize = opt,
-        .link_libc = true,
-        .imports = &.{ .{ .name = "gc", .module = gc_mod } },
-    });
+    const zinc = b.dependency("zinc_vm", .{ .target = target, .optimize = opt });
+    const gc_mod = zinc.module("gc");
+    const vm_mod = zinc.module("vm");
 
     const vm_test_mod = b.createModule(.{
-        .root_source_file = b.path("tests/vm_test.zig"),
+        .root_source_file = zinc.path("tests/vm_test.zig"),
         .target = target,
         .optimize = opt,
         .link_libc = true,

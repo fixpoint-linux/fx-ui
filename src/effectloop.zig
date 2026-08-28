@@ -1,4 +1,7 @@
-//! src/vm/effectloop.zig — the M9 HOST-SIDE effect-manager event loop.
+//! src/effectloop.zig — the M9 HOST-SIDE effect-manager event loop.
+//!
+//! (fx-ui-only consumer module over the zinc-vm package's `vm`; moved
+//! consumer-side in extraction P2 — it is NOT part of the zinc-vm package.)
 //!
 //! Design A (plan M9): effects run in the HOST, not by suspending a half-run
 //! vmExecEnv (which is a deep native recursion — see interp.zig).  `main`
@@ -32,12 +35,12 @@
 const std = @import("std");
 const gc = @import("gc");
 const types = gc.types;
-const state = @import("state.zig");
-const values = @import("values.zig");
-const interp = @import("interp.zig");
-const prims = @import("prims.zig");
-const execplan = @import("execplan.zig");
-const hostcall = @import("hostcall.zig");
+const state = @import("vm").state;
+const values = @import("vm").values;
+const interp = @import("vm").interp;
+const prims = @import("vm").prims;
+const execplan = @import("vm").execplan;
+const hostcall = @import("vm").hostcall;
 
 const Gc = gc.Gc;
 const Value = types.Value;
