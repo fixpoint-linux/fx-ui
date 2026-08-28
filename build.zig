@@ -128,6 +128,25 @@ pub fn build(b: *std.Build) void {
     const elmvm_step = b.step("elmvm", "Build the elmvm gate harness");
     elmvm_step.dependOn(&elmvm_install.step);
 
+    // ---- `vmbench`: the VM throughput benchmark harness (tools/vmbench.zig) ----
+    const vmbench_mod = b.createModule(.{
+        .root_source_file = b.path("tools/vmbench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "gc", .module = gc_mod },
+            .{ .name = "vm", .module = vm_mod },
+        },
+    });
+    const vmbench = b.addExecutable(.{
+        .name = "vmbench",
+        .root_module = vmbench_mod,
+    });
+    const vmbench_install = b.addInstallArtifact(vmbench, .{});
+    const vmbench_step = b.step("vmbench", "Build the vmbench throughput harness");
+    vmbench_step.dependOn(&vmbench_install.step);
+
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
     // This will evaluate the `run` step rather than the default step.

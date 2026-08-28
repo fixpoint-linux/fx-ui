@@ -572,6 +572,7 @@ pub fn vmExecEnv(
     run: while (true) {
         // C:3204-3208 — hard instruction limit.
         instr_count += 1;
+        vm.instr_exec += 1;
         if (instr_count >= instr_limit) {
             std.debug.print(
                 "[HARD LIMIT] {d} instructions, aborting at pc={d} frames={d}\n",

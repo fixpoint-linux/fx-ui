@@ -74,6 +74,9 @@ pub const Vm = struct {
     /// vm_exec_env entry; the port keeps the constant default and exposes
     /// the field for the host to set directly (init comment).
     instr_limit: u64 = 5_000_000_000,
+    /// Cumulative instructions executed across all vmExec calls (harness
+    /// instrumentation; no C counterpart).
+    instr_exec: u64 = 0,
     /// C: zincvm.c:2250-2258 gensym — the static counter behind
     /// "shen.gensym_N" (never reset; symbols are interned so distinct N =>
     /// distinct symbols for the life of the VM).
