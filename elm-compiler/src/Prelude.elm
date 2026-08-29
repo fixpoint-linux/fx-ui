@@ -9,6 +9,12 @@ module Prelude exposing
     , max
     , clamp
     , compare
+    , lt
+    , gt
+    , le
+    , ge
+    , eq
+    , neq
     , maybeMap
     , maybeWithDefault
     , resultMap
@@ -28,6 +34,7 @@ module Prelude exposing
     , join
     , fromInt
     , length
+    , drop
     )
 
 -- The M3 prelude: a pure-core Elm module compiled BY the compiler itself at
@@ -117,15 +124,157 @@ clamp lo hi x =
         x
 
 
+-- STRUCTURAL COMPARE (elm/core Basics.compare parity) — replaces the old
+-- Int-only version.  A pure-Elm dispatcher over the compare prim aliases
+-- (see Lower.Module.comparePrimAliases): the VM < > prims are NUMERIC-ONLY,
+-- so strings/lists/tuples compare structurally here.
+--
+--   * number? covers Int AND Float (VM promotes across the two, NaN -> EQ —
+--     same as real Elm's JS Utils.cmp).
+--   * Strings compare byte-lexicographically via the char-code prim (UTF-8
+--     byte order; differs from JS UTF-16 code-unit order only for astral
+--     chars).  Char rides this branch (chars lower to 1-byte strings).
+--   * Lists AND tuples are cons chains: tuples are cons(a, cons(b, ...))
+--     with the LAST element as terminal cdr (Expr.tupleCode), so the walker
+--     recurses through `compare` itself — a proper list's tail re-dispatches
+--     to cmpList/the nil rule, a tuple's terminal cdr compares by its own
+--     structural order.  The nil-vs-cons prefix rule gives [] < (y :: ys).
+--   * Ill-typed mixed comparisons (e.g. 5 vs "a") fall to EQ — the untyped
+--     subset has no type error to raise.
+
+
 compare a b =
-    if a < b then
+    if isNumber a then
+        cmpNum a b
+
+    else if isString a then
+        cmpStrBytes 0 a b
+
+    else if isCons a then
+        cmpList a b
+
+    else if isNil a then
+        if isNil b then
+            EQ
+
+        else
+            LT
+
+    else
+        EQ
+
+
+cmpNum x y =
+    if x < y then
         LT
 
-    else if a > b then
+    else if x > y then
         GT
 
     else
         EQ
+
+
+cmpStrBytes i s t =
+    let
+        ca =
+            charCode s i
+
+        cb =
+            charCode t i
+    in
+    if ca == -1 then
+        if cb == -1 then
+            EQ
+
+        else
+            LT
+
+    else if cb == -1 then
+        GT
+
+    else if ca < cb then
+        LT
+
+    else if ca > cb then
+        GT
+
+    else
+        cmpStrBytes (i + 1) s t
+
+
+cmpList xs ys =
+    if isNil xs then
+        if isNil ys then
+            EQ
+
+        else
+            LT
+
+    else if isNil ys then
+        GT
+
+    else
+        case xs of
+            x :: xr ->
+                case ys of
+                    y :: yr ->
+                        case compare x y of
+                            EQ ->
+                                compare xr yr
+
+                            o ->
+                                o
+
+                    [] ->
+                        GT
+
+            [] ->
+                LT
+
+
+lt a b =
+    case compare a b of
+        LT ->
+            True
+
+        _ ->
+            False
+
+
+gt a b =
+    case compare a b of
+        GT ->
+            True
+
+        _ ->
+            False
+
+
+le a b =
+    case compare a b of
+        GT ->
+            False
+
+        _ ->
+            True
+
+
+ge a b =
+    case compare a b of
+        LT ->
+            False
+
+        _ ->
+            True
+
+
+eq a b =
+    a == b
+
+
+neq a b =
+    not (a == b)
 
 
 
@@ -335,3 +484,17 @@ lengthGo acc xs =
 
         [] ->
             acc
+
+
+-- Tail-recursive drop (Elm's List.drop): negative n drops nothing.
+drop n xs =
+    if n <= 0 then
+        xs
+
+    else
+        case xs of
+            _ :: rest ->
+                drop (n - 1) rest
+
+            [] ->
+                []

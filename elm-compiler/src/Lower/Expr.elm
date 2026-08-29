@@ -5,6 +5,7 @@ module Lower.Expr exposing
     , binaryPrims
     , primWrappers
     , unaryPrims
+    , ternaryPrims
     , wrapperGlobalName
     , withImport
     , lowerExpression
@@ -136,6 +137,12 @@ binaryPrims =
     , ( "<=", "<=" )
     , ( ">", ">" )
     , ( ">=", ">=" )
+
+    -- (::) as a VALUE (e.g. `foldr (::) []`): this row mints the `::`-curried
+    -- wrapper (primWrappers derives from binaryPrims).  INLINE `x :: xs`
+    -- keeps its dedicated operatorApplication case below, so operator
+    -- lowering is unchanged.
+    , ( "::", "cons" )
     ]
 
 
@@ -153,14 +160,51 @@ wrapperGlobalName op =
 --     stray partial closure when called full-arity.
 primWrappers : List ( String, String )
 primWrappers =
-    binaryPrims ++ [ ( "", "cn" ), ( "", "write-byte" ), ( "", "open" ), ( "", "setenv" ) ]
+    binaryPrims
+        ++ [ ( "", "cn" )
+           , ( "", "write-byte" )
+           , ( "", "open" )
+           , ( "", "setenv" )
+           , ( "", "char-code" )
+
+           -- Vector read (JsArray substitute): `<-address` is 2-ARG (vec,
+           -- idx), so a 2-arg wrapper is the right shape.
+           , ( "", "<-address" )
+
+           -- elm/core Bitwise support (Array port): 2-ARG prims exposed as
+           -- <prim>.curried wrappers via the Bitwise.* primDotAliases.
+           , ( "", "bitwise-and" )
+           , ( "", "bitwise-or" )
+           , ( "", "bitwise-xor" )
+           , ( "", "bitwise-shift-left" )
+           , ( "", "bitwise-shift-right" )
+           , ( "", "bitwise-shift-right-zf" )
+           ]
 
 
 unaryPrims : List String
 unaryPrims =
     [ "c-strlen", "read-byte", "read-file-as-string", "close", "shen.str->bytes", "shen.bytes->string"
     , "intern", "exec-plan", "cd", "getenv", "glob", "getcwd", "getpid"
+
+    -- Vector make + Bitwise complement (Array port): both 1-ARG, so the
+    -- 1-arg wrapper is the right shape (see the c-strlen note above).
+    , "absvector", "bitwise-not"
+
+    -- Structural-compare predicates (Prelude.compare dispatcher): number?
+    -- covers Int AND Float (primNumberP), string? also matches Char (which
+    -- lowers to a 1-byte string), cons? matches lists AND tuples (both cons
+    -- chains), empty? is the nil test.
+    , "string?", "number?", "cons?", "empty?"
     ]
+
+
+-- 3-ARG prim wrappers (Lower.Module.ternaryWrapperEntry): the wrapper body
+-- pushes param3 first so the vector lands ON TOP — `address->` pops
+-- (vec, idx, val) in that order.
+ternaryPrims : List String
+ternaryPrims =
+    [ "address->" ]
 
 
 primOf : String -> Maybe String
@@ -433,6 +477,16 @@ operatorApplication range op left right ctx =
                         |> Result.map (\lcode -> rcode ++ lcode ++ [ Prim "cons" ])
                 )
 
+        "|>" ->
+            -- Pipe: `x |> f a` is `(f a) x`.  Both pipes lower to ONE apply of
+            -- the pipeline function to the piped value (Array.elm port keeps
+            -- its verbatim `<|`/`|>` chains).
+            pipeApply right left ctx
+
+        "<|" ->
+            -- Reverse pipe: `f a <| x` is `(f a) x`, same lowering.
+            pipeApply left right ctx
+
         _ ->
             case primOf op of
                 Just pname ->
@@ -444,6 +498,25 @@ operatorApplication range op left right ctx =
 
                 Nothing ->
                     Err ("unsupported operator: " ++ op)
+
+
+-- Lower a pipe application.  `x |> f a b` desugars to the SINGLE application
+-- `f a b x` (and `f a b <| x` likewise): the piped value is appended to the
+-- pipeline function's argument list and the whole call goes through the
+-- ordinary `application` path (one mark, one apply).  A stack-level "apply the
+-- partial to x afterwards" emission is NOT equivalent here: completing a
+-- partial whose callee collects its remaining args with Grabs (def-arg
+-- pattern functions) misbinds, so the splice is the only safe lowering.
+-- Fallback for non-application function sides (bare `f`, parenthesized
+-- expressions): a plain 2-argument application of funcExpr to argExpr.
+pipeApply : Node Expression -> Node Expression -> Context -> Result String (List Instr)
+pipeApply funcExpr argExpr ctx =
+    case funcExpr of
+        Node _ (Expression.Application (head :: args)) ->
+            application (head :: (args ++ [ argExpr ])) NonTail ctx
+
+        _ ->
+            application [ funcExpr, argExpr ] NonTail ctx
 
 
 andShort : Range -> Node Expression -> Node Expression -> Context -> Result String (List Instr)

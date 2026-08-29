@@ -220,6 +220,28 @@ run fastexec     main   "$(read_expected fastexec)"
 run asyncpure    main   "$(read_expected asyncpure)"
 compile_error dup         "duplicate top-level definition in Dup: f"
 
+# --- elm/core 1.0.5 runtime ports: structural Basics.compare + Dict/Set/Maybe/Result ---
+# cmporder runs FIRST: it is the char-code wrapper ARG ORDER smoke test for the
+# structural compare ("ab" vs "b" must be LT via byte 97 < 98).
+run cmporder    main   "$(read_expected cmporder)"
+run resultmaybe main   "$(read_expected resultmaybe)"
+run dictbasic   main   "$(read_expected dictbasic)"
+run setops      main   "$(read_expected setops)"
+run dictstress  main   "$(read_expected dictstress)"
+
+# --- elm/core Bitwise + Array port (vector JsArray substitute, RRB tree) ---
+# bitwise: int32 semantics pins for the 7 zinc-vm prims (truncation, count
+# &31 masking, arithmetic vs zero-fill right shift, doc examples).
+run bitwise     main   "$(read_expected bitwise)"
+# arraybasic: sizes 0/1/5/32/33/64/100 (first Leaf at 32) — length/foldl/get
+# corners, set OOB no-op + persistence, push 31->33 crossing, roundtrips,
+# map/indexedMap/filter, repeat, append, slice doc cases, toIndexedList/Tuple.
+run arraybasic  main   "$(read_expected arraybasic)"
+# arraystress: 1023/1024/1025 (depth-2->3 boundary at 32*32) + 1000 — sums,
+# set-every-32nd, foldr order check, push 1023->1026, append, deep slices,
+# fromList 1025 positional roundtrip, map/filter over 1024, persistence.
+run arraystress main   "$(read_expected arraystress)"
+
 rm -rf "$OUT"
 echo "=============================="
 echo "PASS=$pass FAIL=$fail"

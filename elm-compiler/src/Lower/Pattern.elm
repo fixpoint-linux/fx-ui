@@ -318,8 +318,22 @@ normalizeClauses clauses =
                 uniform =
                     List.all (\(args, _) -> List.length args == n) clauses
 
+                -- SITE-UNIQUE LABELS: the synthesized case must NOT inherit
+                -- the body's range.  lowerCase names its jumps
+                -- case_next_<row>_<col>/case_end_<row>_<col> and resolve's
+                -- addressMap is LAST-WINS, so a body that is itself a `case`
+                -- (the common `(k,v) :: rest -> ...` clause shape) would
+                -- collide labels with this synthesized case and misroute
+                -- every clause-fail jump into it ("non-exhaustive case" at
+                -- runtime).  The first argument pattern's range is
+                -- declaration-site-unique within the defun instead.
                 range =
-                    Node.range firstBody
+                    case firstArgs of
+                        (Node r _) :: _ ->
+                            r
+
+                        [] ->
+                            Node.range firstBody
 
                 freshNames =
                     List.map (\i -> "$arg" ++ String.fromInt i) (List.range 0 (n - 1))

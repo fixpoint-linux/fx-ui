@@ -262,14 +262,18 @@ compileUnit globals unit =
             -- names) — then user-import expose rows, then the implicit
             -- prelude. prim-dot keys are dotted so can go last.  M6 appends
             -- the Platform.* conveniences (dotted) + the stream-prim bare
-            -- aliases (bare) after the prim-dot rows.
+            -- aliases (bare) after the prim-dot rows; the structural-compare
+            -- prim aliases follow (bare, module-agnostic like the others so
+            -- the Prelude itself can call them).
             selfAliases modName exported
                 ++ importAliases unit.file.imports
                 ++ preludeAliasesFor modName
                 ++ primDotAliases
                 ++ platformTable
                 ++ streamPrimAliases
+                ++ vectorPrimAliases
                 ++ processPrimAliases
+                ++ comparePrimAliases
 
         baseCtx =
             Expr.newContext modName globals
@@ -285,6 +289,7 @@ compileUnit globals unit =
                     wrapperEntries =
                         List.map wrapperEntry Expr.primWrappers
                             ++ List.map unaryWrapperEntry Expr.unaryPrims
+                            ++ List.map ternaryWrapperEntry Expr.ternaryPrims
                 in
                 fnEntries ++ ctorEntries ++ wrapperEntries
             )
@@ -322,6 +327,12 @@ preludeTable =
     , ( "max", "Prelude.max" )
     , ( "clamp", "Prelude.clamp" )
     , ( "compare", "Prelude.compare" )
+    , ( "lt", "Prelude.lt" )
+    , ( "gt", "Prelude.gt" )
+    , ( "le", "Prelude.le" )
+    , ( "ge", "Prelude.ge" )
+    , ( "eq", "Prelude.eq" )
+    , ( "neq", "Prelude.neq" )
 
     -- Maybe / Result constructors + conveniences
     , ( "Just", "Prelude.Just" )
@@ -349,6 +360,7 @@ preludeTable =
     , ( "tail", "Prelude.tail" )
     , ( "isEmpty", "Prelude.isEmpty" )
     , ( "singleton", "Prelude.singleton" )
+    , ( "drop", "Prelude.drop" )
     ]
         ++ dottedRows "List."
             [ ( "map", "map" )
@@ -363,11 +375,21 @@ preludeTable =
             , ( "tail", "tail" )
             , ( "isEmpty", "isEmpty" )
             , ( "singleton", "singleton" )
+            , ( "drop", "drop" )
             ]
         ++ dottedRows ""
             [ ( "String.concat", "concat" )
             , ( "String.join", "join" )
             , ( "String.fromInt", "fromInt" )
+            ]
+        ++ dottedRows "Basics."
+            [ ( "compare", "compare" )
+            , ( "lt", "lt" )
+            , ( "gt", "gt" )
+            , ( "le", "le" )
+            , ( "ge", "ge" )
+            , ( "eq", "eq" )
+            , ( "neq", "neq" )
             ]
 
 
@@ -384,6 +406,16 @@ primDotAliases : List ( String, String )
 primDotAliases =
     [ ( "String.append", Expr.wrapperGlobalName "cn" )
     , ( "String.length", Expr.wrapperGlobalName "c-strlen" )
+
+    -- elm/core Bitwise (Array port support): dotted spellings rewrite to the
+    -- curried prim wrappers minted from Expr.primWrappers/unaryPrims.
+    , ( "Bitwise.and", Expr.wrapperGlobalName "bitwise-and" )
+    , ( "Bitwise.or", Expr.wrapperGlobalName "bitwise-or" )
+    , ( "Bitwise.xor", Expr.wrapperGlobalName "bitwise-xor" )
+    , ( "Bitwise.complement", Expr.wrapperGlobalName "bitwise-not" )
+    , ( "Bitwise.shiftLeftBy", Expr.wrapperGlobalName "bitwise-shift-left" )
+    , ( "Bitwise.shiftRightBy", Expr.wrapperGlobalName "bitwise-shift-right" )
+    , ( "Bitwise.shiftRightZfBy", Expr.wrapperGlobalName "bitwise-shift-right-zf" )
     ]
 
 
@@ -446,6 +478,17 @@ streamPrimAliases =
     ]
 
 
+-- Vector-prim bare aliases (elm/core Array port): the JsArray substitute
+-- module spells the VM vector prims with valid Elm identifiers that rewrite
+-- to the curried wrapper globals keyed "<prim>.curried".
+vectorPrimAliases : List ( String, String )
+vectorPrimAliases =
+    [ ( "vectorMake", Expr.wrapperGlobalName "absvector" )
+    , ( "vectorGet", Expr.wrapperGlobalName "<-address" )
+    , ( "vectorSet", Expr.wrapperGlobalName "address->" )
+    ]
+
+
 -- M8 process-prim bare aliases: the VM prim names are hyphenated ("exec-plan",
 -- "getenv", ...) — some are valid Elm identifiers (cd/getenv/getpid/glob/intern)
 -- but none is a `binaryPrims`/`unaryPrims` row, so the Runtime spells them with
@@ -461,6 +504,23 @@ processPrimAliases =
     , ( "getpidPrim", Expr.wrapperGlobalName "getpid" )
     , ( "globPrim", Expr.wrapperGlobalName "glob" )
     , ( "intern", Expr.wrapperGlobalName "intern" )
+    ]
+
+
+-- Structural-compare prim aliases: the Elm-level type predicates + byte-index
+-- prim the Prelude.compare dispatcher is built from (elm/core Basics parity).
+-- Bare names, appended to EVERY unit's alias table (incl. the Prelude itself —
+-- preludeAliasesFor excludes only the preludeTable rows there), so `isNumber`
+-- etc. resolve to the curried prim wrappers in any module.  charCode is the
+-- 2-arg wrapper: param1 = STRING, param2 = index (the prim pops the string
+-- first) -> call it `charCode str idx`; returns the byte at idx or -1.
+comparePrimAliases : List ( String, String )
+comparePrimAliases =
+    [ ( "isNumber", Expr.wrapperGlobalName "number?" )
+    , ( "isString", Expr.wrapperGlobalName "string?" )
+    , ( "isCons", Expr.wrapperGlobalName "cons?" )
+    , ( "isNil", Expr.wrapperGlobalName "empty?" )
+    , ( "charCode", Expr.wrapperGlobalName "char-code" )
     ]
 
 
@@ -859,6 +919,26 @@ wrapperEntry ( op, prim ) =
 
         code =
             [ Emit.Cur (Emit.Grab :: body) ]
+    in
+    Csexp.bundleEntry name (Emit.flatten (Emit.resolve code))
+
+
+-- A 3-arg curried wrapper for a ternary prim, keyed "<prim>.curried".  Two
+-- grabs (a lone third `r` would misbehave — see unaryWrapperEntry).  Body
+-- pushes access 0 (= param3) FIRST and access 2 (= param1, the vector)
+-- LAST, so the pops come out (vec, idx, val) = (param1, param2, param3) —
+-- the same leftmost-pops-first order as the 2-arg wrapperEntry.
+ternaryWrapperEntry : String -> String
+ternaryWrapperEntry prim =
+    let
+        name =
+            Expr.wrapperGlobalName prim
+
+        body =
+            [ Emit.Access 0, Emit.Access 1, Emit.Access 2, Emit.Prim prim, Emit.Return ]
+
+        code =
+            [ Emit.Cur (Emit.Grab :: Emit.Grab :: body) ]
     in
     Csexp.bundleEntry name (Emit.flatten (Emit.resolve code))
 
