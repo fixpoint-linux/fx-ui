@@ -36,7 +36,7 @@
         // Path dependency for local dev; planned to become a submodule/url
         // dependency in a later phase.
         .zinc_vm = .{
-            .path = "../zinc-vm",
+            .path = "vendor/zinc-vm",
         },
         // See `zig fetch --save <url>` for a command-line interface for adding dependencies.
         //.example = .{
