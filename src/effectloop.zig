@@ -39,6 +39,7 @@ const state = @import("vm").state;
 const values = @import("vm").values;
 const interp = @import("vm").interp;
 const prims = @import("vm").prims;
+const symbols = @import("vm").symbols;
 const execplan = @import("vm").execplan;
 const hostcall = @import("vm").hostcall;
 
@@ -74,6 +75,7 @@ extern "c" fn dup2(oldfd: c_int, newfd: c_int) c_int;
 extern "c" fn close(fd: c_int) c_int;
 extern "c" fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
 extern "c" fn fcntl(fd: c_int, cmd: c_int, ...) c_int;
+extern "c" fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
 
 const F_GETFL: c_int = 3; // Linux
 const F_SETFL: c_int = 4; // Linux
@@ -101,10 +103,46 @@ const ExecEff = struct {
     exit_code: i32 = 0,
 };
 
+/// TaskReadKey accumulator — page_allocator (never GC-scanned, never rooted),
+/// like ReadFileEff.  `esc_wait` marks a suspended eval whose buffer starts
+/// with an incomplete ESC/CSI sequence (lone-ESC flush on poll timeout).
+const ReadKeyEff = struct {
+    buf: std.ArrayListUnmanaged(u8) = .empty,
+    esc_wait: bool = false,
+};
+
 const Eff = union(enum) {
     none,
     readfile: ReadFileEff,
     exec: ExecEff,
+    readkey: ReadKeyEff,
+};
+
+/// A decoded terminal key, before it is built into a host Key vector.
+const KeyVal = union(enum) {
+    char: []const u8, // UTF-8 byte sequence (borrows from the eff buffer)
+    enter,
+    tab,
+    backspace,
+    esc,
+    up,
+    down,
+    left,
+    right,
+    home,
+    end,
+    pgup,
+    pgdn,
+    ins,
+    del,
+    ctrl: u8, // the single control character (0x01 -> 'a')
+    other: i64, // KeyOther Int payload
+    eof,
+};
+
+const DecodedKey = struct {
+    consumed: usize, // bytes consumed from the front of the buffer
+    key: KeyVal,
 };
 
 const FrameKind = enum { andthen, onerror };
@@ -117,12 +155,18 @@ const Frame = struct {
 const Eval = struct {
     active: bool = false,
     base: usize = 0, // block base slot index (task = base, result = base+1)
+    /// Generation token: bumped every time this slot is (re)spawned.  stepEval
+    /// captures it on entry and keeps looping only while it is unchanged — a
+    /// deliver() deactivates the eval and spawn() can place a NEW eval into
+    /// the just-freed slot (first-inactive reuse), which must NOT be stepped
+    /// by the stale eval pointer still walking its while-loop.
+    gen: usize = 0,
     nframes: usize = 0,
     frames: [MAX_FRAMES]Frame = [_]Frame{Frame{ .kind = .andthen, .cont_slot = 0 }} ** MAX_FRAMES,
     eff: Eff = .none,
 };
 
-const PollRole = enum { readfile, exec_out, exec_err };
+const PollRole = enum { readfile, exec_out, exec_err, readkey };
 
 const Child = struct {
     pid: c_int = -1,
@@ -147,6 +191,16 @@ const HostLoop = struct {
     npoll: usize = 0,
     children: [MAX_CHILDREN]Child = [_]Child{Child{}} ** MAX_CHILDREN,
     nchildren: usize = 0,
+
+    /// Terminal substrate (M1 tea): stdin EOF latch (never re-poll a dead fd),
+    /// a one-shot O_NONBLOCK latch for fd0, the saved termios for the raw-mode
+    /// restore (only set once raw-mode ON succeeds), and the leftover-bytes
+    /// pushback (page_allocator, like ReadKeyEff.buf) so a multi-key read never
+    /// drops keys after the first.
+    stdin_eof: bool = false,
+    stdin_nonblock: bool = false,
+    saved_termios: ?std.posix.termios = null,
+    stdin_pending: std.ArrayListUnmanaged(u8) = .empty,
 
     const model_slot = 0;
     const update_slot = 1;
@@ -180,7 +234,7 @@ const HostLoop = struct {
         // stale ref here would retain dead closures/tasks).
         var j: usize = 0;
         while (j < BLOCK) : (j += 1) self.slots[base + j] = values.valNil();
-        self.evals[i] = .{ .active = true, .base = base };
+        self.evals[i] = .{ .active = true, .base = base, .gen = self.evals[i].gen + 1 };
         self.slots[base] = task; // root the task (no alloc — plain store)
         self.nactive += 1;
     }
@@ -213,7 +267,12 @@ const HostLoop = struct {
     // -------------------------------------------------------------
 
     fn stepEval(self: *HostLoop, eval: *Eval) VmError!void {
-        while (eval.active and eval.eff == .none) {
+        // The loop re-reads eval fields each pass, so a deliver() that
+        // deactivates this eval must stop the loop even when spawn() has
+        // placed a fresh eval into the same slot (active becomes true again):
+        // the generation token identifies the LOGICAL eval, not the slot.
+        const start_gen = eval.gen;
+        while (eval.active and eval.gen == start_gen and eval.eff == .none) {
             const task = self.slots[eval.base]; // fresh read (rooted slot)
             if (task.tag != .vector) {
                 self.deactivate(eval);
@@ -275,6 +334,12 @@ const HostLoop = struct {
                 try self.leafPrim(eval, "getpid", &.{});
             } else if (std.mem.eql(u8, name, "TaskGlob")) {
                 try self.leafPrim(eval, "glob", &.{data.?[1]});
+            } else if (std.mem.eql(u8, name, "TaskReadKey")) {
+                try self.leafReadKey(eval);
+            } else if (std.mem.eql(u8, name, "TaskWinSize")) {
+                try self.leafWinSize(eval);
+            } else if (std.mem.eql(u8, name, "TaskRawMode")) {
+                try self.leafRawMode(eval, data.?[1]);
             } else {
                 // Unknown Task ctor — drop the evaluation defensively.
                 self.deactivate(eval);
@@ -612,6 +677,225 @@ const HostLoop = struct {
     }
 
     // -------------------------------------------------------------
+    //  Terminal leaves (M1 tea): TaskReadKey / TaskWinSize / TaskRawMode
+    // -------------------------------------------------------------
+
+    /// TaskReadKey — arm a nonblocking fd0 read and try to drain a key.  If
+    /// stdin has already hit EOF, complete KeyEof immediately (a poll on an
+    /// EOF'd fd busy-spins, so the latch short-circuits every re-arm).  The
+    /// fresh accumulator is seeded with any pushback bytes left over from a
+    /// multi-key read, so leftover keys decode before fd0 is polled again.
+    fn leafReadKey(self: *HostLoop, eval: *Eval) VmError!void {
+        if (self.stdin_eof) {
+            self.slots[resultSlot(eval)] = self.buildKey(.eof);
+            try self.completeSuccess(eval);
+            return;
+        }
+        if (!self.stdin_nonblock) {
+            setNonblocking(0);
+            self.stdin_nonblock = true;
+        }
+        eval.eff = .{ .readkey = .{} };
+        if (self.stdin_pending.items.len > 0) {
+            eval.eff.readkey.buf.appendSlice(pa, self.stdin_pending.items) catch {};
+            self.stdin_pending.clearRetainingCapacity();
+        }
+        _ = try self.readKeyDrain(eval); // completes or suspends
+    }
+
+    /// Decode a key from the readkey accumulator, reading more bytes off fd0
+    /// as needed.  Returns true iff the evaluation COMPLETED (key built +
+    /// delivered, or KeyEof on EOF); false iff it suspended (EAGAIN or an
+    /// incomplete sequence — esc_wait is then set iff the buffer starts with
+    /// 0x1B).  On a complete key, bytes past `consumed` are pushed to
+    /// stdin_pending for the re-armed readKey — a multi-key read is never
+    /// truncated to its first key.
+    fn readKeyDrain(self: *HostLoop, eval: *Eval) VmError!bool {
+        const eff = &eval.eff.readkey;
+        var tmp: [256]u8 = undefined;
+        while (true) {
+            // Decode what is already buffered (seeded pushback included) first.
+            if (eff.buf.items.len > 0) {
+                if (decodeKey(eff.buf.items)) |d| {
+                    if (d.consumed < eff.buf.items.len) {
+                        self.stdin_pending.appendSlice(pa, eff.buf.items[d.consumed..]) catch {};
+                    }
+                    try self.readKeyComplete(eval, d.key);
+                    return true;
+                }
+            }
+            const n = std.posix.read(0, &tmp) catch |e| {
+                if (e == error.WouldBlock) {
+                    // No complete key and no more bytes — suspend (esc_wait iff
+                    // an ESC/CSI is being assembled).
+                    eff.esc_wait = eff.buf.items.len > 0 and eff.buf.items[0] == 0x1B;
+                    return false;
+                }
+                // EIO / other read error — the pty master went away: EOF.
+                self.stdin_eof = true;
+                try self.readKeyComplete(eval, .eof);
+                try self.flushEof();
+                return true;
+            };
+            if (n == 0) {
+                self.stdin_eof = true;
+                try self.readKeyComplete(eval, .eof);
+                try self.flushEof();
+                return true;
+            }
+            eff.buf.appendSlice(pa, tmp[0..n]) catch return false;
+            // loop back to decode the enlarged buffer
+        }
+    }
+
+    /// stdin EOF just latched: every OTHER suspended readkey eval would be
+    /// skipped by rebuildPollfds (the !stdin_eof guard) and never complete, so
+    /// complete them all with KeyEof now (mirrors flushEscWaits).
+    fn flushEof(self: *HostLoop) VmError!void {
+        var i: usize = 0;
+        while (i < self.nevals) : (i += 1) {
+            const eval = &self.evals[i];
+            if (!eval.active or eval.eff != .readkey) continue;
+            try self.readKeyComplete(eval, .eof);
+        }
+    }
+
+    /// Build the Key vector, free the accumulator, clear the effect, and
+    /// deliver.  buildKey is the only GC allocation — the buffer free + plain
+    /// stores after it never trigger GC, so the returned value stays valid
+    /// until it lands in the permanently-rooted result slot (execComplete
+    /// rooting discipline).
+    fn readKeyComplete(self: *HostLoop, eval: *Eval, key: KeyVal) VmError!void {
+        const keyv = self.buildKey(key);
+        eval.eff.readkey.buf.deinit(pa);
+        eval.eff = .none;
+        self.slots[resultSlot(eval)] = keyv;
+        try self.completeSuccess(eval);
+    }
+
+    /// TaskWinSize — SYNCHRONOUS ioctl TIOCGWINSZ (fd0, falling back to fd1,
+    /// else 0x0), completing with the (cols, rows) tuple = cons(col, row).
+    fn leafWinSize(self: *HostLoop, eval: *Eval) VmError!void {
+        var ws: std.posix.winsize = undefined;
+        var cols: i64 = 0;
+        var rows: i64 = 0;
+        if (ioctl(0, std.posix.T.IOCGWINSZ, &ws) == 0) {
+            cols = ws.col;
+            rows = ws.row;
+        } else if (ioctl(1, std.posix.T.IOCGWINSZ, &ws) == 0) {
+            cols = ws.col;
+            rows = ws.row;
+        }
+        const tuple = values.valCons(self.g, values.valNumber(cols), values.valNumber(rows));
+        self.slots[resultSlot(eval)] = tuple;
+        try self.completeSuccess(eval);
+    }
+
+    /// TaskRawMode Bool — SYNCHRONOUS.  ON: save termios once, clear
+    /// ECHO/ICANON/ISIG/IEXTEN (lflag), ICRNL/IXON (iflag), OPOST (oflag),
+    /// VMIN=1 VTIME=0, tcsetattr NOW.  OFF: restore the saved termios DRAIN.
+    /// Not-a-tty (or an off-target OFF) is a silent no-op completing unit.
+    fn leafRawMode(self: *HostLoop, eval: *Eval, enable: Value) VmError!void {
+        const on = enable.payload.boolean != 0;
+        if (on) {
+            if (self.saved_termios == null) {
+                self.saved_termios = std.posix.tcgetattr(0) catch null;
+            }
+            if (self.saved_termios) |saved| {
+                var raw = saved;
+                raw.lflag.ECHO = false;
+                raw.lflag.ICANON = false;
+                raw.lflag.ISIG = false;
+                raw.lflag.IEXTEN = false;
+                raw.iflag.ICRNL = false;
+                raw.iflag.IXON = false;
+                raw.oflag.OPOST = false;
+                raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
+                raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
+                _ = std.posix.tcsetattr(0, .NOW, raw) catch {};
+            }
+        } else {
+            if (self.saved_termios) |saved| {
+                _ = std.posix.tcsetattr(0, .DRAIN, saved) catch {};
+                self.saved_termios = null;
+            }
+        }
+        self.slots[resultSlot(eval)] = values.valNil();
+        try self.completeSuccess(eval);
+    }
+
+    /// Build a host Key vector (bare ctor name + args in ctor order) rooted
+    /// per execComplete: arg built + rooted first, then the vector, then plain
+    /// stores (no GC alloc after the vector).  Tag compare is by name
+    /// (primEq), so the bare ctor spelling is the only contract.
+    fn buildKey(self: *HostLoop, key: KeyVal) Value {
+        switch (key) {
+            .char => |s| return self.buildKeyArg("KeyChar", values.valString(self.g, s)),
+            .ctrl => |c| {
+                var cb = [1]u8{c};
+                return self.buildKeyArg("KeyCtrl", values.valString(self.g, &cb));
+            },
+            .other => |n| return self.buildKeyArg("KeyOther", values.valNumber(n)),
+            .enter => return self.buildKey0("KeyEnter"),
+            .tab => return self.buildKey0("KeyTab"),
+            .backspace => return self.buildKey0("KeyBackspace"),
+            .esc => return self.buildKey0("KeyEsc"),
+            .up => return self.buildKey0("KeyUp"),
+            .down => return self.buildKey0("KeyDown"),
+            .left => return self.buildKey0("KeyLeft"),
+            .right => return self.buildKey0("KeyRight"),
+            .home => return self.buildKey0("KeyHome"),
+            .end => return self.buildKey0("KeyEnd"),
+            .pgup => return self.buildKey0("KeyPgUp"),
+            .pgdn => return self.buildKey0("KeyPgDn"),
+            .ins => return self.buildKey0("KeyIns"),
+            .del => return self.buildKey0("KeyDel"),
+            .eof => return self.buildKey0("KeyEof"),
+        }
+    }
+
+    fn buildKeyArg(self: *HostLoop, name: []const u8, arg: Value) Value {
+        var a = arg;
+        self.g.rootPushValue(&a);
+        defer self.g.rootPop();
+        const v = values.valVector(self.g, 2);
+        v.payload.vector.data.?[0] = symbols.valSymbol(&self.vm.symbols, name);
+        v.payload.vector.data.?[1] = a;
+        return v;
+    }
+
+    fn buildKey0(self: *HostLoop, name: []const u8) Value {
+        const v = values.valVector(self.g, 1);
+        v.payload.vector.data.?[0] = symbols.valSymbol(&self.vm.symbols, name);
+        return v;
+    }
+
+    /// True iff any active readkey eval is in lone-ESC wait — drives the 50ms
+    /// poll timeout instead of blocking forever on an unconfirmed ESC.
+    fn anyEscWait(self: *HostLoop) bool {
+        var i: usize = 0;
+        while (i < self.nevals) : (i += 1) {
+            const eval = &self.evals[i];
+            if (eval.active and eval.eff == .readkey and eval.eff.readkey.esc_wait) return true;
+        }
+        return false;
+    }
+
+    /// Poll timed out: every readkey eval waiting on a possible lone ESC is
+    /// now confirmed ESC (no CSI bytes followed within the deadline) — flush
+    /// them all to KeyEsc (bubbletea's deadline approach).
+    fn flushEscWaits(self: *HostLoop) VmError!void {
+        var i: usize = 0;
+        while (i < self.nevals) : (i += 1) {
+            const eval = &self.evals[i];
+            if (!eval.active or eval.eff != .readkey) continue;
+            if (eval.eff.readkey.esc_wait) {
+                try self.readKeyComplete(eval, .esc);
+            }
+        }
+    }
+
+    // -------------------------------------------------------------
     //  Poll / reap / resume
     // -------------------------------------------------------------
 
@@ -649,6 +933,7 @@ const HostLoop = struct {
                     if (eval.eff.exec.outfd >= 0) self.addPoll(i, eval.eff.exec.outfd, .exec_out);
                     if (eval.eff.exec.errfd >= 0) self.addPoll(i, eval.eff.exec.errfd, .exec_err);
                 },
+                .readkey => if (!self.stdin_eof) self.addPoll(i, 0, .readkey),
             }
         }
     }
@@ -739,6 +1024,11 @@ const HostLoop = struct {
                 },
                 .exec_out => try execDrainOut(eval),
                 .exec_err => try execDrainErr(eval),
+                .readkey => {
+                    // May have been flushed by a poll timeout before this scan.
+                    if (eval.eff != .readkey) continue;
+                    _ = try self.readKeyDrain(eval);
+                },
             }
         }
     }
@@ -759,6 +1049,13 @@ const HostLoop = struct {
     /// Close/free every pending effect (error-exit cleanup): no zombies, no
     /// leaked fds/buffers.  No GC allocation — safe to run under any root set.
     fn cleanupAll(self: *HostLoop) void {
+        // Restore the saved termios on ANY exit path (raw mode must not leak
+        // past an error).
+        if (self.saved_termios) |saved| {
+            _ = std.posix.tcsetattr(0, .DRAIN, saved) catch {};
+            self.saved_termios = null;
+        }
+        self.stdin_pending.deinit(pa);
         var i: usize = 0;
         while (i < self.nevals) : (i += 1) {
             const eval = &self.evals[i];
@@ -775,6 +1072,10 @@ const HostLoop = struct {
                     eval.eff.exec.outbuf.deinit(pa);
                     eval.eff.exec.errbuf.deinit(pa);
                     execplan.planFree(&eval.eff.exec.prog);
+                    eval.eff = .none;
+                },
+                .readkey => {
+                    eval.eff.readkey.buf.deinit(pa);
                     eval.eff = .none;
                 },
             }
@@ -851,10 +1152,17 @@ pub fn runProgram(vm: *Vm, prog: Value) VmError!Value {
             std.debug.print("effectloop: pending effect with no pollable fd\n", .{});
             break;
         }
-        _ = std.posix.poll(loop.pollfds[0..loop.npoll], -1) catch |e| switch (e) {
+        // A readkey eval in lone-ESC wait needs a bounded poll (50ms) so an
+        // unconfirmed ESC flushes to KeyEsc; otherwise block until an fd is
+        // ready.
+        const poll_timeout: i32 = if (loop.anyEscWait()) 50 else -1;
+        const poll_rc = std.posix.poll(loop.pollfds[0..loop.npoll], poll_timeout) catch |e| switch (e) {
             error.NetworkDown, error.SystemResources => return error.ShenError,
-            error.Unexpected => {}, // spurious — re-scan
+            error.Unexpected => 0, // spurious — flush esc_waits like a timeout
         };
+        if (poll_rc == 0) {
+            try loop.flushEscWaits();
+        }
         loop.reapChildren();
         try loop.drainReady();
         try loop.completeReady();
@@ -916,11 +1224,13 @@ fn taskArity(name: []const u8) ?i32 {
     if (std.mem.eql(u8, name, "TaskSucceed") or std.mem.eql(u8, name, "TaskFail") or
         std.mem.eql(u8, name, "TaskWrite") or std.mem.eql(u8, name, "TaskReadFile") or
         std.mem.eql(u8, name, "TaskExec") or std.mem.eql(u8, name, "TaskGetenv") or
-        std.mem.eql(u8, name, "TaskCd") or std.mem.eql(u8, name, "TaskGlob")) return 1;
+        std.mem.eql(u8, name, "TaskCd") or std.mem.eql(u8, name, "TaskGlob") or
+        std.mem.eql(u8, name, "TaskRawMode")) return 1;
     if (std.mem.eql(u8, name, "TaskAndThen") or std.mem.eql(u8, name, "TaskOnError") or
         std.mem.eql(u8, name, "TaskWriteFile") or std.mem.eql(u8, name, "TaskSetenv")) return 2;
     if (std.mem.eql(u8, name, "TaskReadLine") or std.mem.eql(u8, name, "TaskGetcwd") or
-        std.mem.eql(u8, name, "TaskGetpid")) return 0;
+        std.mem.eql(u8, name, "TaskGetpid") or std.mem.eql(u8, name, "TaskReadKey") or
+        std.mem.eql(u8, name, "TaskWinSize")) return 0;
     return null;
 }
 
@@ -942,5 +1252,98 @@ fn writeFdAll(fd: i32, data: []const u8) void {
         }
         if (n == 0) return;
         off += @intCast(n);
+    }
+}
+
+// ---------------------------------------------------------------------
+//  Terminal key decode (M1 tea) — the state machine behind TaskReadKey.
+//  Returns null when the buffer is an INCOMPLETE prefix (caller suspends;
+//  esc_wait is set iff the prefix is ESC/CSI).  Single-byte controls and
+//  UTF-8 are decoded directly; ESC introduces CSI/SS3 sequences.
+// ---------------------------------------------------------------------
+
+fn decodeKey(buf: []const u8) ?DecodedKey {
+    if (buf.len == 0) return null;
+    const b0 = buf[0];
+    // Ctrl keys: 0x01..0x1A EXCEPT the specials the switch maps (tab/enter/
+    // backspace) — Zig switch ranges must not overlap, so this runs first.
+    if (b0 >= 0x01 and b0 <= 0x1A and b0 != 0x08 and b0 != 0x09 and b0 != 0x0A and b0 != 0x0D) {
+        return .{ .consumed = 1, .key = .{ .ctrl = @intCast(b0 - 0x01 + 'a') } };
+    }
+    switch (b0) {
+        0x0D, 0x0A => return .{ .consumed = 1, .key = .enter },
+        0x09 => return .{ .consumed = 1, .key = .tab },
+        0x7F, 0x08 => return .{ .consumed = 1, .key = .backspace },
+        0x00, 0x1C...0x1F => return .{ .consumed = 1, .key = .{ .other = b0 } },
+        0x80...0xBF => return .{ .consumed = 1, .key = .{ .other = b0 } }, // stray continuation
+        0x1B => return decodeEsc(buf),
+        0xC0...0xF4 => return decodeUtf8(buf),
+        0x20...0x7E => return .{ .consumed = 1, .key = .{ .char = buf[0..1] } }, // plain ASCII
+        else => return .{ .consumed = 1, .key = .{ .other = b0 } }, // 0xF5..0xFF etc.
+    }
+}
+
+/// ESC: CSI (`[`) / SS3 (`O`) with params then a final byte; a lone ESC or an
+/// unparsed prefix is incomplete (null).  ESC followed by a NON-sequence byte
+/// is a bare KeyEsc consuming ONLY the ESC — the following byte stays in the
+/// read-key accumulator (stdin_pending pushback) and the re-armed readKey
+/// decodes it as its own key.
+fn decodeEsc(buf: []const u8) ?DecodedKey {
+    if (buf.len < 2) return null; // lone ESC — incomplete
+    const b1 = buf[1];
+    if (b1 == 'O' or b1 == '[') {
+        var i: usize = 2;
+        while (i < buf.len) : (i += 1) {
+            const c = buf[i];
+            if (c >= 0x40 and c <= 0x7E) return mapCsiFinal(buf[2..i], c, i + 1);
+            if (c < 0x30 or c > 0x3F) return null; // not a param/intermediate — incomplete
+        }
+        return null; // ran out before a final byte
+    }
+    return .{ .consumed = 1, .key = .esc };
+}
+
+/// UTF-8 lead (0xC0..0xF4): decode iff all continuation bytes are present.
+/// Missing continuations -> incomplete (null); a non-continuation byte -> the
+/// lead is treated as a stray KeyOther byte.
+fn decodeUtf8(buf: []const u8) ?DecodedKey {
+    const b0 = buf[0];
+    const need: usize = if (b0 < 0xE0) 1 else if (b0 < 0xF0) 2 else 3;
+    if (buf.len < 1 + need) return null;
+    var i: usize = 1;
+    while (i <= need) : (i += 1) {
+        if (buf[i] & 0xC0 != 0x80) return .{ .consumed = 1, .key = .{ .other = b0 } };
+    }
+    return .{ .consumed = 1 + need, .key = .{ .char = buf[0 .. 1 + need] } };
+}
+
+/// Map a CSI/SS3 final byte (with the param bytes preceding it) to a key.
+/// A/B/C/D -> arrows, H/F -> home/end, `~` -> by LAST param digit
+/// (1..6 = Home/Ins/Del/End/PgUp/PgDn; params stripped, modifiers ignored).
+fn mapCsiFinal(params: []const u8, final: u8, consumed: usize) ?DecodedKey {
+    switch (final) {
+        'A' => return .{ .consumed = consumed, .key = .up },
+        'B' => return .{ .consumed = consumed, .key = .down },
+        'C' => return .{ .consumed = consumed, .key = .right },
+        'D' => return .{ .consumed = consumed, .key = .left },
+        'H' => return .{ .consumed = consumed, .key = .home },
+        'F' => return .{ .consumed = consumed, .key = .end },
+        '~' => {
+            var last: u8 = 1;
+            for (params) |p| {
+                if (p >= '0' and p <= '9') last = p - '0';
+            }
+            const key: KeyVal = switch (last) {
+                1 => .home,
+                2 => .ins,
+                3 => .del,
+                4 => .end,
+                5 => .pgup,
+                6 => .pgdn,
+                else => .{ .other = last },
+            };
+            return .{ .consumed = consumed, .key = key };
+        },
+        else => return .{ .consumed = consumed, .key = .{ .other = final } },
     }
 }

@@ -32,12 +32,17 @@ set -u
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
 ELMVM="${1:-$ROOT/zig-out/bin/elmvm}"
+PTYTEST="${PTYTEST:-$ROOT/zig-out/bin/ptytest}"
 CDIR="${2:-$ROOT/elm-compiler}"
 FIX="${3:-$ROOT/tests/elm-fixtures}"
 OUT="$(mktemp -d)"
 
 if [ ! -x "$ELMVM" ]; then
   echo "error: elmvm not found at $ELMVM (run: zig build elmvm)" >&2
+  exit 2
+fi
+if [ ! -x "$PTYTEST" ]; then
+  echo "error: ptytest not found at $PTYTEST (run: zig build elmvm ptytest)" >&2
   exit 2
 fi
 if [ ! -f "$CDIR/compiler.js" ]; then
@@ -124,6 +129,16 @@ compile_error() {
   add_check err "$name" "" "$exp" "" "" "$FIX/$name.elm" "$OUT/$name.csexp"
 }
 
+# pty <name> <fn> <script-name>: compile <name>.elm, then run it under a real
+# pseudo-terminal via ptytest, driving the script tests/elm-fixtures/scripts/
+# <script-name> (send/expect/expect_exit).  PASS iff ptytest exits 0 AND its
+# output starts with 'PASS'.
+pty() {
+  local name="$1" fn="$2" script="$3"
+  register_group "$OUT/$name.csexp" "$FIX/$name.elm"
+  add_check pty "$name" "$fn" "" "" "$script" "$FIX/$name.elm" "$OUT/$name.csexp"
+}
+
 # out_cmp <name>: compare the raw file an elmvm run wrote (iofile's hello.out)
 # against its expected bytes.
 out_cmp() {
@@ -195,6 +210,15 @@ run asyncorder   main   "$(read_expected asyncorder)"
 run fastexec     main   "$(read_expected fastexec)"
 run asyncpure    main   "$(read_expected asyncpure)"
 compile_error dup         "duplicate top-level definition in Dup: f"
+
+# --- M1 bubbletea: terminal Key ADT compiler surface (pure, no terminal) ---
+run keyunit     main   "$(read_expected keyunit)"
+# --- M1 STEP 2: host terminal substrate (raw mode + nonblocking readKey) ---
+pty rawpty      main   rawpty.script
+# --- M1 STEP 3: Tea core loop — pure renderer, byte-exact ANSI frame stream ---
+run teaunit     main   "$(read_expected teaunit)"
+# --- M1 STEP 4: TextInput widget + teademo (Tea program under a real pty) ---
+pty teademo     main   teademo.script
 
 # --- elm/core 1.0.5 runtime ports: structural Basics.compare + Dict/Set/Maybe/Result ---
 # cmporder runs FIRST: it is the char-code wrapper ARG ORDER smoke test for the
@@ -288,6 +312,19 @@ dispatch() {
         echo "PASS $name ($mod.$fn multi) -> $got"; pass=$((pass+1))
       else
         echo "FAIL $name ($mod.$fn multi): exp[$exp] got[$got]"; fail=$((fail+1))
+      fi
+      ;;
+    pty)
+      if head -c 4 "$outfile" | grep -q '^err '; then
+        echo "FAIL $name: compile error: $(cat "$outfile")"; fail=$((fail+1)); return
+      fi
+      mod=$(module_name "$fixfile")
+      qname="$mod.$fn"
+      got=$("$PTYTEST" "$ELMVM" "$outfile" "$qname" "$FIX/scripts/$stdin" 2>&1)
+      if [ $? -eq 0 ] && printf '%s' "$got" | grep -q '^PASS'; then
+        echo "PASS $name ($qname pty)"; pass=$((pass+1))
+      else
+        echo "FAIL $name ($qname pty): $got"; fail=$((fail+1))
       fi
       ;;
     io)

@@ -57,8 +57,9 @@ module Lower.Module exposing
 -- generated-defun alias shims with pure compile-time rewriting — no alias
 -- defuns exist.  Rows come from four sources, built per module:
 --   1. PRIM DOT ALIASES: String.append -> "cn.curried", String.length ->
---      "c-strlen.curried", String.slice -> "substring.curried" — dotted
---      conveniences backed DIRECTLY by curried prim wrappers.
+--      "c-strlen.curried", String.sliceLen -> "substring.curried" — dotted
+--      conveniences backed DIRECTLY by curried prim wrappers (sliceLen is
+--      (start, LEN, str), NOT real Elm's (start, end) slice).
 --   2. PRELUDE ALIASES: the implicit `import Prelude exposing (..)` present
 --      in every module except the Prelude compilation itself (where they
 --      would self-shadow the definitions being lowered).
@@ -372,6 +373,7 @@ compileUnit globals unit =
                         List.map wrapperEntry Expr.primWrappers
                             ++ List.map unaryWrapperEntry Expr.unaryPrims
                             ++ List.map ternaryWrapperEntry Expr.ternaryPrims
+                            ++ [ substringWrapperEntry ]
                 in
                 fnEntries ++ ctorEntries ++ wrapperEntries
             )
@@ -695,6 +697,30 @@ ternaryWrapperEntry prim =
 
         body =
             [ Emit.Access 0, Emit.Access 1, Emit.Access 2, Emit.Prim prim, Emit.Return ]
+
+        code =
+            [ Emit.Cur (Emit.Grab :: Emit.Grab :: body) ]
+    in
+    Csexp.bundleEntry name (Emit.flatten (Emit.resolve code))
+
+
+-- A 3-arg curried wrapper for the `substring` prim in String.sliceLen's
+-- SOURCE order (start len str), keyed "substring.curried" (aliased via
+-- Lower.Resolve.primDotAliases).  NOTE: deliberately NOT named String.slice —
+-- real Elm's slice is (start, end, str), this prim is length-based; the
+-- sliceLen spelling keeps the divergence from being silently wrong.  The
+-- prim pops (string, start, len), and
+-- access 0 = param3 / 1 = param2 / 2 = param1 (see ternaryWrapperEntry), so
+-- the body pushes len (access 1), start (access 2), string (access 0) —
+-- pops come out (string, start, len).  Same two-grab convention.
+substringWrapperEntry : String
+substringWrapperEntry =
+    let
+        name =
+            Expr.wrapperGlobalName "substring"
+
+        body =
+            [ Emit.Access 1, Emit.Access 2, Emit.Access 0, Emit.Prim "substring", Emit.Return ]
 
         code =
             [ Emit.Cur (Emit.Grab :: Emit.Grab :: body) ]

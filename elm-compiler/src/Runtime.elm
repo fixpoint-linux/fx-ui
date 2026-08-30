@@ -32,6 +32,33 @@ type Task x a
     | TaskGetcwd
     | TaskGetpid
     | TaskGlob String
+    | TaskReadKey
+    | TaskWinSize
+    | TaskRawMode Bool
+
+
+-- A decoded terminal key (M1 tea input surface).  The HOST event loop builds
+-- these vectors with the BARE ctor name as tag (tag compare is by name), so
+-- the ctor spellings here are the contract for effectloop.zig's decode table.
+type Key
+    = KeyChar String
+    | KeyEnter
+    | KeyTab
+    | KeyBackspace
+    | KeyEsc
+    | KeyUp
+    | KeyDown
+    | KeyLeft
+    | KeyRight
+    | KeyHome
+    | KeyEnd
+    | KeyPgUp
+    | KeyPgDn
+    | KeyIns
+    | KeyDel
+    | KeyCtrl String
+    | KeyOther Int
+    | KeyEof
 
 
 type alias Cmd msg = List (Task Never msg)
@@ -154,6 +181,20 @@ runTask task =
         TaskGlob pattern ->
             Ok (decodeStringList (globPrim pattern))
 
+        -- M1 terminal effects.  In the SYNC worker (this trusted interpreter)
+        -- they are no-ops: no terminal to poll, so readKey completes with
+        -- KeyEof, winSize reports 0x0, rawMode is ignored.  The HOST event loop
+        -- (src/effectloop.zig, STEP 2) dispatches these same Task tags to real
+        -- nonblocking stdin / ioctl / termios handling.
+        TaskReadKey ->
+            Ok KeyEof
+
+        TaskWinSize ->
+            Ok ( 0, 0 )
+
+        TaskRawMode _ ->
+            Ok ()
+
 
 cmdNone : List (Task Never msg)
 cmdNone = []
@@ -267,6 +308,21 @@ taskGetpid =
 taskGlob : String -> Task x (List String)
 taskGlob pattern =
     TaskGlob pattern
+
+
+taskReadKey : Task x Key
+taskReadKey =
+    TaskReadKey
+
+
+taskWinSize : Task x ( Int, Int )
+taskWinSize =
+    TaskWinSize
+
+
+taskRawMode : Bool -> Task x ()
+taskRawMode enable =
+    TaskRawMode enable
 
 
 subNone : ()

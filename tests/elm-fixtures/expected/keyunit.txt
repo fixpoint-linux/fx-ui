@@ -1,0 +1,1 @@
+"char:a enter tab backspace esc up down left right home end pgup pgdn ins del ctrl:c other:27 eof ansi 27 91 50 75 len4"

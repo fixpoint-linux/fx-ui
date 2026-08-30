@@ -1,0 +1,7 @@
+"[?25l[2Kalpha
+[2Kbeta
+[2A[2Kalpha2
+[2Kbeta2
+[2Kgamma
+[3A[2Konly
+[J"

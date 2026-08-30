@@ -59,7 +59,8 @@ module Prelude exposing
 -- String ops ride the VM byte-string prims (plan §3) THROUGH the curried
 -- wrapper globals Lower.Module emits for them: `String.append` -> `cn`
 -- (full source-order 2-arg concat), `String.length` -> `c-strlen` (BYTE
--- length), `String.slice` -> `substring` (start len str), and `fromInt` =
+-- length), `String.sliceLen` -> `substring` (start LEN str — NOT real Elm's
+-- (start, end) String.slice), and `fromInt` =
 -- `cn ""` (cn renders numbers in decimal).  Those DOTTED names resolve via
 -- the compiler's alias table to `.curried` wrapper globals, which are
 -- emitted alongside every module (deduped identically on bundle merge).

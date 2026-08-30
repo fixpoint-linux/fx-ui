@@ -1,0 +1,15 @@
+# rawpty: raw mode on -> READY -> readKey loop; ESC quits.
+# Proves raw-mode, KeyChar, CSI arrow, Ctrl-C, lone-ESC flush, quit + exit.
+# "send xy" feeds TWO keys in one write — proving the multi-byte consume
+# (both K:char:x and K:char:y must be delivered, not just the first).
+expect READY
+send xy
+expect K:char:x
+expect K:char:y
+send \e[A
+expect K:up
+send \x03
+expect K:ctrl:c
+send \e
+expect K:esc
+expect_exit 0

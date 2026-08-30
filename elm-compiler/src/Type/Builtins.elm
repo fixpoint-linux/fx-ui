@@ -206,6 +206,12 @@ primWrapperSchemes =
         , ( "<-address", poly [ a ] (func [ jsArray (TVar a), tInt ] (TVar a)) )
         , ( "address->", poly [ a ] (func [ jsArray (TVar a), tInt, TVar a ] (jsArray (TVar a))) )
 
+        -- substring(str, start, len), clamped — but the wrapper
+        -- (Lower.Module.substringWrapperEntry) permutes to String.sliceLen's
+        -- SOURCE order, so the visible spelling is start -> len -> str
+        -- (deliberately NOT real Elm's (start, end) String.slice).
+        , ( "substring", mono (func [ tInt, tInt, tString ] tString) )
+
         -- Process execution.  exec-plan takes/returns a tagged list; intern is
         -- a trusted lie (returns a VM symbol typed as String).  Inert by
         -- construction: its only call sites are TRUSTED bodies (Prelude.

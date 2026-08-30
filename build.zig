@@ -157,6 +157,23 @@ pub fn build(b: *std.Build) void {
     const vmbench_step = b.step("vmbench", "Build the vmbench throughput harness");
     vmbench_step.dependOn(&vmbench_install.step);
 
+    // ---- `ptytest`: the PTY expect-runner for terminal fixtures (M1 tea) ----
+    // A libc-linked exe with NO vm imports — pure POSIX (open ptmx/fork/ioctl/
+    // poll).  Drives elmvm inside a pseudo-terminal and asserts on the output.
+    const ptytest_mod = b.createModule(.{
+        .root_source_file = b.path("tools/ptytest.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const ptytest = b.addExecutable(.{
+        .name = "ptytest",
+        .root_module = ptytest_mod,
+    });
+    const ptytest_install = b.addInstallArtifact(ptytest, .{});
+    const ptytest_step = b.step("ptytest", "Build the ptytest terminal harness");
+    ptytest_step.dependOn(&ptytest_install.step);
+
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
     // This will evaluate the `run` step rather than the default step.

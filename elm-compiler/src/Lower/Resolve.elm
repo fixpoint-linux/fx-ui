@@ -155,6 +155,10 @@ primDotAliases : List ( String, String )
 primDotAliases =
     [ ( "String.append", Expr.wrapperGlobalName "cn" )
     , ( "String.length", Expr.wrapperGlobalName "c-strlen" )
+    -- NOTE: this is NOT real Elm's String.slice (start end str) — fx-ui's
+    -- substring prim is LENGTH-based, so the dotted spelling is sliceLen
+    -- (start len str) to keep real-Elm ports from silently mis-slicing.
+    , ( "String.sliceLen", Expr.wrapperGlobalName "substring" )
 
     -- elm/core Bitwise (Array port support): dotted spellings rewrite to the
     -- curried prim wrappers minted from Expr.primWrappers/unaryPrims.
@@ -202,12 +206,44 @@ platformTable =
     , ( "Io.getcwd", "Runtime.taskGetcwd" )
     , ( "Io.getpid", "Runtime.taskGetpid" )
     , ( "Io.glob", "Runtime.taskGlob" )
+    , ( "Io.readKey", "Runtime.taskReadKey" )
+    , ( "Io.winSize", "Runtime.taskWinSize" )
+    , ( "Io.rawMode", "Runtime.taskRawMode" )
     , ( "Plan.str", "Runtime.tStr" )
     , ( "Plan.num", "Runtime.tNum" )
     , ( "Plan.sym", "Runtime.tSym" )
     , ( "Plan.nil", "Runtime.tNil" )
     , ( "Plan.cons", "Runtime.tCons" )
     , ( "Sub.none", "Runtime.subNone" )
+
+    -- M1 terminal Key ADT (foreign: defined in Runtime).  Fixtures use the
+    -- UNQUALIFIED ctor names in patterns/expressions — qualified foreign ctor
+    -- PATTERNS are rejected (Lower.Pattern), so these bare rows (shared by the
+    -- checker + lowerer) are the only spelling that typechecks.  Self-shadowed
+    -- like every platform row.
+    , ( "KeyChar", "Runtime.KeyChar" )
+    , ( "KeyEnter", "Runtime.KeyEnter" )
+    , ( "KeyTab", "Runtime.KeyTab" )
+    , ( "KeyBackspace", "Runtime.KeyBackspace" )
+    , ( "KeyEsc", "Runtime.KeyEsc" )
+    , ( "KeyUp", "Runtime.KeyUp" )
+    , ( "KeyDown", "Runtime.KeyDown" )
+    , ( "KeyLeft", "Runtime.KeyLeft" )
+    , ( "KeyRight", "Runtime.KeyRight" )
+    , ( "KeyHome", "Runtime.KeyHome" )
+    , ( "KeyEnd", "Runtime.KeyEnd" )
+    , ( "KeyPgUp", "Runtime.KeyPgUp" )
+    , ( "KeyPgDn", "Runtime.KeyPgDn" )
+    , ( "KeyIns", "Runtime.KeyIns" )
+    , ( "KeyDel", "Runtime.KeyDel" )
+    , ( "KeyCtrl", "Runtime.KeyCtrl" )
+    , ( "KeyOther", "Runtime.KeyOther" )
+    , ( "KeyEof", "Runtime.KeyEof" )
+
+    -- Tea's quit marker rides a bare TaskSucceed so core-libs Tea.elm can
+    -- scan the user's command for it synchronously (quit key => drop the
+    -- readKey re-arm).  Same bare-name/foreign-ctor mechanism as the Key rows.
+    , ( "TaskSucceed", "Runtime.TaskSucceed" )
     ]
 
 

@@ -27,15 +27,16 @@ const fs = require('fs');
 const path = require('path');
 
 // The fixed corpus, in the order Main/run.js historically appended them:
-// Prelude, Runtime, then the seven elm/core ports (Dict/Set/Maybe/Result/Tuple
-// live in core-libs/ — NOT src/ — because elm's ambiguity check spans
-// source-directories: a local src/Dict.elm collides with elm/core's Dict for
-// every compiler module that imports it, breaking `elm make src/Main.elm`).
+// Prelude, Runtime, then the seven elm/core ports plus Tea (Dict/Set/Maybe/
+// Result/Tuple live in core-libs/ — NOT src/ — because elm's ambiguity check
+// spans source-directories: a local src/Dict.elm collides with elm/core's
+// Dict for every compiler module that imports it, breaking
+// `elm make src/Main.elm`).
 const CORPUS = [
   fs.readFileSync(path.join(__dirname, 'src', 'Prelude.elm'), 'utf8'),
   fs.readFileSync(path.join(__dirname, 'src', 'Runtime.elm'), 'utf8'),
   ...[ 'Dict.elm', 'Set.elm', 'Maybe.elm', 'Result.elm',
-       'Tuple.elm', 'JsArray.elm', 'Array.elm' ]
+       'Tuple.elm', 'JsArray.elm', 'Array.elm', 'Tea.elm', 'TextInput.elm' ]
     .map((f) => fs.readFileSync(path.join(__dirname, 'core-libs', f), 'utf8')),
 ];
 
