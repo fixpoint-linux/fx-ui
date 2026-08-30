@@ -1,24 +1,25 @@
 # fx-ui deferred work / TODO
 
 Deferred items tracked in `plan.md` §11 (deliberate omissions, out of the M1–MX pure-core
-path) plus follow-on ideas. Each is a port-completion of an already-Zig sibling file in
-`~/projects/shen/zig/src/vm/` unless marked otherwise. `src/gc`, `src/vm`, `tools/elmvm.zig`
-are frozen except when a milestone explicitly ports a named seam (M6 streams, M8 execplan).
+path) plus follow-on ideas. The runtime surface (core libs) and the typechecker have both
+landed; what remains are hardening / composition items on top of them. The shared VM
+(`vendor/zinc-vm`) is frozen except the user-approved `prims.zig` (bitwise) + `interp.zig`
+(partial-apply fix) from the Array work; `src/gc`, `tools/elmvm.zig` stay frozen.
 
 Progress gates: `zig build elmvm`, `zig build vm-test`, `elm-compiler/build.sh`,
-`tests/elm-fixtures/run-elm-gate.sh`. Handoff chains: `handoff-elm-csexp-m<8>-*`.
+`tests/elm-fixtures/run-elm-gate.sh` (currently PASS=74 FAIL=0).
 
-## Deferred / recommended
+## Recommended (hardening / composition, after the typechecker landed)
 
-- [x] **TRUE nonblocking async** — poll/select VM seam. The one deferred item with real
-      user-facing value for fx-ui: lets Elm programs do real concurrency instead of M7's
-      deterministic single-threaded cooperative sequencing. **LANDED (M9)** as a host-side
-      effect-manager event loop (`src/vm/effectloop.zig` + `hostcall.zig`): main returns a
-      Program, the host interprets Tasks natively with `std.posix.poll`, out-of-order
-      completion proven by the asyncorder fixture. Gate 54/54, vm-test 86/86.
-- [ ] **Widen the Elm runtime surface** — more core libs (Dict/Set/Array/Result/Maybe),
-      error messages with source ranges, type-checking (currently untyped-subset).
-      Directly serves the "Elm" half of fx-ui.
+- [ ] **Typechecker edge cases** — (a) unsaturated type-alias application silently accepted
+      (wrong-arity alias should error); (b) row-kind generic alias applied to a bare type var
+      (`Named r` in a signature) — documented limitation; (c) `Record.remove` as a value /
+      partial application error quality; (d) the trusted skips (`Runtime.runTask` for the
+      higher-kinded Task interpreter, `intern`).
+- [ ] **Full end-to-end Elm program** — one program using the typechecker + Dict/Array +
+      records + async I/O (M9) compiled and run end-to-end, proving the stack composes.
+- [ ] **Typecheck-pass performance** — cache per-unit schemes keyed on source-hash (checking
+      ~4KLOC core-libs on every gate run in pure Elm on node).
 
 ## Shen-runtime machinery — NOT recommended for fx-ui
 
@@ -43,3 +44,16 @@ compiles statically host-side), so these have ~zero value for fx-ui:
 - [x] **M7 — async Kernel** (`81f2cf5`): cooperative Task monad + effect-manager loop.
 - [x] **M8 — process execution** (`c3fac66`): execplan.zig port (exec-plan + env/cwd prims).
       VM interp.zig vaPop/envPop leak fix: `cd9be11` (separate).
+- [x] **TRUE nonblocking async** — **LANDED (M9)**: host-side effect-manager event loop
+      (`src/vm/effectloop.zig` + `hostcall.zig`), `std.posix.poll`, out-of-order completion.
+- [x] **Core libs (elm/core surface)** — `034c598`: verbatim ports of Dict (Red-Black over
+      comparable), Set, Maybe, Result, Tuple, Array (relaxed radix tree via a VM-vector
+      `Elm.JsArray` substitute) + structural comparable `compare` (cmpNum/cmpStrBytes/cmpList)
+      over new `number?`/`string?`/`cons?`/`empty?`/`char-code` prims. zinc-vm reopened (user-
+      approved) for 7 JS-int32 bitwise prims + a `buildPartialClosure` jump-target fix.
+- [x] **Typechecker (full pre-0.16 scoped-labels records)** — `9520655`: HM Algorithm W over
+      `src/Type/*`, Leijen extensible-record rows (Fig-3 rewrite, first-occurrence select/
+      restrict, duplicate labels, `number`/`comparable`/`appendable` flex vars), `Record.remove`
+      insertion `{r|f<-v}`, 3 AST rewrites driving lowering, source-ranged errors. 3-hunk
+      vendored stil4m parser patch (+`FXUI-PATCHES.md`, `artifacts.dat` staleness guard).
+      Gate PASS=74 FAIL=0.

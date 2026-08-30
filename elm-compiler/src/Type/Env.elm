@@ -339,79 +339,78 @@ substituted for the `TCon`'s arguments (a row-kind generic applied to a
 concrete record splices into the body's row tail via `Rep.zonk`). Nested
 aliases and aliases inside argument/field types are expanded too.
 
-Any NEGATIVE-id sentinel that survives an expansion (a row-kind generic applied
-to a BARE type variable — its row tail is not a concrete record, so `Rep.zonk`'s
-row-splice does not fire — or an alias applied to the wrong number of
-arguments) is FRESHENED to a fresh non-negative id drawn from the unification
-state's counter. This keeps sentinel ids out of the shared substitution: `unify`
-can never bind one, so a later independent use of the same alias can never
-observe an earlier use's binding through the same negative key.
+Applying an alias to the WRONG number of type arguments is an error
+(`Err <msg>`), reported at the alias-application site: a 1-generic alias used
+with zero arguments would otherwise leave its sentinel(s) unbound (silently
+accepting anything), and an alias given too many arguments has no meaning.
+The arity check fires here, at expansion, so the Infer pass can attach the use
+site's source range to the message.
+
+Any NEGATIVE-id sentinel that survives a legal expansion (a row-kind generic
+applied to a BARE type variable — its row tail is not a concrete record, so
+`Rep.zonk`'s row-splice does not fire) is FRESHENED to a fresh non-negative id
+drawn from the unification state's counter. This keeps sentinel ids out of the
+shared substitution: `unify` can never bind one, so a later independent use of
+the same alias can never observe an earlier use's binding through the same
+negative key.
 -}
-expandAliases : Env -> Type -> Uni.State -> ( Type, Uni.State )
+expandAliases : Env -> Type -> Uni.State -> Result String ( Type, Uni.State )
 expandAliases env t state =
     case t of
         TVar v ->
-            ( TVar v, state )
+            Ok ( TVar v, state )
 
         TCon name args ->
             case lookupAlias name env of
                 Just alias ->
-                    let
-                        ( args2, st1 ) =
-                            expandAliasesList env args state
+                    if List.length args /= List.length alias.generics then
+                        Err (arityMessage alias (List.length args))
 
-                        ( body, st2 ) =
-                            expandAliasBody alias args2 st1
-                    in
-                    expandAliases env body st2
+                    else
+                        expandAliasesList env args state
+                            |> Result.andThen
+                                (\( args2, st1 ) ->
+                                    let
+                                        ( body, st2 ) =
+                                            expandAliasBody alias args2 st1
+                                    in
+                                    expandAliases env body st2
+                                )
 
                 Nothing ->
-                    let
-                        ( args2, st1 ) =
-                            expandAliasesList env args state
-                    in
-                    ( TCon name args2, st1 )
+                    expandAliasesList env args state
+                        |> Result.map (\( args2, st1 ) -> ( TCon name args2, st1 ))
 
         TFun a b ->
-            let
-                ( a2, st1 ) =
-                    expandAliases env a state
-
-                ( b2, st2 ) =
-                    expandAliases env b st1
-            in
-            ( TFun a2 b2, st2 )
+            expandAliases env a state
+                |> Result.andThen
+                    (\( a2, st1 ) ->
+                        expandAliases env b st1
+                            |> Result.map (\( b2, st2 ) -> ( TFun a2 b2, st2 ))
+                    )
 
         TTuple ts ->
-            let
-                ( ts2, st1 ) =
-                    expandAliasesList env ts state
-            in
-            ( TTuple ts2, st1 )
+            expandAliasesList env ts state
+                |> Result.map (\( ts2, st1 ) -> ( TTuple ts2, st1 ))
 
         TRecord row ->
-            let
-                ( row2, st1 ) =
-                    expandAliasesRow env row state
-            in
-            ( TRecord row2, st1 )
+            expandAliasesRow env row state
+                |> Result.map (\( row2, st1 ) -> ( TRecord row2, st1 ))
 
 
-expandAliasesList : Env -> List Type -> Uni.State -> ( List Type, Uni.State )
+expandAliasesList : Env -> List Type -> Uni.State -> Result String ( List Type, Uni.State )
 expandAliasesList env ts state =
     case ts of
         [] ->
-            ( [], state )
+            Ok ( [], state )
 
         t :: rest ->
-            let
-                ( t2, st1 ) =
-                    expandAliases env t state
-
-                ( ts2, st2 ) =
-                    expandAliasesList env rest st1
-            in
-            ( t2 :: ts2, st2 )
+            expandAliases env t state
+                |> Result.andThen
+                    (\( t2, st1 ) ->
+                        expandAliasesList env rest st1
+                            |> Result.map (\( ts2, st2 ) -> ( t2 :: ts2, st2 ))
+                    )
 
 
 expandAliasBody : Alias -> List Type -> Uni.State -> ( Type, Uni.State )
@@ -426,38 +425,66 @@ expandAliasBody alias args state =
     freshenSentinels (Rep.zonk subst alias.body) state
 
 
-expandAliasesRow : Env -> Row -> Uni.State -> ( Row, Uni.State )
+expandAliasesRow : Env -> Row -> Uni.State -> Result String ( Row, Uni.State )
 expandAliasesRow env row state =
-    let
-        ( fields2, st1 ) =
-            expandAliasesFields env row.fields state
-    in
-    ( { fields = fields2, tail = row.tail }, st1 )
+    expandAliasesFields env row.fields state
+        |> Result.map (\( fields2, st1 ) -> ( { fields = fields2, tail = row.tail }, st1 ))
 
 
-expandAliasesFields : Env -> List ( String, Type ) -> Uni.State -> ( List ( String, Type ), Uni.State )
+expandAliasesFields : Env -> List ( String, Type ) -> Uni.State -> Result String ( List ( String, Type ), Uni.State )
 expandAliasesFields env fields state =
     case fields of
         [] ->
-            ( [], state )
+            Ok ( [], state )
 
         ( n, t ) :: rest ->
-            let
-                ( t2, st1 ) =
-                    expandAliases env t state
+            expandAliases env t state
+                |> Result.andThen
+                    (\( t2, st1 ) ->
+                        expandAliasesFields env rest st1
+                            |> Result.map (\( rest2, st2 ) -> ( ( n, t2 ) :: rest2, st2 ))
+                    )
 
-                ( rest2, st2 ) =
-                    expandAliasesFields env rest st1
-            in
-            ( ( n, t2 ) :: rest2, st2 )
+
+arityMessage : Alias -> Int -> String
+arityMessage alias actual =
+    let
+        expected =
+            List.length alias.generics
+    in
+    "type alias "
+        ++ alias.name
+        ++ " expects "
+        ++ String.fromInt expected
+        ++ " type argument"
+        ++ (if expected == 1 then "" else "s")
+        ++ " but got "
+        ++ String.fromInt actual
 
 
 {-| Replace every NEGATIVE-id sentinel left in an expanded alias body with a
 fresh non-negative variable of the same kind and flex. The mapping is memoized
 per expansion so a sentinel appearing in several positions (a row generic used
-as two row tails) stays a single shared variable. Sentinels are only left by
-`expandAliasBody` when a row-kind generic is applied to a bare type variable or
-when the alias is applied to the wrong number of arguments.
+as two row tails) stays a single shared variable.
+
+A sentinel is only left by `expandAliasBody` when a row-kind generic is applied
+to a BARE type variable (e.g. signature `f : Named r -> String` with
+`type alias Named r = { name : String | r }`): `Rep.zonk` splices a row generic
+only when its argument is a concrete `TRecord`, so a bare-var argument leaves
+the `KRow` sentinel in the tail. Freshening it here to a fresh row var is what
+makes `f` POLYMORPHIC in its row tail (`forall r'. { name : String | r' } ->
+String`), which matches real Elm's reading of the signature.
+
+LIMITATION (kind inference, not a leak): the bare `r` in the signature is
+converted as `KType` (signatures do not know an alias's generic kinds at
+conversion time), so it does NOT survive into the expanded type — the fresh row
+var replaces it. For the common `Named r -> String` shape this is exactly right,
+but a signature that ALSO uses the SAME variable at a `KType` position
+(`f : Named r -> r -> String`) is ill-kinded and is silently accepted with the
+two occurrences DISCONNECTED (the row occurrence becomes an independent row var,
+the value occurrence stays `KType`). Rejecting it would need a full kind check
+over type variables, which this kindless HM variant deliberately omits; it is
+not reachable in the corpus/fixtures.
 -}
 freshenSentinels : Type -> Uni.State -> ( Type, Uni.State )
 freshenSentinels t state =

@@ -632,7 +632,12 @@ checks =
                     applied =
                         Rep.TCon "Mini.Named" [ Rep.TRecord { fields = [ ( "age", Rep.tInt ) ], tail = Rep.REmpty } ]
                 in
-                Rep.pretty (Tuple.first (Env.expandAliases env applied Uni.emptyState)) == "{name:String, age:Int}"
+                case Env.expandAliases env applied Uni.emptyState of
+                    Ok ( expanded, _ ) ->
+                        Rep.pretty expanded == "{name:String, age:Int}"
+
+                    Err _ ->
+                        False
 
             Err _ ->
                 False
@@ -647,9 +652,59 @@ checks =
                     applied =
                         Rep.TCon "Mini.Box" [ Rep.tInt ]
                 in
-                Rep.pretty (Tuple.first (Env.expandAliases env applied Uni.emptyState)) == "{value:Int}"
+                case Env.expandAliases env applied Uni.emptyState of
+                    Ok ( expanded, _ ) ->
+                        Rep.pretty expanded == "{value:Int}"
+
+                    Err _ ->
+                        False
 
             Err _ ->
+                False
+        )
+    , check "env expands a zero-generic alias applied to zero args"
+        (case Elm.Parser.parseToFile "module Mini exposing (..)\n\ntype alias Point = { x : Int, y : Int }\n" of
+            Ok file ->
+                let
+                    env =
+                        Env.collectFile file
+                in
+                case Env.expandAliases env (Rep.TCon "Mini.Point" []) Uni.emptyState of
+                    Ok ( expanded, _ ) ->
+                        Rep.pretty expanded == "{x:Int, y:Int}"
+
+                    Err _ ->
+                        False
+
+            Err _ ->
+                False
+        )
+    , check "env alias arity error on too many arguments"
+        (case Elm.Parser.parseToFile "module Mini exposing (..)\n\ntype alias Box a = { value : a }\n" of
+            Ok file ->
+                let
+                    env =
+                        Env.collectFile file
+
+                    applied =
+                        Rep.TCon "Mini.Box" [ Rep.tInt, Rep.tBool ]
+                in
+                case Env.expandAliases env applied Uni.emptyState of
+                    Err msg ->
+                        String.contains "expects 1 type argument but got 2" msg
+
+                    Ok _ ->
+                        False
+
+            Err _ ->
+                False
+        )
+    , check "infer rejects an unsaturated type-alias application"
+        (case inferSrc "module Main exposing (..)\n\ntype alias Named r = { name : String | r }\n\nf : Named -> String\nf p =\n    p.name\n" of
+            Err err ->
+                String.contains "type alias Main.Named expects 1 type argument but got 0" err.summary
+
+            Ok _ ->
                 False
         )
     , check "alias sentinels never leak across call sites (two concrete rows)"

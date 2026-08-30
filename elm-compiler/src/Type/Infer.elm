@@ -225,16 +225,18 @@ fresh kind flex state =
     Ok ( v, { state | uni = uni2 } )
 
 
-instantiate : Env -> Scheme -> M Type
-instantiate env scheme state =
+instantiate : Env -> Range -> Scheme -> M Type
+instantiate env range scheme state =
     let
         ( t, uni2 ) =
             Env.instantiate scheme state.uni
-
-        ( expanded, uni3 ) =
-            Env.expandAliases env t uni2
     in
-    Ok ( expanded, { state | uni = uni3 } )
+    case Env.expandAliases env t uni2 of
+        Err msg ->
+            Err (Error.atRange range msg "")
+
+        Ok ( expanded, uni3 ) ->
+            Ok ( expanded, { state | uni = uni3 } )
 
 
 zonkM : Type -> M Type
@@ -384,7 +386,7 @@ resolveValue ctx range modName name =
     else
         case resolveScheme ctx modName name of
             Just scheme ->
-                instantiate ctx.env scheme
+                instantiate ctx.env range scheme
 
             Nothing ->
                 fail (Error.atRange range ("unknown name: " ++ joinName (modName ++ [ name ])) "")
@@ -396,7 +398,7 @@ resolveOperator : Env -> Range -> String -> M Type
 resolveOperator env range op =
     case Builtins.operatorScheme op of
         Just scheme ->
-            instantiate env scheme
+            instantiate env range scheme
 
         Nothing ->
             fail (Error.atRange range ("unsupported operator: " ++ op) "")
@@ -592,7 +594,7 @@ inferExpr ctx (Node range expr) =
                     fail (Error.atNode baseNode "record update base must be a local variable" ("cannot update " ++ baseName))
 
                 Just scheme ->
-                    instantiate ctx.env scheme
+                    instantiate ctx.env (Node.range baseNode) scheme
                         |> andThen (\baseType -> inferSetters ctx baseType setters)
 
         InsertionValue inner ->
@@ -1056,7 +1058,7 @@ resolveCtorType ctx range qref =
     else
         case resolveScheme ctx qref.moduleName qref.name of
             Just scheme ->
-                instantiate ctx.env scheme
+                instantiate ctx.env range scheme
 
             Nothing ->
                 fail (Error.atRange range ("unknown name: " ++ joinName (qref.moduleName ++ [ qref.name ])) "")
@@ -1475,7 +1477,7 @@ inferClause ctx fn =
                 fail (Error.atRange (Node.range fn.declaration) ("internal: unseeded top-level name " ++ name) "")
 
             Just scheme ->
-                instantiate ctx.env scheme
+                instantiate ctx.env (Node.range fn.declaration) scheme
                     |> andThen (\expected ->
                         inferPatterns ctx impl.arguments
                             |> andThen (\( argTypes, binds ) ->

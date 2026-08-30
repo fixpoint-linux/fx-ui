@@ -207,7 +207,12 @@ primWrapperSchemes =
         , ( "address->", poly [ a ] (func [ jsArray (TVar a), tInt, TVar a ] (jsArray (TVar a))) )
 
         -- Process execution.  exec-plan takes/returns a tagged list; intern is
-        -- a trusted lie (returns a VM symbol typed as String).
+        -- a trusted lie (returns a VM symbol typed as String).  Inert by
+        -- construction: its only call sites are TRUSTED bodies (Prelude.
+        -- removeFieldImpl, Runtime.tStr/tNum/tSym/tNil/tCons), which the
+        -- checker skips — so no checked code ever observes the symbol as a
+        -- String.  Kept in the value table only so the scheme is documented
+        -- and TestMain can assert it stays stable.
         , ( "exec-plan", poly [ a, b ] (func [ tList (TVar a) ] (tList (TVar b))) )
         , ( "getenv", mono (func [ tString ] tString) )
         , ( "setenv", mono (func [ tString, tString ] tBool) )
