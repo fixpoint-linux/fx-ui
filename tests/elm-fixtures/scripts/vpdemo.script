@@ -1,0 +1,27 @@
+# vpdemo: the Viewport widget driving Tea v2 under a real pty (S4).
+#
+# The demo renders a live header "off=<yOffset> size=<cols>x<rows>" above the
+# viewport (40 numbered rows), so every scroll state has a UNIQUE needle.  The
+# first paint is the startup resize probe at the pty default 80x24:
+#   \e[?25l \e[2Koff=0 size=80x24\r\n \e[2Krow-00…\r\n … (24 rows)
+# Every directive is settled by an expect BEFORE the next fires (lgdemo
+# discipline).  j/k scroll a line, \e[6~ = pgdn pages by the height (24 ->
+# clamped to maxYOffset 16), `resize 40 12` re-renders at the new dims, and
+# the SGR wheel-up packet scrolls by the 3-line delta.  q quits via the
+# TaskQuit scan (show cursor + exit 0).
+expect \e[?25l\e[2Koff=0 size=80x24
+send j
+expect off=1 size=80x24
+send j
+expect off=2 size=80x24
+send \e[6~
+expect off=16 size=80x24
+send k
+expect off=15 size=80x24
+resize 40 12
+expect off=15 size=40x12
+send \e[<64;5;3M
+expect off=12 size=40x12
+send q
+expect \e[?25h
+expect_exit 0

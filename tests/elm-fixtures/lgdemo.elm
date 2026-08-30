@@ -42,12 +42,20 @@ type alias Model =
   }
 
 
+type Msg
+  = GotKey Runtime.Key
+  | Noop
+
+
 main =
   program
     { init = \_ -> ( { count = 0, last = "-", cols = 0, rows = 0 }, Cmd.none )
     , update = demoUpdate
     , view = view
     , resize = applyResize
+    , onKey = GotKey
+    , onMouse = \_ -> Noop
+    , mouse = MouseModeOff
     }
 
 
@@ -60,26 +68,31 @@ bump key model =
   { model | count = model.count + 1, last = showKey key }
 
 
-demoUpdate key model =
-  let
-    m1 =
-      bump key model
-  in
-  case key of
-    KeyEnter ->
-      ( m1, quit )
+demoUpdate msg model =
+  case msg of
+    Noop ->
+      ( model, Cmd.none )
 
-    KeyCtrl "c" ->
-      ( m1, quit )
+    GotKey key ->
+      let
+        m1 =
+          bump key model
+      in
+      case key of
+        KeyEnter ->
+          ( m1, quit )
 
-    KeyEsc ->
-      ( m1, quit )
+        KeyCtrl "c" ->
+          ( m1, quit )
 
-    KeyChar "q" ->
-      ( m1, quit )
+        KeyEsc ->
+          ( m1, quit )
 
-    _ ->
-      ( m1, Cmd.none )
+        KeyChar "q" ->
+          ( m1, quit )
+
+        _ ->
+          ( m1, Cmd.none )
 
 
 -- The annotation is load-bearing for the same reason (see bump).

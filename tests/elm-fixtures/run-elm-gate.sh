@@ -288,6 +288,104 @@ run statunit    main   "$(read_expected statunit)"
 # re-renders the box at the new dims; Enter quits via the S3 quit latch.
 pty lgdemo      main   lgdemo.script
 
+# --- S0 (M-FOUNDATION): Tea v2 — Key+Mouse+own-message loop ---
+# tea2unit: FUser wrap (init's Io.sleep 50 -> Tick delivered through Tea's
+# Cmd.map FUser + delegated to the app) + tick re-arm (each Tick re-arms the
+# sleep) + TaskQuit scan (quit after 2 ticks -> hasQuit -> exit chain -> exit 0).
+# pty row: Tea always arms readKey, and a plain elmvm run's EOF stdin would exit
+# via KeyEof before the first tick deadline is flushed.
+pty tea2unit    main   tea2unit.script
+
+# --- S1 (M-WIDGETS): bubbles key bindings + Str.contains/cut ---
+# kbunit: keyName over EVERY Runtime.Key ctor (Go key.String() parity), the
+# matches matrix (first/later binding, space, ctrl+c, misses, empty list),
+# disabled/setEnabled/unbind semantics, accessors, Str.contains substring
+# matrix, Str.cut cell windows (escapes verbatim before/after/inside, wide
+# rune straddle, end<=start).
+run kbunit      main   "$(read_expected kbunit)"
+
+# --- S2 (M-WIDGETS): the pure bubbles widgets — help, paginator, progress ---
+# helpunit: short help renders (default dark styles, disabled filtering,
+# item-granular width truncation incl. the strict-< ellipsis-tail rule and
+# the overflow-without-tail case), full help columns (JoinHorizontal Top,
+# disabled columns/members, ellipsis column), view dispatch.
+run helpunit    main   "$(read_expected helpunit)"
+# pagunit: ceil SetTotalPages, GetSliceBounds/ItemsOnPage (incl. Go's
+# negative count past the end), page clamps, key navigation (next before
+# prev, disabled bindings, misses), arabic "%d/%d" (format field FIXED — no
+# printf), default + pre-styled dots.
+run pagunit     main   "$(read_expected pagunit)"
+# progunit: integer permille ViewAs — byte-exact bars (SGR pair per
+# segment, zero-width repeats still emit the pair), truncating fw/pct
+# arithmetic, clamps, percentage reserving bar cells, 256-color fills,
+# custom fill chars.
+run progunit    main   "$(read_expected progunit)"
+
+# --- S3 (M-WIDGETS): the spinner — the FIRST Cmd-producing widget ---
+# spinunit: fpsMs floors of Go's time.Second/N, byte-exact frames of all six
+# presets (Dot's trailing spaces + MiniDot braille are Go parity), the
+# update-fold advance + wrap (line 4-tick, Dot 8-tick), the "(error)" guard,
+# one styled render (fg SGR pair through Lipgloss).
+run spinunit    main   "$(read_expected spinunit)"
+# spinnerdemo: the tick re-arm under a real pty — init arms Io.sleep 100, and
+# every delivered Tick returns the NEXT tick command (Tea's FUser branch
+# re-arms nothing; the app's command IS the re-arm).  Needles span frame
+# boundaries (prev tail \r\n -> \e[1A\e[2K<next>) so tick timing is never
+# asserted (R4); 'q' exercises the TaskQuit scan with a tick still pending.
+pty spinnerdemo main   spinnerdemo.script
+
+# --- S4 (M-WIDGETS): the viewport — the first COMPLEX interactive widget ---
+# vpunit: byte-exact PLAIN renders at a fixed size (vertical scroll states via
+# `update` key folds + the scroll/mouse ops), x-scroll through the Str.cut
+# window, the frame arithmetic (maxYOffset/maxXOffset), init defaults, and a
+# rounded-border + padding render byte-pinned by eye against the gate-proven
+# Lipgloss border.
+run vpunit      main   "$(read_expected vpunit)"
+# vpdemo: the viewport under a real pty — j/k line scroll, pgdn page (clamped
+# to maxYOffset), a live `resize 40 12`, and the SGR wheel-up packet scrolling
+# by the 3-line delta (Click mode still decodes wheel); q quits.
+pty vpdemo      main   vpdemo.script
+
+# --- S5 (M-WIDGETS): the textarea — the multi-line editor ---
+# taunit: byte-exact PLAIN renders at a fixed size (reverse-video cursor cell
+# on the current char + at EOL, prompt prefix on every row, focus gate,
+# vertical reposition when the cursor is below the fold), cursor/content
+# states driven through `update` key folds (left/right/home/end/up/down/pgup/
+# pgdn, backspace incl. the col-0 merge-line-above, delete incl. EOL
+# merge-below, enter split, ctrl+k/ctrl+u/ctrl+w), and `==` flags pinning the
+# grid arithmetic (value join, row/col, word-delete byte offsets).
+run taunit      main   "$(read_expected taunit)"
+# textareademo: type/arrows/home/end/delete/enter-split/backspace-at-col0/
+# up/down under a real pty (unique header needles); q quits.
+pty textareademo main  textareademo.script
+
+# --- S6 (M-WIDGETS): the list — the filterable, paginated list ---
+# listunit: the page-flip cursor logic (R6) — 12 items at 40x19 -> perPage 4
+# (availHeight = 19 - 7 chrome rows = 12, /3), 3 pages, crossing the page
+# boundary in BOTH directions (j 0->3->page2, k back to the previous page's
+# last index); goToEnd/goToStart; the filter lifecycle ("/"->Filtering,
+# "es"->6 visible, esc->Unfiltered, "/"+"es"+enter->FilterApplied, "zzz"->
+# Nothing-matched); byte-exact views (title/status/body/dots/help joined
+# vertically, selected item's left border, dimmed filtering, the "“es” N
+# items • M filtered" applied status).
+run listunit    main   "$(read_expected listunit)"
+# listdemo: the list under a real pty — j crosses the page boundary (3->4),
+# "/"+"es" filters 12->6, esc clears, "/"+"es"+enter applies; q quits.
+pty listdemo    main   listdemo.script
+
+# --- S7 (M-WIDGETS): the table — the data table ---
+# tableunit: the R7 scroll parity (10 rows / 5-high viewport / j / G / g):
+# j walks the cursor to the bottom visible row then scrolls, G jumps to the
+# last row (top = rows-height), g back to the top; the byte-exact views pin
+# the bold header cells (title truncated with a "…" tail INSIDE the width
+# budget), the right-padded cells, the selected row wrapped in bold + fg 212
+# (ColorAnsi256), and the viewport padding each row to the table width.
+run tableunit    main   "$(read_expected tableunit)"
+# tabledemo: the table under a real pty — j/k move the selection (the cursor
+# crossing the 5-high fold scrolls the viewport), G jumps to the bottom; q
+# quits.
+pty tabledemo    main   tabledemo.script
+
 # --- S7: typechecker extensible-record surface (scoped labels) ---
 run rowpoly     main   "$(read_expected rowpoly)"
 run extrec      main   "$(read_expected extrec)"

@@ -1,5 +1,5 @@
 module Tea exposing
-  ( Event
+  ( Config
   , program
   , quit
   , paint
@@ -10,21 +10,34 @@ module Tea exposing
 -- this is fx-ui's terminal-UI runtime module, written in the subset the
 -- checker accepts.
 --
+-- v2 (widgets-port S0): the app now receives Key AND Mouse events AND its own
+-- messages (spinner ticks, etc.).  `Config msg model` names the app contract;
+-- the app's `update` takes ITS OWN `msg`, produced by `onKey`/`onMouse` from a
+-- decoded input or by the app's own commands.  The internal `FrameMsg` ADT
+-- carries every host delivery (keys, mouse, resize, the user's own cmds mapped
+-- back through `FUser`, quit, and side-effect ignores); `outerUpdate`
+-- translates each into the app's message space and re-wraps the app's commands
+-- with `Cmd.map FUser`.
+--
 -- Subset/architecture deviations from real bubbletea, all forced by the M9
 -- cmd-driven loop and the checker surface:
---   * the input subscription is a SELF-RE-ARMING TaskReadKey command (the M9
---     loop delivers task results as the only messages; there are no Subs) —
---     every handled key re-arms `Io.readKey`, but quit and KeyEof do NOT:
---     KeyEof (stdin EOF) takes the exit path directly and is never delivered
---     as a normal key (a re-arm after it would spin — the host completes
---     every re-armed readKey with KeyEof instantly once stdin hits EOF);
+--   * the input subscriptions are SELF-RE-ARMING TaskReadKey/TaskReadMouse
+--     commands (the M9 loop delivers task results as the only messages; there
+--     are no Subs) — every handled key re-arms `Io.readKey`, every handled
+--     mouse event re-arms `Io.readMouse`, but quit and KeyEof/MouseEof do NOT:
+--     KeyEof/MouseEof (stdin EOF) take the exit path directly and are never
+--     delivered as normal input (a re-arm after them would spin — the host
+--     completes every re-armed read with the EOF marker instantly once stdin
+--     hits EOF);
 --   * `view` returns List String (one string per terminal row) instead of a
 --     full-screen view type (no String.split/`++` in the Prelude);
---   * quitting = appending `quit` (a [TaskSucceed EvQuit] command) to the
---     command update returns; outerUpdate scans for it SYNCHRONOUSLY so the
---     readKey re-arm is dropped on the quit key itself and the host's eval
---     set drains to zero (a delivery-time quit would leave a suspended
---     readKey and the program would hang waiting for one more key);
+--   * quitting = appending `quit` (a [TaskQuit] command) to the command the
+--     update returns; the payload-less Runtime.TaskQuit ctor is polymorphic in
+--     BOTH Task params (Nothing : Maybe a class), so it inhabits any Cmd msg;
+--     outerUpdate scans for it SYNCHRONOUSLY (ctor match, no equality) so the
+--     readKey/readMouse re-arm is dropped on the quit event and the host's
+--     eval set drains to zero (a delivery-time quit would leave a suspended
+--     read and the program would hang waiting for one more event);
 --   * the tea model is a plain record {mod, prev, rows, cols} — `mod` is the
 --     user's model, `prev` the last painted frame (cursor rests one line
 --     BELOW its last line), rows/cols the last resize dims;
@@ -32,66 +45,119 @@ module Tea exposing
 --     (PTY-deterministic single-write frames).
 
 
-{-| The messages `outerUpdate` handles.  `EvKey` carries a decoded terminal
-key (a Runtime.Key, host-decoded); `EvResize` the cols/rows probe answered at
-startup (the first paint piggybacks on it); `EvQuit` the quit marker, only
-delivered if a `quit` task ever escapes to the host; `EvIgnored` the delivery
-of side-effect chains (frame writes, raw-mode flips).
+{-| The app contract.  `init`/`update`/`view`/`resize` are the same shape as
+v1, but `update` now takes the APP'S OWN message type (produced by `onKey`/
+`onMouse` from a decoded input, or by the app's own commands) and returns
+`Cmd msg` of that same type.  `mouse` picks the terminal tracking mode —
+`MouseModeOff` arms no readMouse at all.
 -}
-type Event
-  = EvKey Runtime.Key
-  | EvResize Int Int
-  | EvQuit
-  | EvIgnored
+type alias Config msg model =
+  { init : () -> ( model, Runtime.Cmd msg )
+  , update : msg -> model -> ( model, Runtime.Cmd msg )
+  , view : model -> List String
+  , resize : Int -> Int -> model -> model
+  , onKey : Runtime.Key -> msg
+  , onMouse : Runtime.MouseMsg -> msg
+  , mouse : Runtime.MouseMode
+  }
 
 
-{-| Turn a user config `{init, update, view, resize}` into a host Program.  init
-batches the user's initial command with a RAW-MODE-FIRST chain: raw mode must
-be ON before the winsize probe / first readKey (the first frame's \r\n is
-mangled by the tty's ONLCR otherwise — the host runs batched tasks out of
-spawn order, so ordering here is a chain, not a batch).
+-- The tea-internal model: the user's `mod` plus the painter's cursor state.
+type alias TeaModel model =
+  { mod : model
+  , prev : List String
+  , rows : Int
+  , cols : Int
+  }
 
-`resize cols rows model` folds EVERY EvResize delivery into the user model
-before the repaint — the startup winsize probe AND every live SIGWINCH
-(after each delivery the EvResize branch re-arms `Io.waitResize` first in its
-batch, before the frame write, so the signalfd is armed before a peer-issued
-resize can ever be observed — resizeunit's GotProbe ordering discipline).
+
+{-| The messages `outerUpdate` handles.  `FKey`/`FMouse` carry a decoded
+terminal input (translated through the app's onKey/onMouse); `FResize` the
+cols/rows probe answered at startup and every live SIGWINCH; `FUser` the app's
+own command deliveries (sleep ticks, etc.); `FQuit` a quit marker that escaped
+the synchronous scan (defensive — the scan normally catches it first);
+`FIgnored` the delivery of side-effect chains (frame writes, raw-mode flips,
+mouse-mode flips).
+-}
+type FrameMsg msg
+  = FKey Runtime.Key
+  | FMouse Runtime.MouseMsg
+  | FResize Int Int
+  | FUser msg
+  | FQuit
+  | FIgnored
+
+
+{-| Turn a user config `Config msg model` into a host Program.  init batches
+the user's initial command (mapped into FUser space) with a RAW-MODE-FIRST
+chain per input leaf: raw mode must be ON before the winsize probe / first
+readKey / first readMouse (the first frame's \r\n is mangled by the tty's ONLCR
+otherwise — the host runs batched tasks out of spawn order, so ordering here is
+a chain, not a batch).
+
+The mouse arm (mouseMode + readMouse) is included ONLY when `config.mouse` is
+not MouseModeOff — a readMouse armed with tracking off would sit on fd0 and
+never complete.  Each is chained after rawMode like the key arm.
 -}
 program config =
   let
     ( m0, c0 ) =
       config.init ()
+
+    armed =
+      case config.mouse of
+        MouseModeOff ->
+          False
+
+        _ ->
+          True
   in
   Platform.program
     { init =
         \_ ->
           ( { mod = m0, prev = [], rows = 0, cols = 0 }
           , Cmd.batch
-              [ c0
-              , Task.perform resizeToEvent
-                  (Task.andThen (\_ -> Io.winSize) (Io.rawMode True))
-              , Task.perform EvKey
-                  (Task.andThen (\_ -> Io.readKey) (Io.rawMode True))
-              ]
+              (List.append
+                [ Cmd.map FUser c0
+                , Task.perform resizeToFrame
+                    (Task.andThen (\_ -> Io.winSize) (Io.rawMode True))
+                , Task.perform FKey
+                    (Task.andThen (\_ -> Io.readKey) (Io.rawMode True))
+                ]
+                (if armed then
+                  [ Task.perform (\_ -> FIgnored)
+                      (Task.andThen (\_ -> Io.mouseMode config.mouse) (Io.rawMode True))
+                  , Task.perform FMouse
+                      (Task.andThen (\_ -> Io.readMouse) (Io.rawMode True))
+                  ]
+
+                else
+                  []
+                )
+              )
           )
     , update = outerUpdate config
     , subscriptions = \_ -> Sub.none
     }
 
 
-resizeToEvent size =
-  EvResize (Tuple.first size) (Tuple.second size)
+resizeToFrame size =
+  FResize (Tuple.first size) (Tuple.second size)
 
 
 {-| Append to the command your update returns to quit: outerUpdate sees the
 marker synchronously, skips the repaint/re-arm, and runs the exit path.
 -}
+quit : Runtime.Cmd msg
 quit =
-  [ TaskSucceed EvQuit ]
+  [ TaskQuit ]
 
 
 -- The synchronous quit scan (see module header): True iff the command list
--- carries the quit marker task.
+-- carries a TaskQuit.  A ctor match, not `==` (TaskQuit is a foreign ADT ctor
+-- and `==` is comparable-only), and it runs on the synchronous command list so
+-- the quit event itself drops the readKey/readMouse re-arm.
+hasQuit : Runtime.Cmd msg -> Bool
 hasQuit cmd =
   case cmd of
     [] ->
@@ -99,7 +165,7 @@ hasQuit cmd =
 
     task :: rest ->
       case task of
-        TaskSucceed EvQuit ->
+        TaskQuit ->
           True
 
         _ ->
@@ -112,15 +178,16 @@ hasQuit cmd =
 -- breaks even with a re-armed readKey/mouse/resize eval still suspended, so a
 -- delivery-time quit can no longer hang waiting on one more event).
 exit =
-  Task.perform (\_ -> EvIgnored)
+  Task.perform (\_ -> FIgnored)
     (Task.andThen (\_ -> Io.quit)
       (Task.andThen (\_ -> Io.rawMode False) (Io.writeString showCursor))
     )
 
 
+outerUpdate : Config msg model -> FrameMsg msg -> TeaModel model -> ( TeaModel model, Runtime.Cmd (FrameMsg msg) )
 outerUpdate config msg tea =
   case msg of
-    EvKey key ->
+    FKey key ->
       case key of
         -- stdin EOF is never a normal key: delegating + re-arming here would
         -- livelock (deliver -> update -> re-arm -> instant KeyEof), so take
@@ -131,23 +198,25 @@ outerUpdate config msg tea =
         _ ->
           let
             ( m1, c1 ) =
-              config.update key tea.mod
+              config.update (config.onKey key) tea.mod
           in
-          if hasQuit c1 then
-            ( tea, exit )
+          delegate config tea m1 c1 [ Task.perform FKey Io.readKey ]
 
-          else
-            let
-              ( tea1, frame ) =
-                paint tea m1 (config.view m1)
-            in
-            ( tea1
-            , Cmd.batch
-                [ c1
-                , repaint frame
-                , Task.perform EvKey Io.readKey
-                ]
-            )
+    FMouse mm ->
+      case mm of
+        -- stdin EOF, same as KeyEof: exit directly, never re-arm.
+        MouseEof ->
+          ( tea, exit )
+
+        _ ->
+          let
+            ( m1, c1 ) =
+              config.update (config.onMouse mm) tea.mod
+          in
+          -- Re-arm readMouse FIRST in the batch (waitResize discipline): the
+          -- readMouse eval must be armed before the frame write, so a second
+          -- wheel event that races the repaint is not missed.
+          delegate config tea m1 c1 [ Task.perform FMouse Io.readMouse ]
 
     -- The initial dims probe and every live SIGWINCH (the re-armed
     -- Io.waitResize below): the user's `resize` hook folds the dims into the
@@ -160,7 +229,7 @@ outerUpdate config msg tea =
     -- before.  The waitResize re-arm is FIRST in the batch: leafWaitResize
     -- blocks SIGWINCH + arms the signalfd before the frame write can become
     -- visible to the peer, so a `resize` directive can never race the arming.
-    EvResize cols rows ->
+    FResize cols rows ->
       let
         m1 =
           config.resize cols rows tea.mod
@@ -173,19 +242,49 @@ outerUpdate config msg tea =
       in
       ( tea1
       , Cmd.batch
-          [ Task.perform resizeToEvent Io.waitResize
+          [ Task.perform resizeToFrame Io.waitResize
           , repaint frame
           ]
       )
 
+    -- The app's own command deliveries (sleep ticks, etc.): full delegation
+    -- twin of FKey, but NO input re-arm — the command that produced this
+    -- delivery self-re-arms via the commands it returns.
+    FUser u ->
+      let
+        ( m1, c1 ) =
+          config.update u tea.mod
+      in
+      delegate config tea m1 c1 []
+
     -- Quit marker delivered (only possible when the scan above missed):
     -- run the exit path, no re-arm.
-    EvQuit ->
+    FQuit ->
       ( tea, exit )
 
-    -- Frame writes, raw-mode flips: nothing to do.
-    _ ->
+    -- Frame writes, raw-mode flips, mouse-mode flips: nothing to do.
+    FIgnored ->
       ( tea, Cmd.none )
+
+
+-- Every delegating branch (FKey/FMouse/FUser) shares this shape: run the user
+-- update, scan for quit, repaint, re-map the user command, then re-arm the
+-- inputs THAT BRANCH owns (`rearm` — FKey readKey, FMouse readMouse, FUser
+-- nothing; re-arm FIRST in the batch, waitResize discipline).
+delegate : Config msg model -> TeaModel model -> model -> Runtime.Cmd msg -> List (Runtime.Cmd (FrameMsg msg)) -> ( TeaModel model, Runtime.Cmd (FrameMsg msg) )
+delegate config tea m1 c1 rearm =
+  if hasQuit c1 then
+    ( tea, exit )
+
+  else
+    let
+      ( tea1, frame ) =
+        paint tea m1 (config.view m1)
+    in
+    ( tea1
+    , Cmd.batch
+        (List.append rearm [ Cmd.map FUser c1, repaint frame ])
+    )
 
 
 -- ---- renderer ----
@@ -223,7 +322,7 @@ paint tea m frame =
 -- Wrap a frame string into a perform-wrapped write: the delivery lands on
 -- the ignored branch of outerUpdate.
 repaint frame =
-  Task.perform (\_ -> EvIgnored) (Io.writeString frame)
+  Task.perform (\_ -> FIgnored) (Io.writeString frame)
 
 
 frameString frame =

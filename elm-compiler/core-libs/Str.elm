@@ -7,8 +7,10 @@ module Str exposing
     , replace
     , width
     , truncate
+    , contains
     , startsWith
     , endsWith
+    , cut
     , trim
     , countChar
     , fromFloat
@@ -387,6 +389,59 @@ truncGo s i budget acc sgr =
         truncGo s (i + 1 + need) (budget - runeWidth (decodeRune s i c)) (String.append acc (String.sliceLen i (1 + need) s)) sgr
 
 
+{-| Cell window [start, end) of s (x/ansi.Cut parity): escape sequences are
+copied verbatim wherever they occur (they are zero-width, before the window,
+inside it and after it), a rune is kept iff its cumulative END cell is
+`> start` and `<= end` — so a wide rune never straddles `end`, but one
+straddling `start` IS kept (the same boundary rules x/ansi applies),
+`end <= start` cuts everything.  The viewport's horizontal scroll and the
+textarea's line slicing both render through this.
+
+Documented deviation: x/ansi re-emits carried SGR state at the cut edges;
+we do not — SGR state does not carry across a cut here.
+-}
+cut : Int -> Int -> String -> String
+cut start end s =
+    if end <= start then
+        ""
+
+    else
+        cutGo s 0 0 start end ""
+
+
+cutGo s i cell start end acc =
+    let
+        c =
+            charCode s i
+    in
+    if c == -1 then
+        acc
+
+    else if c == 27 then
+        let
+            e =
+                skipAnsi s i
+        in
+        cutGo s e cell start end (String.append acc (String.sliceLen i (e - i) s))
+
+    else
+        let
+            need =
+                runeNeed c
+
+            cellEnd =
+                cell + runeWidth (decodeRune s i c)
+
+            piece =
+                String.sliceLen i (1 + need) s
+        in
+        if cellEnd <= end && (start <= 0 || cellEnd > start) then
+            cutGo s (i + 1 + need) cellEnd start end (String.append acc piece)
+
+        else
+            cutGo s (i + 1 + need) cellEnd start end acc
+
+
 -- ====================== affixes / whitespace ======================
 
 
@@ -406,6 +461,28 @@ endsWith suf s =
 
     else
         matchAt suf s off
+
+
+{-| Substring test (Go strings.Contains / elm/core String.contains parity):
+the splitter's byte-naive `matchAt` anchored at every index.  `contains "" s`
+is True (the empty needle matches at index 0).  Matching is byte-naive, the
+same scan strings.Contains does — a valid UTF-8 needle never matches across a
+rune boundary.
+-}
+contains : String -> String -> Bool
+contains needle hay =
+    containsGo needle hay 0
+
+
+containsGo needle hay i =
+    if matchAt needle hay i then
+        True
+
+    else if charCode hay i == -1 then
+        False
+
+    else
+        containsGo needle hay (i + 1)
 
 
 {-| Strip ASCII whitespace bytes (space, tab, \n, \r) from both ends. Byte

@@ -1,0 +1,37 @@
+"cur0=0 h0=5 w0=24 foc0=1
+cur1=1 cur4=4 cur5=5
+curG=9 curg=0 gb=9 gt=0
+blur=0 blurKey=0
+pgdn=5 pgup=0 half=2
+setCur=3 setRows=2 nRows=3
+sel0=1,Tokyo,37400068 selG=10,Osaka,19281000
+cols=3 hG=5 wG=24
+help=[38;2;98;98;98m↑/k[0m [38;2;74;74;74mup[0m[38;2;60;60;60m • [0m[38;2;98;98;98m↓/j[0m [38;2;74;74;74mdown[0m
+--- view m0 ---
+[1mRank [0m [1mCity    [0m [1mPopulat…[0m 
+[1;38;5;212m1     Tokyo    37400068 [0m
+2     Delhi    28514000 
+3     Shanghai 25582000 
+4     Sao Pau… 21650000 
+5     Mexico … 21581000 
+--- view m5 ---
+[1mRank [0m [1mCity    [0m [1mPopulat…[0m 
+2     Delhi    28514000 
+3     Shanghai 25582000 
+4     Sao Pau… 21650000 
+5     Mexico … 21581000 
+[1;38;5;212m6     Cairo    20076000 [0m
+--- view mG ---
+[1mRank [0m [1mCity    [0m [1mPopulat…[0m 
+6     Cairo    20076000 
+7     Mumbai   19980000 
+8     Beijing  19618000 
+9     Dhaka    19578000 
+[1;38;5;212m10    Osaka    19281000 [0m
+--- view msr ---
+[1mRank [0m [1mCity    [0m [1mPopulat…[0m 
+1     Tokyo    37400068 
+2     Delhi    28514000 
+[1;38;5;212m3     Shanghai 25582000 [0m
+                        
+                        "

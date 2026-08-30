@@ -1,0 +1,10 @@
+"111111111111111111111111111111111111111111|aaaaa
+bbbbb
+ccccc|fffff
+ggggg
+hhhhh|0123456789|6789abcdef|abcdefghij|╭──────╮
+│      │
+│ one  │
+│ two  │
+│      │
+╰──────╯"

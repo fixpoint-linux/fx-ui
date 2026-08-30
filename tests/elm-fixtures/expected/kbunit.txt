@@ -1,0 +1,1 @@
+"1111111111111111111111111111111111110111111111111111111|a,space,enter,tab,backspace,esc,up,down,left,right,home,end,pgup,pgdown,insert,delete,ctrl+c,7,eof|cd|abc|||一二|一"

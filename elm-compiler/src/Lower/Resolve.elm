@@ -271,9 +271,12 @@ platformTable =
     , ( "Drag", "Runtime.Drag" )
     , ( "AllMotion", "Runtime.AllMotion" )
 
-    -- Tea's quit marker rides a bare TaskSucceed so core-libs Tea.elm can
-    -- scan the user's command for it synchronously (quit key => drop the
-    -- readKey re-arm).  Same bare-name/foreign-ctor mechanism as the Key rows.
+    -- Tea's quit marker rides a bare TaskQuit (S0/Tea v2) so core-libs
+    -- Tea.elm can scan the user's command for it synchronously (quit key =>
+    -- drop the readKey/readMouse re-arm).  The payload-less Runtime.TaskQuit
+    -- ctor is polymorphic in BOTH Task params, so it inhabits any Cmd msg.
+    -- Same bare-name/foreign-ctor mechanism as the Key rows.
+    , ( "TaskQuit", "Runtime.TaskQuit" )
     , ( "TaskSucceed", "Runtime.TaskSucceed" )
     ]
 

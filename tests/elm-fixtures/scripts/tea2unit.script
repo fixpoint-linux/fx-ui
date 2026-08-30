@@ -1,0 +1,16 @@
+# tea2unit: Tea v2 FUser wrap + tick re-arm + TaskQuit scan under a pty.
+#
+# Frame trace (each repaint is ONE write; first paint hides the cursor):
+#   resize probe (sync, first)  \e[?25l \e[2Ktick=0\r\n
+#   tick 1 (sleep 50 -> FUser)  \e[1A\e[2Ktick=1\r\n
+#   tick 2 (re-armed sleep)     \e[1A\e[2Ktick=2\r\n
+#   tick 3 -> quit              \e[?25h + exit 0   (no repaint: hasQuit scan)
+# The tick count is DETERMINISTIC (each Tick re-arms exactly one sleep and the
+# app quits on the third), so the needles assert the exact frames — unlike the
+# spinner animation this is not an unbounded frame stream.
+expect \e[?25l
+expect tick=0
+expect tick=1
+expect tick=2
+expect \e[?25h
+expect_exit 0

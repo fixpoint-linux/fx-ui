@@ -1,0 +1,32 @@
+# listdemo: the ListBox widget driving Tea v2 under a real pty (S6).
+#
+# The demo renders a live "i=<idx> st=<st> v=<fv>" header above the 40x19
+# list (12 items, perPage 4, 3 pages), so every cursor/filter state has a
+# UNIQUE needle.  Coverage: j moves the cursor down, crossing the page
+# boundary at index 3 -> 4 (the R6 page-flip); "/" enters filtering (filter
+# line + dimmed items); typing "es" shrinks 12 -> 6 items (case-sensitive
+# substring over title OR description); esc cancels the filter; "/" + "es" +
+# enter applies it (FilterApplied, "“es” 6 items • 6 filtered").  q quits via
+# the TaskQuit scan (show cursor + exit 0).
+#
+# Escapes: \e[?25l hide cursor, \e[?25h show cursor, \x1b esc, \r enter.
+expect \e[?25l\e[2Ki=0 st=unf v=
+send j
+expect i=1 st=unf v=
+send jjj
+expect i=4 st=unf v=
+send /
+expect i=0 st=flt v=
+send es
+expect st=flt v=es
+send \x1b
+expect st=unf v=
+send /
+expect i=0 st=flt v=
+send es
+expect st=flt v=es
+send \r
+expect st=app v=es
+send q
+expect \e[?25h
+expect_exit 0

@@ -1,0 +1,57 @@
+# textareademo: the Textarea widget driving Tea v2 under a real pty (S5).
+#
+# The demo renders a live "v=<value> r=<row> c=<col>" header (newlines shown
+# as '/') above the textarea, so every cursor/content state has a UNIQUE
+# needle.  The textarea is fixed 40x8 and focused; the reverse-video cursor
+# (\e[7m) sits inside it but all needles live in the plain header.
+#
+# Coverage: type (hello/!/ab/xyz/Q/Z), left+right arrows, home/end, delete
+# (forward), enter (split onto a new row), backspace AT col 0 of a lower row
+# (mergeLineAbove — the cursor lands at the end of the UPPER line, i.e. col 5
+# of the 7-byte "helo!ab", a position we then observe with end/enter), and
+# up/down (col clamped to the target line, proven by an insert into the row
+# the arrow actually reached).  q quits via the TaskQuit scan (show cursor +
+# exit 0).
+#
+# Escapes: \e[D left, \e[C right, \e[A up, \e[B down, \e[H home, \e[F end,
+# \e[3~ delete, \x7f backspace, \r enter.
+expect \e[?25l\e[2Kv= r=0 c=0
+send hello
+expect v=hello r=0 c=5
+send \e[D\e[D
+expect v=hello r=0 c=3
+send \e[3~
+expect v=helo r=0 c=3
+send \e[H
+expect v=helo r=0 c=0
+send \e[C
+expect v=helo r=0 c=1
+send \e[F
+expect v=helo r=0 c=4
+send !
+expect v=helo! r=0 c=5
+send \r
+expect v=helo!/ r=1 c=0
+send ab
+expect v=helo!/ab r=1 c=2
+send \e[H
+expect v=helo!/ab r=1 c=0
+send \x7f
+expect v=helo!ab r=0 c=5
+send \e[F
+expect v=helo!ab r=0 c=7
+send \r
+expect v=helo!ab/ r=1 c=0
+send xyz
+expect v=helo!ab/xyz r=1 c=3
+send \e[A
+expect v=helo!ab/xyz r=0 c=3
+send Q
+expect v=helQo!ab/xyz r=0 c=4
+send \e[B
+expect v=helQo!ab/xyz r=1 c=3
+send Z
+expect v=helQo!ab/xyzZ r=1 c=4
+send q
+expect \e[?25h
+expect_exit 0

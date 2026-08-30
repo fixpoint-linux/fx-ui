@@ -1,0 +1,34 @@
+# tabledemo: the Table widget driving Tea v2 under a real pty (S7).
+#
+# The demo renders a live "cur=<cursor>" header above the 24-wide table
+# (Rank/City/Population columns, 10 rows, 5-high viewport), so every cursor
+# state has a UNIQUE needle.  Coverage: the first paint proves the bold
+# header row (Rank + City + "Population" truncated to "Populat…" INSIDE the
+# width) and the bold+fg212 selected data row (ColorAnsi256 212); j walks the
+# cursor down to the bottom visible row (the cursor crossing the 5-high fold
+# at cursor 5 scrolls the viewport); G jumps to the last row (top =
+# rows-height); k walks back up (scrolls when the cursor crosses back above
+# the fold).  q quits via the TaskQuit scan (show cursor + exit 0).
+#
+# Escapes: \e[?25l hide cursor, \e[?25h show cursor, \r carriage return.
+expect \e[?25l\e[2Kcur=0\r\n\e[2K\e[1mRank \e[0m \e[1mCity    \e[0m \e[1mPopulat
+expect \e[1;38;5;212m1     Tokyo
+send j
+expect cur=1
+send j
+expect cur=2
+send j
+expect cur=3
+send j
+expect cur=4
+send j
+expect cur=5
+send G
+expect cur=9
+send k
+expect cur=8
+send k
+expect cur=7
+send q
+expect \e[?25h
+expect_exit 0
