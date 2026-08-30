@@ -1,5 +1,6 @@
 module Lower.Resolve exposing
     ( aliasTableFor
+    , checkImportShadowing
     , exportedNames
     , preludeModuleName
     , preludeTable
@@ -399,6 +400,47 @@ exposeAlias mkQualified (Node _ item) =
             -- along implicitly under the SAME spelling Elm uses for nullary
             -- tags (minimal semantics: unknown names still error naturally).
             [ ( name, mkQualified name ) ]
+
+
+-- The import-shadowing footgun, made loud: a top-level definition whose name
+-- ALSO appears as a bare name in some explicit `exposing` list.  Self alias
+-- rows carry only the module's EXPOSED names, so a same-named def that the
+-- module does not itself export is silently hidden by the import row — every
+-- bare use then resolves to the IMPORTED function (the widget-demo crash that
+-- looked like a host segfault).  Real Elm rejects the clash at compile time;
+-- so do we.  Uses importAliases (explicit exposing rows ONLY) — never
+-- preludeTable, which core-libs are MEANT to shadow.
+checkImportShadowing : List String -> List (Node Import.Import) -> Result String ()
+checkImportShadowing defined imports =
+    let
+        bareNames =
+            List.concatMap
+                (\((Node _ imp) as node) ->
+                    List.map (\( bare, _ ) -> ( bare, String.join "." (Node.value imp.moduleName) ))
+                        (importAlias node)
+                )
+                imports
+
+        findClash names =
+            case names of
+                [] ->
+                    Ok ()
+
+                name :: rest ->
+                    case List.filter (\( bare, _ ) -> bare == name) bareNames of
+                        ( _, fromModule ) :: _ ->
+                            Err
+                                ("the name `"
+                                    ++ name
+                                    ++ "` is both a top-level definition and imported via `exposing` from "
+                                    ++ fromModule
+                                    ++ "; remove it from the import's exposing list (real Elm rejects this)"
+                                )
+
+                        [] ->
+                            findClash rest
+    in
+    findClash defined
 
 
 -- The exported-name list of a module, honoring its exposing clause:

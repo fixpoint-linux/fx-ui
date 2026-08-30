@@ -25,6 +25,7 @@ import Type.Representation as Rep
 import Type.Unify as Uni
 import Zinc.Csexp as Csexp
 import Zinc.Emit as Emit
+import Lower.Resolve as Resolve
 import Lower.Scope as Scope
 
 
@@ -549,6 +550,23 @@ checks =
                 True
 
             Ok _ ->
+                False
+        )
+    , check "import shadowing rejected (bare exposing row vs local def)"
+        (case Elm.Parser.parseToFile "module A exposing (main)\nimport B exposing (update)\n\nupdate = 1\n\nmain = 0\n" of
+            Ok file ->
+                Resolve.checkImportShadowing [ "update", "main" ] file.imports
+                    == Err "the name `update` is both a top-level definition and imported via `exposing` from B; remove it from the import's exposing list (real Elm rejects this)"
+
+            Err _ ->
+                False
+        )
+    , check "import shadowing allows clean explicit imports"
+        (case Elm.Parser.parseToFile "module A exposing (main)\nimport B exposing (update)\n\nhelper = 2\n\nmain = 0\n" of
+            Ok file ->
+                Resolve.checkImportShadowing [ "helper", "main" ] file.imports == Ok ()
+
+            Err _ ->
                 False
         )
     , check "infer let-generalizes (id used at Bool and String)"

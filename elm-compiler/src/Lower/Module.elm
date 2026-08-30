@@ -279,13 +279,21 @@ collectUnit file =
         |> Result.andThen
             (\funs ->
                 collectCtors file.declarations
-                    |> Result.map
+                    |> Result.andThen
                         (\ctors ->
-                            { moduleName = modName
-                            , funs = funs
-                            , ctors = ctors
-                            , file = file
-                            }
+                            -- Loud compile error for the import-shadowing
+                            -- footgun, BEFORE typechecking/lowering.
+                            Resolve.checkImportShadowing
+                                (List.map Tuple.first funs ++ List.map Tuple.first ctors)
+                                file.imports
+                                |> Result.map
+                                    (\() ->
+                                        { moduleName = modName
+                                        , funs = funs
+                                        , ctors = ctors
+                                        , file = file
+                                        }
+                                    )
                         )
             )
 
