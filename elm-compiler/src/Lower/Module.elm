@@ -1,5 +1,6 @@
 module Lower.Module exposing
     ( compileSources
+    , compileBatch
     )
 
 -- M1b/M1c/M2/M3 module lowering: turn PARSED Elm source(s) into a ZINC-csexp
@@ -100,6 +101,7 @@ import Lower.Pattern as Pat
 import Lower.Resolve as Resolve
 import Lower.Scope as Scope
 import Type.Check as Check
+import Type.Env as Env exposing (Env)
 import Zinc.Csexp as Csexp
 import Zinc.Emit as Emit exposing (Instr(..))
 
@@ -141,6 +143,98 @@ compileSources sources =
                                     )
                         )
             )
+
+
+-- ======================= BATCH COMPILATION =======================
+-- compileBatch : the corpus (Prelude + Runtime + 7 core-libs) is parsed,
+-- typechecked, and LOWERED ONCE; every fixture group then only pays for its
+-- own parse/typecheck/lower against the cached corpus environment + entries.
+--
+-- The corpus bundle is BYTE-IDENTICAL to the single-compile output because
+-- each corpus unit's lowering depends only on the corpus globals' MEMBERSHIP
+-- and ARITIES (see Lower.Expr.globalRefByKey), and both are unchanged by any
+-- user group (corpus modules reference only corpus/Prelude names; user module
+-- names are distinct, so no key/arity can be shadowed).  The 74-fixture gate
+-- (byte-identical bundles) is the empirical check of this invariant.
+--
+-- Return shape: `Err msg` ONLY for a corpus-level failure (parse/typecheck/
+-- lower of the corpus itself) — Main maps that to an `err` entry for every
+-- group.  On corpus success the list has one entry PER GROUP: the full bundle
+-- text, or "err <msg>" if that group alone failed to parse/typecheck/lower.
+
+
+compileBatch : List String -> List (List String) -> Result String (List String)
+compileBatch corpusSources groups =
+    parseAll corpusSources
+        |> Result.andThen
+            (\corpusFiles ->
+                collectAll corpusFiles
+                    |> Result.andThen
+                        (\_ ->
+                            Check.checkBuiltins corpusFiles
+                                |> Result.andThen
+                                    (\{ env, files } ->
+                                        collectAll files
+                                            |> Result.andThen
+                                                (\corpusUnits ->
+                                                    case mergedGlobals corpusUnits of
+                                                        Err msg ->
+                                                            Err msg
+
+                                                        Ok corpusGlobals ->
+                                                            case sequenceMaps (List.map (compileUnit corpusGlobals) corpusUnits) of
+                                                                Err msg ->
+                                                                    Err msg
+
+                                                                Ok corpusEntryLists ->
+                                                                    let
+                                                                        corpusEntries =
+                                                                            List.concat corpusEntryLists
+                                                                    in
+                                                                    Ok (List.map (compileOneGroup env corpusUnits corpusEntries) groups)
+                                                )
+                                    )
+                        )
+            )
+
+
+-- One fixture group: parse+collect the group, check it against the cached
+-- builtin env, then lower the (rewritten) group units against the COMBINED
+-- globals (corpus ++ group) so group modules resolve each other AND the
+-- corpus.  Bundle = corpusEntries ++ groupEntries wrapped ONCE (byte-identical
+-- to lowering corpus+group together in one compileSources call).
+compileOneGroup : Env -> List Unit -> List String -> List String -> String
+compileOneGroup env corpusUnits corpusEntries groupSources =
+    case
+        parseAll groupSources
+            |> Result.andThen
+                (\groupFiles ->
+                    collectAll groupFiles
+                        |> Result.andThen
+                            (\groupUnits0 ->
+                                Check.checkUserGroup env (List.map .file groupUnits0)
+                                    |> Result.andThen
+                                        (\checkedGroupFiles ->
+                                            collectAll checkedGroupFiles
+                                                |> Result.andThen
+                                                    (\groupUnits ->
+                                                        case mergedGlobals (corpusUnits ++ groupUnits) of
+                                                            Err msg ->
+                                                                Err msg
+
+                                                            Ok globals ->
+                                                                sequenceMaps (List.map (compileUnit globals) groupUnits)
+                                                                    |> Result.map (Csexp.list << (++) corpusEntries << List.concat)
+                                                    )
+                                        )
+                            )
+                )
+    of
+        Ok bundle ->
+            bundle
+
+        Err msg ->
+            "err " ++ msg
 
 
 parseAll : List String -> Result String (List File.File)

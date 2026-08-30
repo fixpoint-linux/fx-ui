@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
-# run-elm-gate.sh — M1b gate runner.
+# run-elm-gate.sh — M1b gate runner (BATCH mode).
 #
 # For each fixture under tests/elm-fixtures, compiles it with the elm-compiler
 # (node run.js -> .csexp), loads it into the ZINC VM via elmvm, runs the named
 # function with the given args, and diffs the printed value against
 # expected/<name>.txt.
+#
+# Since S8 the compile step is BATCHED: the fixed corpus (Prelude + Runtime +
+# the seven core-libs) is parsed+typechecked+lowered ONCE, and every fixture
+# group is compiled in the SAME node run.js process against the cached corpus.
+# The script declares all fixtures up front (registering each (sources, output)
+# group + its post-compile check), calls run.js ONCE with a batch manifest, then
+# runs the elmvm/diff checks in declaration order — the PASS/FAIL output and
+# counts are byte-identical to the pre-batch runner.
 #
 # Usage:
 #   tests/elm-fixtures/run-elm-gate.sh [elmvm-binary] [elm-compiler-dir] [fixtures-dir]
@@ -36,12 +44,42 @@ if [ ! -f "$CDIR/compiler.js" ]; then
   echo "error: $CDIR/compiler.js missing (run: build.sh)" >&2
   exit 2
 fi
+if ! command -v jq >/dev/null 2>&1; then
+  echo "error: jq required to build the batch manifest" >&2
+  exit 2
+fi
 
 pass=0; fail=0
 
 # Derive a fixture's Elm MODULE NAME by scanning its `module X ...` header.
 module_name() {
   awk '/^module /{print $2; exit}' "$1"
+}
+
+# read_expected <name> -> trims the trailing newline
+read_expected() { cat "$FIX/expected/$1.txt"; }
+
+# ============================ PHASE 1: declare ============================
+# Every fixture call registers (a) its compile GROUP (user source file(s) +
+# output .csexp) and (b) its post-compile CHECK.  Nothing compiles or runs
+# elmvm yet; the checks fire in declaration order after the one batch compile.
+
+ngroup=0; ncheck=0
+declare -a GOUT GSRC
+declare -a CKIND CNAME CFN CEXP CARG CSTDIN CFIX COUT
+
+register_group() {
+  local out="$1"; shift
+  GOUT[$ngroup]="$out"
+  GSRC[$ngroup]="$*"
+  ngroup=$((ngroup+1))
+}
+
+add_check() {
+  CKIND[$ncheck]="$1"; CNAME[$ncheck]="$2"; CFN[$ncheck]="$3"
+  CEXP[$ncheck]="$4"; CARG[$ncheck]="$5"; CSTDIN[$ncheck]="$6"
+  CFIX[$ncheck]="$7"; COUT[$ncheck]="$8"
+  ncheck=$((ncheck+1))
 }
 
 # run <name> <fn> <expected> [args...]
@@ -52,33 +90,8 @@ module_name() {
 # still fall back to the bare name.
 run() {
   local name="$1" fn="$2" exp="$3"; shift 3
-  node "$CDIR/run.js" "$FIX/$name.elm" "$OUT/$name.csexp" 2>/dev/null
-  local rc=$?
-  if [ $rc -ne 0 ]; then
-    echo "FAIL $name: node run.js rc=$rc"; fail=$((fail+1)); return
-  fi
-  if head -c 4 "$OUT/$name.csexp" | grep -q '^err '; then
-    echo "FAIL $name: compile error: $(cat "$OUT/$name.csexp")"; fail=$((fail+1)); return
-  fi
-  local mod qname got
-  mod=$(module_name "$FIX/$name.elm")
-  qname="$mod.$fn"
-  got=$("$ELMVM" "$OUT/$name.csexp" "$qname" "$@" 2>&1)
-  if [ "$got" != "unknown global: $qname" ] && [ "$got" != "unknown name: $qname" ]; then
-    if [ "$got" = "$exp" ]; then
-      echo "PASS $name ($qname $*) -> $got"; pass=$((pass+1))
-    else
-      echo "FAIL $name ($qname $*): exp[$exp] got[$got]"; fail=$((fail+1))
-    fi
-    return
-  fi
-  # fallback to the bare fn name (legacy single-module bundles)
-  got=$("$ELMVM" "$OUT/$name.csexp" "$fn" "$@" 2>&1)
-  if [ "$got" = "$exp" ]; then
-    echo "PASS $name ($fn $*) -> $got"; pass=$((pass+1))
-  else
-    echo "FAIL $name ($fn $*): exp[$exp] got[$got]"; fail=$((fail+1))
-  fi
+  register_group "$OUT/$name.csexp" "$FIX/$name.elm"
+  add_check run "$name" "$fn" "$exp" "$*" "" "$FIX/$name.elm" "$OUT/$name.csexp"
 }
 
 # run2 <name> <auxname> <fn> <expected>: multi-module fixture — compile
@@ -86,22 +99,8 @@ run() {
 # up under "<NameModule>.<fn>" scanned from the MAIN fixture header.
 run2() {
   local name="$1" aux="$2" fn="$3" exp="$4"; shift 4
-  node "$CDIR/run.js" "$FIX/$aux.elm" "$FIX/$name.elm" "$OUT/$name.csexp" 2>/dev/null
-  local rc=$?
-  if [ $rc -ne 0 ]; then
-    echo "FAIL $name: node run.js rc=$rc"; fail=$((fail+1)); return
-  fi
-  if head -c 4 "$OUT/$name.csexp" | grep -q '^err '; then
-    echo "FAIL $name: compile error: $(cat "$OUT/$name.csexp")"; fail=$((fail+1)); return
-  fi
-  local mod got
-  mod=$(module_name "$FIX/$name.elm")
-  got=$("$ELMVM" "$OUT/$name.csexp" "$mod.$fn" "$@" 2>&1)
-  if [ "$got" = "$exp" ]; then
-    echo "PASS $name ($mod.$fn multi) -> $got"; pass=$((pass+1))
-  else
-    echo "FAIL $name ($mod.$fn multi): exp[$exp] got[$got]"; fail=$((fail+1))
-  fi
+  register_group "$OUT/$name.csexp" "$FIX/$aux.elm" "$FIX/$name.elm"
+  add_check run2 "$name" "$fn" "$exp" "" "" "$FIX/$name.elm" "$OUT/$name.csexp"
 }
 
 # run_io <name> <fn> <expected> <stdin-file>
@@ -111,27 +110,9 @@ run2() {
 # read-byte on fd 0) consume stdin.  Still checks the printed FINAL MODEL.
 run_io() {
   local name="$1" fn="$2" exp="$3" stdin="$4"
-  node "$CDIR/run.js" "$FIX/$name.elm" "$OUT/$name.csexp" 2>/dev/null
-  local rc=$?
-  if [ $rc -ne 0 ]; then
-    echo "FAIL $name: node run.js rc=$rc"; fail=$((fail+1)); return
-  fi
-  if head -c 4 "$OUT/$name.csexp" | grep -q '^err '; then
-    echo "FAIL $name: compile error: $(cat "$OUT/$name.csexp")"; fail=$((fail+1)); return
-  fi
-  local mod qname got
-  mod=$(module_name "$FIX/$name.elm")
-  qname="$mod.$fn"
-  got=$("$ELMVM" "$OUT/$name.csexp" "$qname" < "$FIX/input/$stdin" 2>&1)
-  if [ "$got" = "$exp" ]; then
-    echo "PASS $name ($qname < input/$stdin) -> $(echo "$got" | tail -1)"; pass=$((pass+1))
-  else
-    echo "FAIL $name ($qname < input/$stdin): exp[$exp] got[$got]"; fail=$((fail+1))
-  fi
+  register_group "$OUT/$name.csexp" "$FIX/$name.elm"
+  add_check io "$name" "$fn" "$exp" "" "$stdin" "$FIX/$name.elm" "$OUT/$name.csexp"
 }
-
-# read_expected <name> -> trims the trailing newline
-read_expected() { cat "$FIX/expected/$1.txt"; }
 
 # compile_error <name> <expected-substring>: asserts compilation emits
 # "err <message>" and that <message> contains the expected substring.  Used for
@@ -139,17 +120,14 @@ read_expected() { cat "$FIX/expected/$1.txt"; }
 # run through the value gate.
 compile_error() {
   local name="$1" exp="$2"
-  node "$CDIR/run.js" "$FIX/$name.elm" "$OUT/$name.csexp" 2>/dev/null
-  local rc=$?
-  if [ $rc -ne 0 ]; then
-    echo "FAIL $name: node run.js rc=$rc"; fail=$((fail+1)); return
-  fi
-  local out
-  out=$(cat "$OUT/$name.csexp")
-  case "$out" in
-    err*"$exp"*) echo "PASS $name: $out"; pass=$((pass+1));;
-    *) echo "FAIL $name: expected err containing [$exp], got [$out]"; fail=$((fail+1));;
-  esac
+  register_group "$OUT/$name.csexp" "$FIX/$name.elm"
+  add_check err "$name" "" "$exp" "" "" "$FIX/$name.elm" "$OUT/$name.csexp"
+}
+
+# out_cmp <name>: compare the raw file an elmvm run wrote (iofile's hello.out)
+# against its expected bytes.
+out_cmp() {
+  add_check cmp "$1" "" "" "" "" "" ""
 }
 
 run fib        fib        "$(read_expected fib)"        10
@@ -201,9 +179,7 @@ run mxstring  main   "$(read_expected mxstring)"
 # iofile: RdFile round-trip — the final String model is printed (printValue
 # wraps it in quotes) AND the raw file is written to out/hello.out.
 run_io iofile  main   "$(read_expected iofile)" hello.txt
-cmp -s "$FIX/out/hello.out" "$FIX/expected/hello.out.txt" &&
-  { echo "PASS iofile out-file cmp"; pass=$((pass+1)); } ||
-  { echo "FAIL iofile out-file cmp: out/hello.out != expected/hello.out.txt"; fail=$((fail+1)); }
+out_cmp iofile
 # ioecho: readLine echo-until-quit — echoed lines + the final Int count.
 run_io ioecho  main   "$(read_expected ioecho)" echo.txt
 # --- M7: async Kernel (Task monad + effect-manager loop) ---
@@ -255,6 +231,107 @@ compile_error tyerr_ambiguous_append      "ambiguous"
 compile_error tyerr_numstr                "unify number with String"
 compile_error tyerr_arity                 "apply non-function"
 compile_error tyerr_remove_absent         "does not have field"
+
+# ============================ PHASE 2: batch compile ============================
+# Build the manifest {groups:[{sources:[...],output:"..."}]} and run.js ONCE.
+: > "$OUT/groups.jsonl"
+for ((i=0;i<ngroup;i++)); do
+  read -r -a srcs <<< "${GSRC[$i]}"
+  jq -n --arg out "${GOUT[$i]}" \
+        --argjson srcs "$(printf '%s\n' "${srcs[@]}" | jq -R . | jq -s .)" \
+        '{sources: $srcs, output: $out}' >> "$OUT/groups.jsonl"
+done
+jq -s '{groups: .}' "$OUT/groups.jsonl" > "$OUT/manifest.json"
+
+# ELM_GATE_MANIFEST_ONLY=1: stop after building the manifest (debugging / the
+# byte-identical bundle diff) — print its path and leave $OUT in place.
+if [ "${ELM_GATE_MANIFEST_ONLY:-0}" = "1" ]; then
+  echo "$OUT/manifest.json"
+  exit 0
+fi
+
+node "$CDIR/run.js" --batch "$OUT/manifest.json" 2>/dev/null
+if [ $? -ne 0 ]; then
+  echo "FAIL: node run.js --batch failed" >&2
+  rm -rf "$OUT"
+  exit 1
+fi
+
+# ============================ PHASE 3: checks ============================
+dispatch() {
+  local kind="$1" i="$2"
+  local name fn exp args stdin fixfile outfile mod qname got out
+  name="${CNAME[$i]}"; fn="${CFN[$i]}"; exp="${CEXP[$i]}"
+  args="${CARG[$i]}"; stdin="${CSTDIN[$i]}"; fixfile="${CFIX[$i]}"; outfile="${COUT[$i]}"
+  case "$kind" in
+    cmp)
+      if cmp -s "$FIX/out/hello.out" "$FIX/expected/hello.out.txt"; then
+        echo "PASS iofile out-file cmp"; pass=$((pass+1))
+      else
+        echo "FAIL iofile out-file cmp: out/hello.out != expected/hello.out.txt"; fail=$((fail+1))
+      fi
+      ;;
+    err)
+      out=$(cat "$outfile")
+      case "$out" in
+        err*"$exp"*) echo "PASS $name: $out"; pass=$((pass+1));;
+        *) echo "FAIL $name: expected err containing [$exp], got [$out]"; fail=$((fail+1));;
+      esac
+      ;;
+    run2)
+      if head -c 4 "$outfile" | grep -q '^err '; then
+        echo "FAIL $name: compile error: $(cat "$outfile")"; fail=$((fail+1)); return
+      fi
+      mod=$(module_name "$fixfile")
+      got=$("$ELMVM" "$outfile" "$mod.$fn" 2>&1)
+      if [ "$got" = "$exp" ]; then
+        echo "PASS $name ($mod.$fn multi) -> $got"; pass=$((pass+1))
+      else
+        echo "FAIL $name ($mod.$fn multi): exp[$exp] got[$got]"; fail=$((fail+1))
+      fi
+      ;;
+    io)
+      if head -c 4 "$outfile" | grep -q '^err '; then
+        echo "FAIL $name: compile error: $(cat "$outfile")"; fail=$((fail+1)); return
+      fi
+      mod=$(module_name "$fixfile")
+      qname="$mod.$fn"
+      got=$("$ELMVM" "$outfile" "$qname" < "$FIX/input/$stdin" 2>&1)
+      if [ "$got" = "$exp" ]; then
+        echo "PASS $name ($qname < input/$stdin) -> $(echo "$got" | tail -1)"; pass=$((pass+1))
+      else
+        echo "FAIL $name ($qname < input/$stdin): exp[$exp] got[$got]"; fail=$((fail+1))
+      fi
+      ;;
+    run)
+      if head -c 4 "$outfile" | grep -q '^err '; then
+        echo "FAIL $name: compile error: $(cat "$outfile")"; fail=$((fail+1)); return
+      fi
+      mod=$(module_name "$fixfile")
+      qname="$mod.$fn"
+      got=$("$ELMVM" "$outfile" "$qname" $args 2>&1)
+      if [ "$got" != "unknown global: $qname" ] && [ "$got" != "unknown name: $qname" ]; then
+        if [ "$got" = "$exp" ]; then
+          echo "PASS $name ($qname $args) -> $got"; pass=$((pass+1))
+        else
+          echo "FAIL $name ($qname $args): exp[$exp] got[$got]"; fail=$((fail+1))
+        fi
+        return
+      fi
+      # fallback to the bare fn name (legacy single-module bundles)
+      got=$("$ELMVM" "$outfile" "$fn" $args 2>&1)
+      if [ "$got" = "$exp" ]; then
+        echo "PASS $name ($fn $args) -> $got"; pass=$((pass+1))
+      else
+        echo "FAIL $name ($fn $args): exp[$exp] got[$got]"; fail=$((fail+1))
+      fi
+      ;;
+  esac
+}
+
+for ((i=0;i<ncheck;i++)); do
+  dispatch "${CKIND[$i]}" "$i"
+done
 
 rm -rf "$OUT"
 echo "=============================="

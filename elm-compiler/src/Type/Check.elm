@@ -1,4 +1,4 @@
-module Type.Check exposing (checkUnits)
+module Type.Check exposing (checkUnits, checkBuiltins, checkUserGroup)
 
 {-| S6 pipeline orchestration: typecheck every compilation unit in DEPENDENCY
 order and return the checker-REWRITTEN `File`s (the three surgical rewrites
@@ -61,18 +61,62 @@ checkUnits files =
         |> Result.andThen (\ordered -> checkInOrder env0 ordered [])
 
 
+{-| Check ONLY the builtin corpus (the nine canonical modules): build the
+environment up front from their signatures, check them in canonical order, and
+return BOTH the final environment (env0 ++ every inferred builtin scheme, e.g.
+`Prelude`'s unsignatured `map`/`compare`, `Runtime`'s `worker`/`task*`) and the
+checker-rewritten corpus files.  The environment is what every user group is
+then checked against — built ONCE per process, not per fixture.
+-}
+checkBuiltins : List File.File -> Result String { env : Env, files : List File.File }
+checkBuiltins files =
+    let
+        env0 =
+            List.foldl (\f env -> Env.merge env (Env.collectFile f)) Env.empty files
+    in
+    orderUnits files
+        |> Result.andThen (\ordered -> checkInOrderEnv env0 ordered [])
+        |> Result.map (\( env, checked ) -> { env = env, files = checked })
+
+
+{-| Check ONE user group (1-2 fixture modules) against the GIVEN builtin
+environment.  The group's own signatures/ctors/aliases are collected up front
+(so cross-module references inside the group resolve exactly as in `checkUnits`
+regardless of topological order), the group is topologically sorted, and each
+unit is checked — its inferred schemes merge back into the env only within the
+group (each group is independent).  Returns the rewritten group files.
+-}
+checkUserGroup : Env -> List File.File -> Result String (List File.File)
+checkUserGroup env files =
+    let
+        env0 =
+            List.foldl (\f e -> Env.merge e (Env.collectFile f)) env files
+    in
+    topoUser files
+        |> Result.andThen (\ordered -> checkInOrder env0 ordered [])
+
+
 checkInOrder : Env -> List File.File -> List File.File -> Result String (List File.File)
 checkInOrder env files acc =
+    checkInOrderEnv env files acc
+        |> Result.map Tuple.second
+
+
+{-| Like `checkInOrder`, but also returns the FINAL environment (the up-front
+env plus every inferred scheme), so `checkBuiltins` can hand it to user groups.
+-}
+checkInOrderEnv : Env -> List File.File -> List File.File -> Result String ( Env, List File.File )
+checkInOrderEnv env files acc =
     case files of
         [] ->
-            Ok (List.reverse acc)
+            Ok ( env, List.reverse acc )
 
         f :: rest ->
             if isTrustedUnit (moduleNameStr f) then
                 -- Body skipped; signatures/ctors/aliases are already in the
                 -- (up-front) environment.  Keep the ORIGINAL file — no
                 -- rewrites are needed because the body is never checked.
-                checkInOrder env rest (f :: acc)
+                checkInOrderEnv env rest (f :: acc)
 
             else
                 case Infer.inferUnit env f of
@@ -80,7 +124,7 @@ checkInOrder env files acc =
                         Err (Error.render err)
 
                     Ok checked ->
-                        checkInOrder (insertSchemes checked.schemes env) rest (checked.file :: acc)
+                        checkInOrderEnv (insertSchemes checked.schemes env) rest (checked.file :: acc)
 
 
 insertSchemes : List ( String, Scheme ) -> Env -> Env
