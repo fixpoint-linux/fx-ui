@@ -83,6 +83,14 @@ runOne update model task rest =
             drive update model rest
 
 
+-- The Task interpreter.  Each Task constructor's effect has a DIFFERENT result
+-- type (TaskWrite -> (), TaskReadLine -> String, TaskExec -> (Int, String,
+-- String), TaskGetpid -> Int, TaskGlob -> List String, ...), which HM cannot
+-- type — the untyped VM runs `runTask` dynamically.  Its body is therefore
+-- TRUSTED (Type.Builtins.trustedBodies) and this signature (`Task x a ->
+-- Result x a`, the honest monadic shape) is what the checker uses at every
+-- call site (`runOne`/`drive`).
+runTask : Task x a -> Result x a
 runTask task =
     case task of
         TaskSucceed v ->
@@ -147,97 +155,121 @@ runTask task =
             Ok (decodeStringList (globPrim pattern))
 
 
+cmdNone : List (Task Never msg)
 cmdNone = []
 
 
+cmdBatch : List (List (Task Never msg)) -> List (Task Never msg)
 cmdBatch cmds =
     foldr append [] cmds
 
 
+cmdMap : (a -> msg) -> List (Task Never a) -> List (Task Never msg)
 cmdMap f cmd =
     map (taskMap f) cmd
 
 
+taskSucceed : a -> Task x a
 taskSucceed v =
     TaskSucceed v
 
 
+taskFail : x -> Task x a
 taskFail e =
     TaskFail e
 
 
+taskAndThen : (a -> Task x b) -> Task x a -> Task x b
 taskAndThen f t =
     TaskAndThen f t
 
 
+taskOnError : (x -> Task y a) -> Task x a -> Task y a
 taskOnError h t =
     TaskOnError h t
 
 
+taskMap : (a -> b) -> Task x a -> Task x b
 taskMap f t =
     taskAndThen (\v -> taskSucceed (f v)) t
 
 
+taskMap2 : (a -> b -> c) -> Task x a -> Task x b -> Task x c
 taskMap2 f ta tb =
     taskAndThen (\a -> taskAndThen (\b -> taskSucceed (f a b)) tb) ta
 
 
+taskSequence : List (Task x a) -> Task x (List a)
 taskSequence tasks =
     foldr (\t acc -> taskMap2 (\x xs -> x :: xs) t acc) (taskSucceed []) tasks
 
 
+taskPerform : (a -> msg) -> Task x a -> List (Task Never msg)
 taskPerform toMsg task =
     [ taskMap toMsg task ]
 
 
+taskAttempt : (Result x a -> msg) -> Task x a -> List (Task Never msg)
 taskAttempt toMsg task =
     [ taskMap toMsg (taskOnError (\e -> taskSucceed (Err e)) (taskMap Ok task)) ]
 
 
+taskWriteString : String -> Task x ()
 taskWriteString s =
     TaskWrite s
 
 
+taskReadLine : Task x String
 taskReadLine =
     TaskReadLine
 
 
+taskReadFile : String -> Task x String
 taskReadFile path =
     TaskReadFile path
 
 
+taskWriteFile : String -> String -> Task x ()
 taskWriteFile path contents =
     TaskWriteFile path contents
 
 
+taskExec : a -> Task x (Int, String, String)
 taskExec plan =
     TaskExec plan
 
 
+taskGetenv : String -> Task x String
 taskGetenv name =
     TaskGetenv name
 
 
+taskSetenv : String -> String -> Task x Bool
 taskSetenv name value =
     TaskSetenv name value
 
 
+taskCd : String -> Task x Bool
 taskCd path =
     TaskCd path
 
 
+taskGetcwd : Task x String
 taskGetcwd =
     TaskGetcwd
 
 
+taskGetpid : Task x Int
 taskGetpid =
     TaskGetpid
 
 
+taskGlob : String -> Task x (List String)
 taskGlob pattern =
     TaskGlob pattern
 
 
+subNone : ()
 subNone = ()
 
 
@@ -302,28 +334,34 @@ readLineGo acc =
 -- These are the ONLY way to build a plan; decodeExec/decodeStringList walk
 -- the matching tagged results back to plain values.
 
+tStr : String -> List a
 tStr s =
     intern "string" :: s :: []
 
 
+tNum : number -> List a
 tNum n =
     intern "number" :: n :: []
 
 
+tSym : String -> List a
 tSym x =
     intern "symbol" :: intern x :: []
 
 
+tNil : List a
 tNil =
     intern "cons" :: []
 
 
+tCons : List a -> List a -> List a
 tCons h t =
     intern "cons" :: h :: t :: []
 
 
 -- primExecPlan returns [cons [number code] [cons [string out] [cons [string
 -- err] [cons]]]] -> (code, out, err).
+decodeExec : List a -> ( Int, String, String )
 decodeExec r =
     case r of
         _ :: codeTag :: outList :: _ ->
@@ -344,6 +382,7 @@ decodeExec r =
 
 
 -- primGlob returns [cons [string s1] [cons [string s2] [cons]]] -> [String].
+decodeStringList : List a -> List String
 decodeStringList r =
     case r of
         _ :: [] ->
@@ -356,6 +395,7 @@ decodeStringList r =
             []
 
 
+decodeNumber : List a -> Int
 decodeNumber v =
     case v of
         _ :: n :: _ ->
@@ -365,6 +405,7 @@ decodeNumber v =
             0
 
 
+decodeString : List a -> String
 decodeString v =
     case v of
         _ :: s :: _ ->

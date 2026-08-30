@@ -14,7 +14,7 @@ main =
 
 
 init () =
-    ( 0
+    ( ""
     , Task.attempt Got
         (Task.andThen (\_ -> Task.fail "boom") (Task.succeed ()))
     )
@@ -23,7 +23,7 @@ init () =
 update msg model =
     case msg of
         Got (Ok n) ->
-            ( n, Cmd.none )
+            ( String.fromInt n, Cmd.none )
 
         Got (Err e) ->
             ( e, Cmd.none )

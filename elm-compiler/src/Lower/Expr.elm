@@ -300,6 +300,12 @@ lowerExpression (Node range expr) pos ctx =
         TupledExpression es ->
             tupledExpr es ctx
 
+        InsertionValue inner ->
+            -- S6: an insertion setter RHS (`{r | f <- v}`) — the vendored
+            -- parser wraps `v` in InsertionValue; insertion and update lower
+            -- IDENTICALLY (prepend-pair), so unwrap to the inner expression.
+            lowerExpression inner pos ctx
+
         _ ->
             Err "unsupported expression in the M1b subset (case/records/ADTs are M2)"
 
@@ -1043,7 +1049,18 @@ recordAccess rec nameNode ctx =
 
 recordAccessFunction : String -> Context -> Result String (List Instr)
 recordAccessFunction name _ =
-    Ok [ Cur (Grab :: [ Access 0, Symbol name, Prim "assoc", Prim "snd" ] ++ [ Return ]) ]
+    -- The name arrives as ".x" (leading dot); record fields are interned BARE
+    -- ("x"), so strip the dot or `assoc` would never match.  (The checker types
+    -- `.x` correctly by stripping the dot too.)
+    let
+        field =
+            String.dropLeft 1 name
+    in
+    -- A 1-param closure compiles to [cur] with NO leading grab (zincArity =
+    -- leading grabs + 1; the first param is bound by APPLY).  The old `Grab ::
+    -- ...` made `.x` read arity 2, so a value accessor fed to `List.map`/a
+    -- `let` never got applied and surfaced as garbage.
+    Ok [ Cur ([ Access 0, Symbol field, Prim "assoc", Prim "snd" ] ++ [ Return ]) ]
 
 
 recordUpdate : Node String -> List (Node Expression.RecordSetter) -> Context -> Result String (List Instr)

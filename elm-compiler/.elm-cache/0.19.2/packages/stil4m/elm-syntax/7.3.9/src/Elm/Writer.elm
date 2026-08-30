@@ -392,9 +392,16 @@ writeExpression (Node range inner) =
 
         writeRecordSetter : RecordSetter -> ( Range, Writer )
         writeRecordSetter ( name, expr ) =
-            ( Node.range expr
-            , spaced [ string <| Node.value name, string "=", writeExpression expr ]
-            )
+            case expr of
+                Node _ (InsertionValue inserted) ->
+                    ( Node.range inserted
+                    , spaced [ string <| Node.value name, string "<-", writeExpression inserted ]
+                    )
+
+                _ ->
+                    ( Node.range expr
+                    , spaced [ string <| Node.value name, string "=", writeExpression expr ]
+                    )
 
         sepHelper : (Bool -> List Writer -> Writer) -> List ( Range, Writer ) -> Writer
         sepHelper f l =
@@ -553,6 +560,9 @@ writeExpression (Node range inner) =
                 , sepHelper sepByComma (List.map (Node.value >> writeRecordSetter) updates)
                 , string "}"
                 ]
+
+        InsertionValue inserted ->
+            writeExpression inserted
 
         GLSLExpression s ->
             join

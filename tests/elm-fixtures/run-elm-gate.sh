@@ -242,6 +242,20 @@ run arraybasic  main   "$(read_expected arraybasic)"
 # fromList 1025 positional roundtrip, map/filter over 1024, persistence.
 run arraystress main   "$(read_expected arraystress)"
 
+# --- S7: typechecker extensible-record surface (scoped labels) ---
+run rowpoly     main   "$(read_expected rowpoly)"
+run extrec      main   "$(read_expected extrec)"
+run insrec      main   "$(read_expected insrec)"
+run remrec      main   "$(read_expected remrec)"
+run scopedup    main   "$(read_expected scopedup)"
+run recalias    main   "$(read_expected recalias)"
+run appendres   main   "$(read_expected appendres)"
+compile_error tyerr_update_missing_field "does not have field"
+compile_error tyerr_ambiguous_append      "ambiguous"
+compile_error tyerr_numstr                "unify number with String"
+compile_error tyerr_arity                 "apply non-function"
+compile_error tyerr_remove_absent         "does not have field"
+
 rm -rf "$OUT"
 echo "=============================="
 echo "PASS=$pass FAIL=$fail"

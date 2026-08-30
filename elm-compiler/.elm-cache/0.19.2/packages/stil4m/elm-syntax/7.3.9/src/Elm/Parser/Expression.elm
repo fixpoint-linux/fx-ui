@@ -427,18 +427,29 @@ recordFields =
 recordSetterNodeWithLayout : Parser (WithComments (Node RecordSetter))
 recordSetterNodeWithLayout =
     ParserFast.map5WithRange
-        (\range name commentsAfterFunctionName commentsAfterEquals expressionResult commentsAfterExpression ->
+        (\range name commentsAfterFunctionName ( isInsertion, commentsAfterSeparator ) expressionResult commentsAfterExpression ->
             { comments =
                 commentsAfterFunctionName
-                    |> Rope.prependTo commentsAfterEquals
+                    |> Rope.prependTo commentsAfterSeparator
                     |> Rope.prependTo expressionResult.comments
                     |> Rope.prependTo commentsAfterExpression
-            , syntax = Node range ( name, expressionResult.syntax )
+            , syntax =
+                Node range
+                    ( name
+                    , if isInsertion then
+                        Node (Node.range expressionResult.syntax) (InsertionValue expressionResult.syntax)
+
+                      else
+                        expressionResult.syntax
+                    )
             }
         )
         Tokens.functionNameNode
         Layout.maybeLayout
-        (ParserFast.symbolFollowedBy "=" Layout.maybeLayout)
+        (ParserFast.oneOf2
+            (ParserFast.symbolFollowedBy "=" (ParserFast.map (\comments -> ( False, comments )) Layout.maybeLayout))
+            (ParserFast.symbolFollowedBy "<-" (ParserFast.map (\comments -> ( True, comments )) Layout.maybeLayout))
+        )
         expression
         -- This extra whitespace is just included for compatibility with earlier version
         -- TODO for v8: remove

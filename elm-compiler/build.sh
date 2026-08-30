@@ -28,4 +28,24 @@ else
   exit 1
 fi
 
+# Guard against a stale compiled-package cache: elm 0.19.2 never re-verifies
+# package content once a package's artifacts.dat exists, so a patched vendored
+# source is silently ignored until its artifacts.dat is regenerated.  If any
+# package src file is newer than that package's artifacts.dat, drop the stale
+# artifacts.dat (and elm-stuff, which embeds the old package interfaces) so elm
+# rebuilds it from source.
+stale=0
+for pkg in "$PWD/.elm-cache/0.19.2/packages"/*/*/*/; do
+  [ -d "$pkg/src" ] || continue
+  [ -f "$pkg/artifacts.dat" ] || continue
+  if [ -n "$(find "$pkg/src" -type f -newer "$pkg/artifacts.dat" -print -quit 2>/dev/null)" ]; then
+    echo "build.sh: stale artifacts.dat in ${pkg%/} (source newer) -> removing" >&2
+    rm -f "$pkg/artifacts.dat"
+    stale=1
+  fi
+done
+if [ "$stale" = 1 ]; then
+  rm -rf "$PWD/elm-stuff"
+fi
+
 ELM_HOME="$PWD/.elm-cache" "$ELM" make src/Main.elm --output=compiler.js

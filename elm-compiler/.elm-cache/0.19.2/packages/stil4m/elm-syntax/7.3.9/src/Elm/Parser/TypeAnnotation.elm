@@ -205,7 +205,19 @@ recordTypeAnnotation =
                                     TypeAnnotation.GenericRecord firstNameNode fields
 
                                 FieldsAfterName fieldsAfterName ->
-                                    TypeAnnotation.Record (Node.combine Tuple.pair firstNameNode fieldsAfterName.firstFieldValue :: fieldsAfterName.tailFields)
+                                    case fieldsAfterName.tail of
+                                        Nothing ->
+                                            TypeAnnotation.Record (Node.combine Tuple.pair firstNameNode fieldsAfterName.firstFieldValue :: fieldsAfterName.tailFields)
+
+                                        Just tailNode ->
+                                            TypeAnnotation.GenericRecord tailNode
+                                                (Node
+                                                    (tailLastFieldsRange
+                                                        (Node.combine Tuple.pair firstNameNode fieldsAfterName.firstFieldValue)
+                                                        fieldsAfterName.tailFields
+                                                    )
+                                                    (Node.combine Tuple.pair firstNameNode fieldsAfterName.firstFieldValue :: fieldsAfterName.tailFields)
+                                                )
                             )
                     }
                 )
@@ -242,17 +254,19 @@ recordTypeAnnotation =
                         )
                     )
                     (ParserFast.symbolFollowedBy ":"
-                        (ParserFast.map4
-                            (\commentsBeforeFirstFieldValue firstFieldValue commentsAfterFirstFieldValue tailFields ->
+                        (ParserFast.map5
+                            (\commentsBeforeFirstFieldValue firstFieldValue commentsAfterFirstFieldValue tailFields tailResult ->
                                 { comments =
                                     commentsBeforeFirstFieldValue
                                         |> Rope.prependTo firstFieldValue.comments
                                         |> Rope.prependTo commentsAfterFirstFieldValue
                                         |> Rope.prependTo tailFields.comments
+                                        |> Rope.prependTo tailResult.comments
                                 , syntax =
                                     FieldsAfterName
                                         { firstFieldValue = firstFieldValue.syntax
                                         , tailFields = tailFields.syntax
+                                        , tail = tailResult.syntax
                                         }
                                 }
                             )
@@ -262,6 +276,23 @@ recordTypeAnnotation =
                             (ParserFast.orSucceed
                                 (ParserFast.symbolFollowedBy "," recordFieldsTypeAnnotation)
                                 { comments = Rope.empty, syntax = [] }
+                            )
+                            (ParserFast.orSucceed
+                                (ParserFast.symbolFollowedBy "|"
+                                    (ParserFast.map3
+                                        (\commentsBeforeTail tailNameNode commentsAfterTail ->
+                                            { comments =
+                                                commentsBeforeTail
+                                                    |> Rope.prependTo commentsAfterTail
+                                            , syntax = Just tailNameNode
+                                            }
+                                        )
+                                        Layout.maybeLayout
+                                        Tokens.functionNameNode
+                                        Layout.maybeLayout
+                                    )
+                                )
+                                { comments = Rope.empty, syntax = Nothing }
                             )
                         )
                     )
@@ -277,9 +308,32 @@ typeAnnotationRecordEmpty =
     TypeAnnotation.Record []
 
 
+tailLastFieldsRange : Node RecordField -> List (Node RecordField) -> Range
+tailLastFieldsRange first rest =
+    case rest of
+        [] ->
+            Node.range first
+
+        _ ->
+            let
+                lastNode =
+                    rest
+                        |> List.reverse
+                        |> List.head
+                        |> Maybe.withDefault first
+            in
+            { start = (Node.range first).start
+            , end = (Node.range lastNode).end
+            }
+
+
 type RecordFieldsOrExtensionAfterName
     = RecordExtensionExpressionAfterName (Node RecordDefinition)
-    | FieldsAfterName { firstFieldValue : Node TypeAnnotation, tailFields : List (Node RecordField) }
+    | FieldsAfterName
+        { firstFieldValue : Node TypeAnnotation
+        , tailFields : List (Node RecordField)
+        , tail : Maybe (Node String)
+        }
 
 
 recordFieldsTypeAnnotation : Parser (WithComments TypeAnnotation.RecordDefinition)

@@ -134,6 +134,7 @@ type Expression
     | RecordAccess (Node Expression) (Node String)
     | RecordAccessFunction String
     | RecordUpdateExpression (Node String) (List (Node RecordSetter))
+    | InsertionValue (Node Expression)
     | GLSLExpression String
 
 
@@ -338,6 +339,9 @@ encode expr =
         RecordUpdateExpression name updates ->
             encodeTyped "recordUpdate" (encodeRecordUpdate name updates)
 
+        InsertionValue inner ->
+            encodeTyped "insertionValue" (Node.encode encode inner)
+
         GLSLExpression x ->
             encodeTyped "glsl" (JE.string x)
 
@@ -477,6 +481,7 @@ decoder =
                         (JD.field "name" <| Node.decoder JD.string)
                         (JD.field "updates" (JD.list <| Node.decoder decodeRecordSetter))
                   )
+                , ( "insertionValue", decodeNested |> JD.map InsertionValue )
                 , ( "glsl", JD.string |> JD.map GLSLExpression )
                 ]
         )

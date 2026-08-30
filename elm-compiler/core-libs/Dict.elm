@@ -513,8 +513,8 @@ mergeStepState
   -> (comparable -> b -> result -> result)
   -> comparable
   -> b
-  -> (List comparable, result)
-  -> (List comparable, result)
+  -> (List (comparable, a), result)
+  -> (List (comparable, a), result)
 mergeStepState leftStep bothStep rightStep rKey rValue (list, result) =
   case list of
     [] ->

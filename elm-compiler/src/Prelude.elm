@@ -141,8 +141,15 @@ clamp lo hi x =
 --     structural order.  The nil-vs-cons prefix rule gives [] < (y :: ys).
 --   * Ill-typed mixed comparisons (e.g. 5 vs "a") fall to EQ — the untyped
 --     subset has no type error to raise.
+--
+-- `compare` is a RUNTIME-TYPE-TAG dispatcher (isNumber/isString/isCons/isNil),
+-- which HM cannot type — it is the authentic elm/core Basics.compare surface,
+-- which real Elm implements in the KERNEL.  Its body is therefore TRUSTED
+-- (Type.Builtins.trustedBodies), and this signature (`comparable -> comparable
+-- -> Order`, verbatim elm/core) is what the checker uses at every call site.
 
 
+compare : comparable -> comparable -> Order
 compare a b =
     if isNumber a then
         cmpNum a b
@@ -413,7 +420,7 @@ tail xs =
             rest
 
         [] ->
-            "tail of empty list"
+            []
 
 
 singleton x =
@@ -467,6 +474,10 @@ join sep strs =
 -- ====================== String =====================
 
 
+-- `fromInt` rides the `cn` prim (String.append), which RENDERS a number in
+-- decimal when concatenated — a trusted lie the checker cannot see (String.append
+-- is typed String -> String -> String), so the body is TRUSTED.
+fromInt : Int -> String
 fromInt n =
     String.append "" n
 
@@ -498,3 +509,29 @@ drop n xs =
 
             [] ->
                 []
+
+
+
+-- ==================== Record field removal ====================
+-- The runtime for `Record.remove '<label>' r` (the typechecker rewrites that
+-- surface to `Prelude.removeFieldImpl "<label>" r`).  A record VALUE is an
+-- assoc list of @p(symbol, value) pairs, so this walks it and drops the FIRST
+-- matching pair only — returning `rest` on a match, NOT a full filter — which
+-- is exactly the paper's `restrict` (outermost-occurrence removal) that scoped
+-- labels require: with duplicate labels {x=1, x=2}, removing x leaves {x=2}
+-- and `.x` then selects 2.  `intern` (processPrimAliases) makes the symbol from
+-- the string; `==` lowers to the structural `=` prim.  The body is TRUSTED
+-- (Type.Builtins.trustedBodies): it pattern-matches a record as a raw assoc
+-- list, which the TRecord-typed checker must never see.
+
+removeFieldImpl name rec =
+    case rec of
+        ( k, v ) :: rest ->
+            if k == intern name then
+                rest
+
+            else
+                ( k, v ) :: removeFieldImpl name rest
+
+        [] ->
+            []
