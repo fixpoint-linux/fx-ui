@@ -234,6 +234,11 @@ primWrapperSchemes =
         , ( "cons?", poly [ a ] (func [ TVar a ] tBool) )
         , ( "empty?", poly [ a ] (func [ TVar a ] tBool) )
         , ( "char-code", mono (func [ tString, tInt ] tInt) )
+
+        -- Renders any scalar to a string (floats via values.floatText).
+        -- The only call site is the TRUSTED Str.fromFloat, which passes a
+        -- Float through the String-typed lie — same pattern as fromInt/cn.
+        , ( "str", mono (func [ tString ] tString) )
         ]
 
 
@@ -318,6 +323,8 @@ trustedBodies =
     [ recordRemoveImpl
     , "Prelude.compare"
     , "Prelude.fromInt"
+    , "Str.fromFloat"
+    , "Str.countChar"
     , "Runtime.runTask"
     , "Runtime.taskAndThen"
     , "Runtime.taskOnError"

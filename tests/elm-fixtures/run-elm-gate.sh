@@ -242,6 +242,52 @@ run arraybasic  main   "$(read_expected arraybasic)"
 # fromList 1025 positional roundtrip, map/filter over 1024, persistence.
 run arraystress main   "$(read_expected arraystress)"
 
+# --- S1 (M-FOUNDATION): core-libs/Str.elm string toolkit + Prelude.List.take ---
+# strunit: width (ANSI-skip + UTF-8 cell tables), split/lines/repeat/pad/
+# truncate/replace/affixes/trim/countChar, List.take, trusted Str.fromFloat.
+run strunit     main   "$(read_expected strunit)"
+
+# --- S2 (M-FOUNDATION): core-libs/Lipgloss.elm faithful v1.1.0 port ---
+# lgunit: byte-exact pure renders (SGR param order incl. the v1.1.0 duplicate
+# underline-4; color parser RGB/ANSI256/ANSI16; padding/width/align; normal+
+# rounded border boxes + the corner-suppression matrix; marginBg margins;
+# maxWidth/maxHeight; joinH/joinV/place; width/height/size; CJK box width).
+run lgunit      main   "$(read_expected lgunit)"
+
+# --- S3 (M-FOUNDATION): host TaskNow/Sleep/Quit leaves (monotonic time) ---
+# nowunit: sleep 30 then now-diff >= 25 (CLOCK_MONOTONIC, not the wall-clock
+# get-time prim) + a two-sleep ORDER chain (sequential sleeps take >= 40ms).
+run nowunit     main   "$(read_expected nowunit)"
+
+# --- S4 (M-FOUNDATION): host mouse input (SGR decode + shared event queue) ---
+# mouseunit: AllMotion mouse mode + readMouse loop — press/release/wheel SGR
+# packets decode to press:left@4,2 / release:left@4,2 / wheel:up@4,2; 'q' quits.
+pty mouseunit   main   mouseunit.script
+# mousemix: readKey AND readMouse BOTH armed; one send interleaves 'a' + click
+# + 'b' — the shared queue must route each event to the right reader.
+pty mousemix    main   mousemix.script
+
+# --- S5 (M-FOUNDATION): SIGWINCH resize (signalfd + TaskWaitResize) ---
+# resizeunit: initial 80x24 probe (Io.winSize), `resize 40 12` -> SIGWINCH ->
+# waitResize delivers 40x12 + re-arms; 'q' quits via the S3 quit latch.
+pty resizeunit  main   resizeunit.script
+
+# --- S6 (M-FOUNDATION): host dir/stat leaves (getdents64 + fstatat) ---
+# dirunit: Io.listDir over input/dirlist — '.'/'..' skipped, isDir from dirent
+# d_type; RAW fs order re-sorted through Set for a deterministic join.
+run dirunit     main   "$(read_expected dirunit)"
+# statunit: Io.stat size + isDir/isFile + mode S_IFMT type bits (NOT mtime) +
+# the zero-record failure parity for a missing path.
+run statunit    main   "$(read_expected statunit)"
+
+# --- M-FOUNDATION S7: Tea + Lipgloss integration demo (lgdemo) ---
+# The composing proof: a Tea program whose view is a Lipgloss rounded-border
+# box (cyan edges, bold-cyan nested title, padding, width = probed cols) split
+# into frame rows by Str.lines.  Every key re-renders with a changed n=/last=
+# field; a live `resize 40 12` (Tea re-arms Io.waitResize on every EvResize)
+# re-renders the box at the new dims; Enter quits via the S3 quit latch.
+pty lgdemo      main   lgdemo.script
+
 # --- S7: typechecker extensible-record surface (scoped labels) ---
 run rowpoly     main   "$(read_expected rowpoly)"
 run extrec      main   "$(read_expected extrec)"

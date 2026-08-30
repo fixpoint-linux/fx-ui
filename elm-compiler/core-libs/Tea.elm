@@ -45,11 +45,17 @@ type Event
   | EvIgnored
 
 
-{-| Turn a user config `{init, update, view}` into a host Program.  init
+{-| Turn a user config `{init, update, view, resize}` into a host Program.  init
 batches the user's initial command with a RAW-MODE-FIRST chain: raw mode must
 be ON before the winsize probe / first readKey (the first frame's \r\n is
 mangled by the tty's ONLCR otherwise — the host runs batched tasks out of
 spawn order, so ordering here is a chain, not a batch).
+
+`resize cols rows model` folds EVERY EvResize delivery into the user model
+before the repaint — the startup winsize probe AND every live SIGWINCH
+(after each delivery the EvResize branch re-arms `Io.waitResize` first in its
+batch, before the frame write, so the signalfd is armed before a peer-issued
+resize can ever be observed — resizeunit's GotProbe ordering discipline).
 -}
 program config =
   let
@@ -100,13 +106,16 @@ hasQuit cmd =
           hasQuit rest
 
 
--- Exit path: restore the cursor, drop raw mode.  No re-arm — after these
--- two tasks complete the host's eval set drains and the program exits.
+-- Exit path: restore the cursor, drop raw mode, then quit.  ORDER MATTERS — a
+-- batch runs out of spawn order, so this is a CHAIN: write showCursor, then
+-- rawMode False, then Io.quit (which sets the host's quit latch — the loop
+-- breaks even with a re-armed readKey/mouse/resize eval still suspended, so a
+-- delivery-time quit can no longer hang waiting on one more event).
 exit =
-  Cmd.batch
-    [ Task.perform (\_ -> EvIgnored) (Io.writeString showCursor)
-    , Task.perform (\_ -> EvIgnored) (Io.rawMode False)
-    ]
+  Task.perform (\_ -> EvIgnored)
+    (Task.andThen (\_ -> Io.quit)
+      (Task.andThen (\_ -> Io.rawMode False) (Io.writeString showCursor))
+    )
 
 
 outerUpdate config msg tea =
@@ -140,21 +149,34 @@ outerUpdate config msg tea =
                 ]
             )
 
-    -- The initial dims probe.  prev is carried through, NOT forced to []:
-    -- a key decoded before this delivery (startup typeahead) may already
-    -- have painted a frame; forcing prev to [] would repaint over it with
-    -- NO moveUp and leave the stale frame stuck on screen.  Carrying prev
-    -- keeps paint's cursor invariant — at a true first paint prev is still
-    -- [] and the first-frame branch is taken exactly as before.
+    -- The initial dims probe and every live SIGWINCH (the re-armed
+    -- Io.waitResize below): the user's `resize` hook folds the dims into the
+    -- user model, then the frame repaints at the new size.  prev is carried
+    -- through, NOT forced to []: a key decoded before this delivery (startup
+    -- typeahead) may already have painted a frame; forcing prev to [] would
+    -- repaint over it with NO moveUp and leave the stale frame stuck on
+    -- screen.  Carrying prev keeps paint's cursor invariant — at a true first
+    -- paint prev is still [] and the first-frame branch is taken exactly as
+    -- before.  The waitResize re-arm is FIRST in the batch: leafWaitResize
+    -- blocks SIGWINCH + arms the signalfd before the frame write can become
+    -- visible to the peer, so a `resize` directive can never race the arming.
     EvResize cols rows ->
       let
+        m1 =
+          config.resize cols rows tea.mod
+
         resized =
-          { mod = tea.mod, prev = tea.prev, rows = rows, cols = cols }
+          { mod = m1, prev = tea.prev, rows = rows, cols = cols }
 
         ( tea1, frame ) =
-          paint resized resized.mod (config.view resized.mod)
+          paint resized m1 (config.view m1)
       in
-      ( tea1, repaint frame )
+      ( tea1
+      , Cmd.batch
+          [ Task.perform resizeToEvent Io.waitResize
+          , repaint frame
+          ]
+      )
 
     -- Quit marker delivered (only possible when the scan above missed):
     -- run the exit path, no re-arm.

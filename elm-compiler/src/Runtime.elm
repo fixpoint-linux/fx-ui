@@ -34,7 +34,15 @@ type Task x a
     | TaskGlob String
     | TaskReadKey
     | TaskWinSize
+    | TaskWaitResize
     | TaskRawMode Bool
+    | TaskNow
+    | TaskSleep Int
+    | TaskQuit
+    | TaskMouseMode MouseMode
+    | TaskReadMouse
+    | TaskListDir String
+    | TaskStat String
 
 
 -- A decoded terminal key (M1 tea input surface).  The HOST event loop builds
@@ -59,6 +67,43 @@ type Key
     | KeyCtrl String
     | KeyOther Int
     | KeyEof
+
+
+-- A decoded SGR mouse event (S4 host surface).  The HOST event loop builds
+-- these vectors with the BARE ctor names as tags (tag compare is by name), so
+-- the ctor spellings here are the contract for effectloop.zig's decode table.
+type MouseMsg
+    = MouseMsg MouseAction MouseButton Int Int
+    | MouseEof
+
+
+type MouseAction
+    = MousePress
+    | MouseRelease
+    | MouseMotion
+    | MouseWheel
+
+
+type MouseButton
+    = MouseLeft
+    | MouseMiddle
+    | MouseRight
+    | MouseNone
+    | MouseWheelUp
+    | MouseWheelDown
+    | MouseWheelLeft
+    | MouseWheelRight
+
+
+-- Mouse tracking mode for TaskMouseMode.  Click = press/release only (1006+
+-- 1000), Drag = +drag (1006+1002), AllMotion = +all motion (1006+1003), Off
+-- resets everything.  Off is spelled MouseModeOff (not `Off`) to avoid
+-- colliding with the bare-name namespace of user modules.
+type MouseMode
+    = MouseModeOff
+    | Click
+    | Drag
+    | AllMotion
 
 
 type alias Cmd msg = List (Task Never msg)
@@ -192,8 +237,44 @@ runTask task =
         TaskWinSize ->
             Ok ( 0, 0 )
 
+        -- M-FOUNDATION resize leaf.  Sync no-op: no signalfd / SIGWINCH here.
+        -- The HOST event loop arms the shared signalfd and completes every
+        -- armed waitResize eval with the fresh size on each SIGWINCH.
+        TaskWaitResize ->
+            Ok ( 0, 0 )
+
         TaskRawMode _ ->
             Ok ()
+
+        -- M-FOUNDATION time/quit leaves.  Sync no-ops: no monotonic clock /
+        -- event loop here.  The HOST event loop dispatches these same tags.
+        TaskNow ->
+            Ok 0
+
+        TaskSleep _ ->
+            Ok ()
+
+        TaskQuit ->
+            Ok ()
+
+        -- M-FOUNDATION mouse leaves.  Sync no-ops: no terminal to poll, so
+        -- readMouse completes with MouseEof and mouseMode is ignored.  The HOST
+        -- event loop dispatches these same tags.
+        TaskReadMouse ->
+            Ok MouseEof
+
+        TaskMouseMode _ ->
+            Ok ()
+
+        -- M-FOUNDATION dir/stat leaves.  Sync no-ops: no filesystem here, so
+        -- listDir completes empty and stat completes the ZERO record.  The
+        -- HOST event loop dispatches these same tags to getdents64 / fstatat
+        -- (a failed host stat also completes the zero record).
+        TaskListDir _ ->
+            Ok []
+
+        TaskStat _ ->
+            Ok { size = 0, mode = 0, mtimeMs = 0, isDir = False, isFile = False }
 
 
 cmdNone : List (Task Never msg)
@@ -320,9 +401,49 @@ taskWinSize =
     TaskWinSize
 
 
+taskWaitResize : Task x ( Int, Int )
+taskWaitResize =
+    TaskWaitResize
+
+
 taskRawMode : Bool -> Task x ()
 taskRawMode enable =
     TaskRawMode enable
+
+
+taskNow : Task x Int
+taskNow =
+    TaskNow
+
+
+taskSleep : Int -> Task x ()
+taskSleep ms =
+    TaskSleep ms
+
+
+taskQuit : Task x ()
+taskQuit =
+    TaskQuit
+
+
+taskMouseMode : MouseMode -> Task x ()
+taskMouseMode mode =
+    TaskMouseMode mode
+
+
+taskReadMouse : Task x MouseMsg
+taskReadMouse =
+    TaskReadMouse
+
+
+taskListDir : String -> Task x (List { name : String, isDir : Bool })
+taskListDir path =
+    TaskListDir path
+
+
+taskStat : String -> Task x { size : Int, mode : Int, mtimeMs : Int, isDir : Bool, isFile : Bool }
+taskStat path =
+    TaskStat path
 
 
 subNone : ()

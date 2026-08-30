@@ -36,7 +36,8 @@ const CORPUS = [
   fs.readFileSync(path.join(__dirname, 'src', 'Prelude.elm'), 'utf8'),
   fs.readFileSync(path.join(__dirname, 'src', 'Runtime.elm'), 'utf8'),
   ...[ 'Dict.elm', 'Set.elm', 'Maybe.elm', 'Result.elm',
-       'Tuple.elm', 'JsArray.elm', 'Array.elm', 'Tea.elm', 'TextInput.elm' ]
+       'Tuple.elm', 'JsArray.elm', 'Array.elm', 'Tea.elm', 'TextInput.elm',
+       'Str.elm', 'Lipgloss.elm' ]
     .map((f) => fs.readFileSync(path.join(__dirname, 'core-libs', f), 'utf8')),
 ];
 

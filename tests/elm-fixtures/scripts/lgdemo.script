@@ -1,0 +1,32 @@
+# lgdemo: Tea + Lipgloss integration demo under a real pty (M-FOUNDATION S7).
+#
+# Frame layout at cols=80 (then cols=40), 6 rows per frame — a Lipgloss
+# rounded-border box (cyan edges) with padding 1 and width = cols, around a
+# bold-cyan "lgdemo" title rendered NESTED in the content (the box's align
+# math skips its ANSI) plus the live model line:
+#   \e[?25l  (first paint only)
+#   \e[2K\e[36m╭─…╮\e[0m\r\n
+#   \e[2K\e[36m│\e[0m<cols spaces>\e[36m│\e[0m\r\n            (pad row, x2)
+#   \e[2K\e[36m│\e[0m \e[1;36mlgdemo\e[0m<pad>\e[36m│\e[0m\r\n
+#   \e[2K\e[36m│\e[0m n=<k> last=<key> size=<c>x<r> <pad>\e[36m│\e[0m\r\n
+#   \e[2K\e[36m╰─…╯\e[0m\r\n
+# repaints are prefixed \e[6A (move up 6).
+#
+# Every directive is settled by an expect BEFORE the next fires — no two
+# events are ever pending at once (the host drains a pending SIGWINCH before
+# pending keys, so back-to-back directives would make frame order racy).
+# Needles name bytes that exist only in the frame they await: the first
+# paint's head, a changed n=/last= field, the 40-wide top edge (the 80-wide
+# edge cannot contain it: after 40 dashes comes dash 41, never ╮), and the
+# exit path's showCursor.
+expect \e[?25l\e[2K\e[36m╭
+send x
+expect n=1 last=x size=80x24
+resize 40 12
+expect \e[36m╭────────────────────────────────────────╮\e[0m
+expect n=1 last=x size=40x12
+send y
+expect n=2 last=y size=40x12
+send \r
+expect \e[?25h
+expect_exit 0

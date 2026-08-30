@@ -474,6 +474,14 @@ checks =
             Nothing ->
                 False
         )
+    , check "builtin strPrim is String -> String"
+        (case Builtins.lookupValue "strPrim" of
+            Just s ->
+                Rep.pretty s.body == "String -> String"
+
+            Nothing ->
+                False
+        )
     , check "builtin removeFieldImpl is String -> a -> b"
         (case Builtins.lookupValue "Prelude.removeFieldImpl" of
             Just s ->
@@ -492,8 +500,8 @@ checks =
         (not (Builtins.isTrusted "Prelude.map"))
     , check "every prim-wrapper alias row has a builtin scheme"
         (Builtins.uncoveredPrimRows == [])
-    , check "33 prim-wrapper schemes registered"
-        (Dict.size Builtins.primWrapperSchemes == 33)
+    , check "34 prim-wrapper schemes registered"
+        (Dict.size Builtins.primWrapperSchemes == 34)
 
     -- Type.Infer: Algorithm W over expressions/patterns, record operations,
     -- let-generalization, top-level group, and the ++/Record.remove rewrites.

@@ -16,6 +16,10 @@ main =
     { init = \_ -> ( TextInput.init, Cmd.none )
     , update = demoUpdate
     , view = TextInput.view
+
+    -- S7 added the resize hook to Tea's config: teademo keeps no dims state,
+    -- so its hook is the identity (the repaint still happens, unchanged).
+    , resize = \cols rows m -> m
     }
 
 

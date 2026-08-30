@@ -1,0 +1,15 @@
+# mouseunit: SGR mouse decode + TaskMouseMode + TaskReadMouse under a pty.
+# init = rawMode -> mouseMode AllMotion -> READY -> readMouse.  Each mouse
+# event echoes M:<kind>; 'q' quits via the S3 quit latch.
+#   \e[<0;5;3M   = press   (cb=0 left, cx=5 cy=3) -> M:press:left@4,2
+#   \e[<0;5;3m   = release (final m)              -> M:release:left@4,2
+#   \e[<64;5;3M  = wheel   (cb=64, low bits 0)    -> M:wheel:up@4,2
+expect READY
+send \e[<0;5;3M
+expect M:press:left@4,2
+send \e[<0;5;3m
+expect M:release:left@4,2
+send \e[<64;5;3M
+expect M:wheel:up@4,2
+send q
+expect_exit 0

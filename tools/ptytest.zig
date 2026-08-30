@@ -15,6 +15,7 @@
 //!   send <escaped>          write bytes to the pty master
 //!   expect <escaped>        wait (10s cap) until the capture CONTAINS the bytes
 //!   expect_exit <code>      wait (10s cap) for the child to exit <code>
+//!   resize <cols> <rows>    TIOCSWINSZ on the master (fires SIGWINCH)
 //!   Escapes: \xNN \n \r \e \t (\\ is a literal backslash).
 //!
 //! SETUP: open /dev/ptmx (O_RDWR|O_NOCTTY), unlock it (TIOCSPTLCK=0), read the
@@ -152,6 +153,37 @@ pub fn main(init: std.process.Init) !void {
                 break;
             }
             writeAll(master, bytes.items);
+        } else if (std.mem.startsWith(u8, line, "resize ")) {
+            // resize <cols> <rows>: TIOCSWINSZ on the master fires SIGWINCH at
+            // the foreground process group (the child elmvm), which the S5
+            // signalfd host loop delivers as a resize event.
+            var dims = std.mem.tokenizeScalar(u8, std.mem.trim(u8, line["resize ".len..], " \t"), ' ');
+            const cols_s = dims.next() orelse {
+                ok = false;
+                reason = "resize: missing cols";
+                break;
+            };
+            const rows_s = dims.next() orelse {
+                ok = false;
+                reason = "resize: missing rows";
+                break;
+            };
+            const cols = std.fmt.parseInt(u16, cols_s, 10) catch {
+                ok = false;
+                reason = "resize: bad cols";
+                break;
+            };
+            const rows = std.fmt.parseInt(u16, rows_s, 10) catch {
+                ok = false;
+                reason = "resize: bad rows";
+                break;
+            };
+            var nws = std.posix.winsize{ .row = rows, .col = cols, .xpixel = 0, .ypixel = 0 };
+            if (ioctl(master, std.posix.T.IOCSWINSZ, &nws) != 0) {
+                ok = false;
+                reason = "resize: TIOCSWINSZ failed";
+                break;
+            }
         } else if (std.mem.startsWith(u8, line, "expect_exit ")) {
             const code = std.fmt.parseInt(u8, std.mem.trim(u8, line["expect_exit ".len..], " \t"), 10) catch 255;
             if (!expectExit(master, pid, code, &capture)) {

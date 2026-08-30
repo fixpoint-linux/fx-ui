@@ -35,6 +35,7 @@ module Prelude exposing
     , fromInt
     , length
     , drop
+    , take
     )
 
 -- The M3 prelude: a pure-core Elm module compiled BY the compiler itself at
@@ -507,6 +508,22 @@ drop n xs =
         case xs of
             _ :: rest ->
                 drop (n - 1) rest
+
+            [] ->
+                []
+
+
+
+-- Tail-recursive take (Elm's List.take), the exact mirror of drop:
+-- negative n takes nothing, n past the end takes everything.
+take n xs =
+    if n <= 0 then
+        []
+
+    else
+        case xs of
+            y :: rest ->
+                y :: take (n - 1) rest
 
             [] ->
                 []

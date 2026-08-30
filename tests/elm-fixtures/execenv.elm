@@ -44,7 +44,7 @@ update msg model =
         Got ( env, pid, cwd ) ->
             let
                 pidStr = String.fromInt pid
-                pidOk = pid > 0 && not (isEmpty pidStr)
+                pidOk = pid > 0 && pidStr /= ""
             in
             ( String.join ""
                 [ env

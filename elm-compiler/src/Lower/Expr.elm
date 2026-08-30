@@ -196,6 +196,10 @@ unaryPrims =
     -- lowers to a 1-byte string), cons? matches lists AND tuples (both cons
     -- chains), empty? is the nil test.
     , "string?", "number?", "cons?", "empty?"
+
+    -- Str.fromFloat: the 1-arg `str` prim renders ANY scalar (float via
+    -- values.floatText = shortest {d} + ".0" when integral) as a string.
+    , "str"
     ]
 
 

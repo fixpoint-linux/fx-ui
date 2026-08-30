@@ -883,16 +883,14 @@ inferLetDecl ctx (Node _ decl) =
                     inferPattern ctx patNode
                         |> andThen (\( binds, pt ) ->
                             unifyM (Node.range patNode) pt et
-                                |> map
+                                |> andThen
                                     (\_ ->
                                         let
                                             rigid =
                                                 scopeFreeVars ctx
-
-                                            gens =
-                                                List.map (\( n, s ) -> ( n, generalizeLet rigid s.body )) binds
                                         in
-                                        { ctx | locals = gens ++ ctx.locals }
+                                        generalizeBinds rigid binds
+                                            |> map (\gens -> { ctx | locals = gens ++ ctx.locals })
                                     )
                         )
                 )
@@ -910,8 +908,30 @@ inferLetFunction ctx fn =
     inferPatterns ctx impl.arguments
         |> andThen (\( argTypes, binds ) ->
             inferExpr { ctx | locals = binds ++ ctx.locals } impl.expression
-                |> map (\bt -> generalizeLet rigid (List.foldr TFun bt argTypes))
+                |> andThen (\bt ->
+                    zonkM (List.foldr TFun bt argTypes)
+                        |> map (\zt -> generalizeLet rigid zt)
+                )
         )
+
+
+{-| Generalize a list of destructuring binds.  Each bind's body is ZONKED first:
+a pattern variable bound to a CLOSED type (e.g. `let y = h x` with a concrete
+record result) would otherwise still look like a free `TVar` (bound in the
+substitution) to `freeVars`, get quantified, and re-instantiate to a FRESH var —
+losing the concrete record and making a later `{ y | f = ... }` update fail with
+"record does not have field f".  Zonking first turns such a body into the closed
+record, whose free-variable set is empty, so nothing is quantified.
+-}
+generalizeBinds : List VarId -> List ( String, Scheme ) -> M (List ( String, Scheme ))
+generalizeBinds rigid binds =
+    case binds of
+        [] ->
+            ok []
+
+        ( n, s ) :: rest ->
+            zonkM s.body
+                |> andThen (\zt -> generalizeBinds rigid rest |> map (\gens -> ( n, generalizeLet rigid zt ) :: gens))
 
 
 {-| Let-generalization: quantify the free variables of `t` that are not rigid

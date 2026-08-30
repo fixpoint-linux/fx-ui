@@ -112,6 +112,7 @@ preludeTable =
     , ( "isEmpty", "Prelude.isEmpty" )
     , ( "singleton", "Prelude.singleton" )
     , ( "drop", "Prelude.drop" )
+    , ( "take", "Prelude.take" )
     ]
         ++ dottedRows "List."
             [ ( "map", "map" )
@@ -127,6 +128,7 @@ preludeTable =
             , ( "isEmpty", "isEmpty" )
             , ( "singleton", "singleton" )
             , ( "drop", "drop" )
+            , ( "take", "take" )
             ]
         ++ dottedRows ""
             [ ( "String.concat", "concat" )
@@ -208,7 +210,15 @@ platformTable =
     , ( "Io.glob", "Runtime.taskGlob" )
     , ( "Io.readKey", "Runtime.taskReadKey" )
     , ( "Io.winSize", "Runtime.taskWinSize" )
+    , ( "Io.waitResize", "Runtime.taskWaitResize" )
     , ( "Io.rawMode", "Runtime.taskRawMode" )
+    , ( "Io.now", "Runtime.taskNow" )
+    , ( "Io.sleep", "Runtime.taskSleep" )
+    , ( "Io.quit", "Runtime.taskQuit" )
+    , ( "Io.mouseMode", "Runtime.taskMouseMode" )
+    , ( "Io.readMouse", "Runtime.taskReadMouse" )
+    , ( "Io.listDir", "Runtime.taskListDir" )
+    , ( "Io.stat", "Runtime.taskStat" )
     , ( "Plan.str", "Runtime.tStr" )
     , ( "Plan.num", "Runtime.tNum" )
     , ( "Plan.sym", "Runtime.tSym" )
@@ -240,6 +250,27 @@ platformTable =
     , ( "KeyOther", "Runtime.KeyOther" )
     , ( "KeyEof", "Runtime.KeyEof" )
 
+    -- S4 mouse ADTs (foreign: defined in Runtime).  Same bare-name mechanism as
+    -- the Key rows — fixtures use the UNQUALIFIED ctor names in patterns.
+    , ( "MouseMsg", "Runtime.MouseMsg" )
+    , ( "MouseEof", "Runtime.MouseEof" )
+    , ( "MousePress", "Runtime.MousePress" )
+    , ( "MouseRelease", "Runtime.MouseRelease" )
+    , ( "MouseMotion", "Runtime.MouseMotion" )
+    , ( "MouseWheel", "Runtime.MouseWheel" )
+    , ( "MouseLeft", "Runtime.MouseLeft" )
+    , ( "MouseMiddle", "Runtime.MouseMiddle" )
+    , ( "MouseRight", "Runtime.MouseRight" )
+    , ( "MouseNone", "Runtime.MouseNone" )
+    , ( "MouseWheelUp", "Runtime.MouseWheelUp" )
+    , ( "MouseWheelDown", "Runtime.MouseWheelDown" )
+    , ( "MouseWheelLeft", "Runtime.MouseWheelLeft" )
+    , ( "MouseWheelRight", "Runtime.MouseWheelRight" )
+    , ( "MouseModeOff", "Runtime.MouseModeOff" )
+    , ( "Click", "Runtime.Click" )
+    , ( "Drag", "Runtime.Drag" )
+    , ( "AllMotion", "Runtime.AllMotion" )
+
     -- Tea's quit marker rides a bare TaskSucceed so core-libs Tea.elm can
     -- scan the user's command for it synchronously (quit key => drop the
     -- readKey re-arm).  Same bare-name/foreign-ctor mechanism as the Key rows.
@@ -260,6 +291,10 @@ streamPrimAliases =
     , ( "close", Expr.wrapperGlobalName "close" )
     , ( "strToBytes", Expr.wrapperGlobalName "shen.str->bytes" )
     , ( "bytesToString", Expr.wrapperGlobalName "shen.bytes->string" )
+
+    -- Str.fromFloat: the 1-arg `str` prim renders any scalar (a Float at
+    -- this call site) to its decimal text.
+    , ( "strPrim", Expr.wrapperGlobalName "str" )
     ]
 
 

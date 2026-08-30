@@ -51,6 +51,11 @@ const VmError = state.VmError;
 
 const pa = std.heap.page_allocator;
 
+/// SGR mouse-tracking DECRST (the exact set leafMouseMode Off emits) — reused
+/// by cleanupAll so a real terminal does not keep 1000/1002/1003/1006 tracking
+/// armed after quit or error.
+const MOUSE_OFF_SEQ = "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+
 // ---------------------------------------------------------------------
 //  Bounds — fixed tables, no dynamic growth (the host owns every fd/pid).
 // ---------------------------------------------------------------------
@@ -76,6 +81,29 @@ extern "c" fn close(fd: c_int) c_int;
 extern "c" fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
 extern "c" fn fcntl(fd: c_int, cmd: c_int, ...) c_int;
 extern "c" fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
+/// glibc fstatat (std.c leaves it void on linux — 0.16 prefers statx; the
+/// plain call matches the file's other libc externs and Go os.Stat semantics).
+extern "c" fn fstatat(dirfd: c_int, path: [*:0]const u8, buf: *Stat, flag: c_uint) c_int;
+
+/// glibc `struct stat` on x86_64-linux (std.c.Stat is void there) — only the
+/// fields the stat leaves read are named; layout must match bits/stat.h.
+const Stat = extern struct {
+    dev: u64,
+    ino: u64,
+    nlink: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    pad0: c_int,
+    rdev: u64,
+    size: i64,
+    blksize: i64,
+    blocks: i64,
+    atim: std.os.linux.timespec,
+    mtim: std.os.linux.timespec,
+    ctim: std.os.linux.timespec,
+    reserved: [3]c_long,
+};
 
 const F_GETFL: c_int = 3; // Linux
 const F_SETFL: c_int = 4; // Linux
@@ -111,16 +139,35 @@ const ReadKeyEff = struct {
     esc_wait: bool = false,
 };
 
+/// TaskReadMouse accumulator — identical shape to ReadKeyEff: SGR mouse events
+/// and a lone-ESC wait both ride the SAME shared fd0.
+const ReadMouseEff = struct {
+    buf: std.ArrayListUnmanaged(u8) = .empty,
+    esc_wait: bool = false,
+};
+
+/// TaskSleep suspends until `deadline_ms` (CLOCK_MONOTONIC).  No fd and no
+/// buffer: the poll loop bounds its timeout by the nearest deadline and
+/// flushExpiredSleeps completes expired sleeps after every poll return.
+const SleepEff = struct {
+    deadline_ms: i64 = 0,
+};
+
 const Eff = union(enum) {
     none,
     readfile: ReadFileEff,
     exec: ExecEff,
     readkey: ReadKeyEff,
+    readmouse: ReadMouseEff,
+    sleep: SleepEff,
+    winch, // SIGWINCH wait — no per-eval fd (all share HostLoop.winch_fd)
 };
 
-/// A decoded terminal key, before it is built into a host Key vector.
-const KeyVal = union(enum) {
-    char: []const u8, // UTF-8 byte sequence (borrows from the eff buffer)
+/// A decoded terminal key, before it is built into a host Key vector.  The
+/// queued form is OWNED: `char` used to borrow the eff buffer (which is
+/// deinit'd on completion), so the shared queue stores the bytes by value.
+const KeyKind = enum(u8) {
+    char,
     enter,
     tab,
     backspace,
@@ -135,15 +182,47 @@ const KeyVal = union(enum) {
     pgdn,
     ins,
     del,
-    ctrl: u8, // the single control character (0x01 -> 'a')
-    other: i64, // KeyOther Int payload
+    ctrl,
+    other,
     eof,
 };
 
-const DecodedKey = struct {
-    consumed: usize, // bytes consumed from the front of the buffer
-    key: KeyVal,
+const EventKey = struct {
+    kind: KeyKind = .other,
+    char: [4]u8 = undefined, // UTF-8 bytes for .char (at most 4)
+    char_len: usize = 0,
+    num: i64 = 0, // .ctrl single char or .other Int payload
 };
+
+/// SGR mouse action/button enums (the Runtime.elm MouseMsg ADT contract).
+const MouseAction = enum(u8) { press, release, motion, wheel };
+const MouseButton = enum(u8) { left, middle, right, none, wheel_up, wheel_down, wheel_left, wheel_right };
+
+const EventMouse = struct {
+    eof: bool = false,
+    action: MouseAction = .press,
+    button: MouseButton = .none,
+    x: i64 = 0,
+    y: i64 = 0,
+};
+
+const InputEvent = union(enum) {
+    key: EventKey,
+    mouse: EventMouse,
+};
+
+const DecodedInput = struct {
+    consumed: usize, // bytes consumed from the front of the buffer
+    event: InputEvent,
+};
+
+fn evKey(kind: KeyKind) InputEvent {
+    return .{ .key = .{ .kind = kind } };
+}
+
+fn evMouseEof() InputEvent {
+    return .{ .mouse = .{ .eof = true } };
+}
 
 const FrameKind = enum { andthen, onerror };
 
@@ -166,7 +245,7 @@ const Eval = struct {
     eff: Eff = .none,
 };
 
-const PollRole = enum { readfile, exec_out, exec_err, readkey };
+const PollRole = enum { readfile, exec_out, exec_err, readkey, winch };
 
 const Child = struct {
     pid: c_int = -1,
@@ -201,6 +280,27 @@ const HostLoop = struct {
     stdin_nonblock: bool = false,
     saved_termios: ?std.posix.termios = null,
     stdin_pending: std.ArrayListUnmanaged(u8) = .empty,
+    /// SGR mouse-tracking latch (set by leafMouseMode): true while the terminal
+    /// has 1000/1002/1003/1006 tracking armed, so cleanupAll can emit the
+    /// DECRST mouse-off reset before restoring termios (a real terminal
+    /// otherwise keeps tracking on after quit/error and spews SGR packets).
+    mouse_armed: bool = false,
+    /// Shared decoded-event queue (readKey AND readMouse both armed over fd0).
+    /// OWNED bytes — a queued KeyChar/EventKey carries its UTF-8 bytes by
+    /// value, never a borrow into an eff buffer that gets deinit'd.  A drain
+    /// parks non-matching kinds here; leafReadKey/leafReadMouse pop a matching
+    /// event first (typeahead) before touching fd0.
+    pending_events: std.ArrayListUnmanaged(InputEvent) = .empty,
+    /// Quit latch: TaskQuit sets it; the main loop breaks once the current
+    /// stepAll/completeReady round finishes (even with suspended evals still
+    /// armed — unlike nactive==0, which a re-armed readKey/mouse/resize eval
+    /// would block forever).
+    quit: bool = false,
+    /// The signalfd for SIGWINCH (lazy one-time init in leafWaitResize).  -1
+    /// until the first TaskWaitResize runs.  One shared fd for every armed
+    /// winch eval — on readiness drainWinch completes ALL of them with a fresh
+    /// TIOCGWINSZ read.
+    winch_fd: i32 = -1,
 
     const model_slot = 0;
     const update_slot = 1;
@@ -336,10 +436,26 @@ const HostLoop = struct {
                 try self.leafPrim(eval, "glob", &.{data.?[1]});
             } else if (std.mem.eql(u8, name, "TaskReadKey")) {
                 try self.leafReadKey(eval);
+            } else if (std.mem.eql(u8, name, "TaskReadMouse")) {
+                try self.leafReadMouse(eval);
+            } else if (std.mem.eql(u8, name, "TaskMouseMode")) {
+                try self.leafMouseMode(eval, data.?[1]);
             } else if (std.mem.eql(u8, name, "TaskWinSize")) {
                 try self.leafWinSize(eval);
+            } else if (std.mem.eql(u8, name, "TaskWaitResize")) {
+                try self.leafWaitResize(eval);
             } else if (std.mem.eql(u8, name, "TaskRawMode")) {
                 try self.leafRawMode(eval, data.?[1]);
+            } else if (std.mem.eql(u8, name, "TaskNow")) {
+                try self.leafNow(eval);
+            } else if (std.mem.eql(u8, name, "TaskSleep")) {
+                try self.leafSleep(eval, data.?[1]);
+            } else if (std.mem.eql(u8, name, "TaskQuit")) {
+                try self.leafQuit(eval);
+            } else if (std.mem.eql(u8, name, "TaskListDir")) {
+                try self.leafListDir(eval);
+            } else if (std.mem.eql(u8, name, "TaskStat")) {
+                try self.leafStat(eval);
             } else {
                 // Unknown Task ctor — drop the evaluation defensively.
                 self.deactivate(eval);
@@ -677,17 +793,24 @@ const HostLoop = struct {
     }
 
     // -------------------------------------------------------------
-    //  Terminal leaves (M1 tea): TaskReadKey / TaskWinSize / TaskRawMode
+    //  Terminal leaves (M1 tea + S4 mouse): TaskReadKey / TaskReadMouse /
+    //  TaskMouseMode / TaskWinSize / TaskRawMode
     // -------------------------------------------------------------
 
     /// TaskReadKey — arm a nonblocking fd0 read and try to drain a key.  If
     /// stdin has already hit EOF, complete KeyEof immediately (a poll on an
-    /// EOF'd fd busy-spins, so the latch short-circuits every re-arm).  The
-    /// fresh accumulator is seeded with any pushback bytes left over from a
-    /// multi-key read, so leftover keys decode before fd0 is polled again.
+    /// EOF'd fd busy-spins, so the latch short-circuits every re-arm).  A
+    /// queued key (decoded by an earlier drain) is popped first — typeahead.
+    /// Otherwise the fresh accumulator is seeded with any pushback bytes left
+    /// over from a multi-event read, so leftovers decode before fd0 is polled.
     fn leafReadKey(self: *HostLoop, eval: *Eval) VmError!void {
         if (self.stdin_eof) {
-            self.slots[resultSlot(eval)] = self.buildKey(.eof);
+            self.slots[resultSlot(eval)] = self.buildKey(evKey(.eof));
+            try self.completeSuccess(eval);
+            return;
+        }
+        if (self.popPending(false)) |event| {
+            self.slots[resultSlot(eval)] = self.buildKey(event);
             try self.completeSuccess(eval);
             return;
         }
@@ -700,46 +823,111 @@ const HostLoop = struct {
             eval.eff.readkey.buf.appendSlice(pa, self.stdin_pending.items) catch {};
             self.stdin_pending.clearRetainingCapacity();
         }
-        _ = try self.readKeyDrain(eval); // completes or suspends
+        _ = try self.inputDrain(eval, false); // completes or suspends
     }
 
-    /// Decode a key from the readkey accumulator, reading more bytes off fd0
-    /// as needed.  Returns true iff the evaluation COMPLETED (key built +
-    /// delivered, or KeyEof on EOF); false iff it suspended (EAGAIN or an
-    /// incomplete sequence — esc_wait is then set iff the buffer starts with
-    /// 0x1B).  On a complete key, bytes past `consumed` are pushed to
-    /// stdin_pending for the re-armed readKey — a multi-key read is never
-    /// truncated to its first key.
-    fn readKeyDrain(self: *HostLoop, eval: *Eval) VmError!bool {
-        const eff = &eval.eff.readkey;
+    /// TaskReadMouse — the mouse analogue of leafReadKey over the SAME fd0.
+    /// EOF -> MouseEof; queued mouse event -> pop first; else arm + seed the
+    /// pushback + drain.
+    fn leafReadMouse(self: *HostLoop, eval: *Eval) VmError!void {
+        if (self.stdin_eof) {
+            self.slots[resultSlot(eval)] = self.buildMouse(evMouseEof());
+            try self.completeSuccess(eval);
+            return;
+        }
+        if (self.popPending(true)) |event| {
+            self.slots[resultSlot(eval)] = self.buildMouse(event);
+            try self.completeSuccess(eval);
+            return;
+        }
+        if (!self.stdin_nonblock) {
+            setNonblocking(0);
+            self.stdin_nonblock = true;
+        }
+        eval.eff = .{ .readmouse = .{} };
+        if (self.stdin_pending.items.len > 0) {
+            eval.eff.readmouse.buf.appendSlice(pa, self.stdin_pending.items) catch {};
+            self.stdin_pending.clearRetainingCapacity();
+        }
+        _ = try self.inputDrain(eval, true); // completes or suspends
+    }
+
+    /// TaskMouseMode mode — SYNCHRONOUS.  Writes the SGR mouse-tracking
+    /// DECSET/DECRST to fd1 (the pty): Click=1006+1000, Drag=1006+1002,
+    /// AllMotion=1006+1003, Off=reset all.  `mode` is a 0-ary ctor vector
+    /// whose tag symbol names the mode.
+    fn leafMouseMode(self: *HostLoop, eval: *Eval, mode: Value) VmError!void {
+        var name: []const u8 = "";
+        if (mode.tag == .vector and mode.payload.vector.data != null and mode.payload.vector.len >= 1) {
+            const tag = mode.payload.vector.data.?[0];
+            if (tag.tag == .symbol) name = values.symSlice(tag);
+        }
+        const seq: []const u8 = if (std.mem.eql(u8, name, "Click"))
+            "\x1b[?1006h\x1b[?1000h"
+        else if (std.mem.eql(u8, name, "Drag"))
+            "\x1b[?1006h\x1b[?1002h"
+        else if (std.mem.eql(u8, name, "AllMotion"))
+            "\x1b[?1006h\x1b[?1003h"
+        else
+            MOUSE_OFF_SEQ; // Off / unknown — reset all
+        self.mouse_armed = !std.mem.eql(u8, seq, MOUSE_OFF_SEQ);
+        writeFdAll(1, seq);
+        self.slots[resultSlot(eval)] = values.valNil();
+        try self.completeSuccess(eval);
+    }
+
+    /// Decode events from the readkey/readmouse accumulator (want_mouse picks
+    /// the kind THIS eval is armed for), reading more bytes off fd0 as needed.
+    /// Events are decoded IN ORDER; a non-matching event is handed to a sibling
+    /// eval of the right kind (parked in pending_events if none is armed) and
+    /// draining continues; the first matching event completes THIS eval with
+    /// bytes past `consumed` pushed to stdin_pending.  Returns true iff this
+    /// eval COMPLETED; false iff it suspended (EAGAIN or an incomplete
+    /// sequence — esc_wait is then set iff the buffer starts with 0x1B).
+    fn inputDrain(self: *HostLoop, eval: *Eval, comptime want_mouse: bool) VmError!bool {
+        const eff = if (want_mouse) &eval.eff.readmouse else &eval.eff.readkey;
         var tmp: [256]u8 = undefined;
         while (true) {
             // Decode what is already buffered (seeded pushback included) first.
             if (eff.buf.items.len > 0) {
-                if (decodeKey(eff.buf.items)) |d| {
-                    if (d.consumed < eff.buf.items.len) {
-                        self.stdin_pending.appendSlice(pa, eff.buf.items[d.consumed..]) catch {};
+                if (decodeInput(eff.buf.items)) |d| {
+                    const is_mouse = switch (d.event) {
+                        .mouse => true,
+                        .key => false,
+                    };
+                    if (is_mouse == want_mouse) {
+                        if (d.consumed < eff.buf.items.len) {
+                            self.stdin_pending.appendSlice(pa, eff.buf.items[d.consumed..]) catch {};
+                        }
+                        try self.inputComplete(eval, d.event);
+                        return true;
                     }
-                    try self.readKeyComplete(eval, d.key);
-                    return true;
+                    // Non-matching kind: drop the consumed bytes from the front
+                    // of the buffer, route the event to a matching sibling eval
+                    // (or park it), and keep draining.
+                    const rest = eff.buf.items[d.consumed..];
+                    std.mem.copyForwards(u8, eff.buf.items[0..rest.len], rest);
+                    eff.buf.items.len = rest.len;
+                    try self.deliverInputEvent(d.event);
+                    continue;
                 }
             }
             const n = std.posix.read(0, &tmp) catch |e| {
                 if (e == error.WouldBlock) {
-                    // No complete key and no more bytes — suspend (esc_wait iff
-                    // an ESC/CSI is being assembled).
+                    // No complete event and no more bytes — suspend (esc_wait
+                    // iff an ESC/CSI is being assembled).
                     eff.esc_wait = eff.buf.items.len > 0 and eff.buf.items[0] == 0x1B;
                     return false;
                 }
                 // EIO / other read error — the pty master went away: EOF.
                 self.stdin_eof = true;
-                try self.readKeyComplete(eval, .eof);
+                try self.inputComplete(eval, if (want_mouse) evMouseEof() else evKey(.eof));
                 try self.flushEof();
                 return true;
             };
             if (n == 0) {
                 self.stdin_eof = true;
-                try self.readKeyComplete(eval, .eof);
+                try self.inputComplete(eval, if (want_mouse) evMouseEof() else evKey(.eof));
                 try self.flushEof();
                 return true;
             }
@@ -748,47 +936,159 @@ const HostLoop = struct {
         }
     }
 
-    /// stdin EOF just latched: every OTHER suspended readkey eval would be
-    /// skipped by rebuildPollfds (the !stdin_eof guard) and never complete, so
-    /// complete them all with KeyEof now (mirrors flushEscWaits).
+    /// Hand a decoded event to the first ARMED eval of the matching kind
+    /// (readkey for a key, readmouse for a mouse); park it in pending_events if
+    /// none is armed.  The queue stores OWNED bytes, so the event is safe
+    /// after any eff buffer deinit.
+    fn deliverInputEvent(self: *HostLoop, event: InputEvent) VmError!void {
+        const is_mouse = switch (event) {
+            .mouse => true,
+            .key => false,
+        };
+        var i: usize = 0;
+        while (i < self.nevals) : (i += 1) {
+            const eval = &self.evals[i];
+            if (!eval.active) continue;
+            if (is_mouse) {
+                if (eval.eff == .readmouse) {
+                    try self.inputComplete(eval, event);
+                    return;
+                }
+            } else if (eval.eff == .readkey) {
+                try self.inputComplete(eval, event);
+                return;
+            }
+        }
+        self.pending_events.append(pa, event) catch {};
+    }
+
+    /// Pop the first queued event of the given kind (typeahead), in order.
+    fn popPending(self: *HostLoop, want_mouse: bool) ?InputEvent {
+        var i: usize = 0;
+        while (i < self.pending_events.items.len) : (i += 1) {
+            const ev = self.pending_events.items[i];
+            const is_mouse = switch (ev) {
+                .mouse => true,
+                .key => false,
+            };
+            if (is_mouse == want_mouse) {
+                _ = self.pending_events.orderedRemove(i);
+                return ev;
+            }
+        }
+        return null;
+    }
+
+    /// stdin EOF just latched: every OTHER suspended readkey/readmouse eval
+    /// would be skipped by rebuildPollfds (the !stdin_eof guard) and never
+    /// complete, so complete them all now — readkey -> KeyEof, readmouse ->
+    /// MouseEof (mirrors flushEscWaits).
     fn flushEof(self: *HostLoop) VmError!void {
         var i: usize = 0;
         while (i < self.nevals) : (i += 1) {
             const eval = &self.evals[i];
-            if (!eval.active or eval.eff != .readkey) continue;
-            try self.readKeyComplete(eval, .eof);
+            if (!eval.active) continue;
+            if (eval.eff == .readkey) {
+                try self.inputComplete(eval, evKey(.eof));
+            } else if (eval.eff == .readmouse) {
+                try self.inputComplete(eval, evMouseEof());
+            }
         }
     }
 
-    /// Build the Key vector, free the accumulator, clear the effect, and
-    /// deliver.  buildKey is the only GC allocation — the buffer free + plain
-    /// stores after it never trigger GC, so the returned value stays valid
-    /// until it lands in the permanently-rooted result slot (execComplete
-    /// rooting discipline).
-    fn readKeyComplete(self: *HostLoop, eval: *Eval, key: KeyVal) VmError!void {
-        const keyv = self.buildKey(key);
-        eval.eff.readkey.buf.deinit(pa);
+    /// Feed parked stdin_pending bytes into an ALREADY-ARMED stdin eval whose
+    /// accumulator is empty, and decode them directly (inputDrain decodes the
+    /// seeded buffer first, before polling fd0).  Without this, leftover raw
+    /// bytes parked by a sibling drain are invisible to an armed empty-buf
+    /// eval: it polls fd0, which will not re-fire for already-consumed bytes,
+    /// so the parked (older) bytes get bypassed by newer input or the reader
+    /// hangs with bytes available.  Each inputDrain call consumes >= 1 byte or
+    /// parks a strictly shorter tail, so the loop makes progress and cannot
+    /// livelock; a partial sequence that still needs more bytes suspends in the
+    /// eval's own buffer (esc_wait) and the pending queue is then empty.
+    fn drainPendingStdin(self: *HostLoop) VmError!void {
+        while (self.stdin_pending.items.len > 0) {
+            var target: ?*Eval = null;
+            var i: usize = 0;
+            while (i < self.nevals) : (i += 1) {
+                const eval = &self.evals[i];
+                if (!eval.active) continue;
+                if (eval.eff == .readkey and eval.eff.readkey.buf.items.len == 0) {
+                    target = eval;
+                    break;
+                }
+                if (eval.eff == .readmouse and eval.eff.readmouse.buf.items.len == 0) {
+                    target = eval;
+                    break;
+                }
+            }
+            const eval = target orelse return; // no armed empty-buf stdin eval
+            if (eval.eff == .readkey) {
+                eval.eff.readkey.buf.appendSlice(pa, self.stdin_pending.items) catch return;
+                self.stdin_pending.clearRetainingCapacity();
+                _ = try self.inputDrain(eval, false);
+            } else {
+                eval.eff.readmouse.buf.appendSlice(pa, self.stdin_pending.items) catch return;
+                self.stdin_pending.clearRetainingCapacity();
+                _ = try self.inputDrain(eval, true);
+            }
+        }
+    }
+
+    /// Build the Key/MouseMsg value, free the accumulator, clear the effect,
+    /// and deliver.  buildKey/buildMouse are the only GC allocations — the
+    /// buffer free + plain stores after them never trigger GC, so the returned
+    /// value stays valid until it lands in the permanently-rooted result slot
+    /// (execComplete rooting discipline).
+    fn inputComplete(self: *HostLoop, eval: *Eval, event: InputEvent) VmError!void {
+        const is_mouse = eval.eff == .readmouse;
+        const v = if (is_mouse) self.buildMouse(event) else self.buildKey(event);
+        if (is_mouse) {
+            eval.eff.readmouse.buf.deinit(pa);
+        } else {
+            eval.eff.readkey.buf.deinit(pa);
+        }
         eval.eff = .none;
-        self.slots[resultSlot(eval)] = keyv;
+        self.slots[resultSlot(eval)] = v;
         try self.completeSuccess(eval);
     }
 
-    /// TaskWinSize — SYNCHRONOUS ioctl TIOCGWINSZ (fd0, falling back to fd1,
-    /// else 0x0), completing with the (cols, rows) tuple = cons(col, row).
+    /// TaskWinSize — SYNCHRONOUS ioctl TIOCGWINSZ, completing with the
+    /// (cols, rows) tuple = cons(col, row).
     fn leafWinSize(self: *HostLoop, eval: *Eval) VmError!void {
-        var ws: std.posix.winsize = undefined;
-        var cols: i64 = 0;
-        var rows: i64 = 0;
-        if (ioctl(0, std.posix.T.IOCGWINSZ, &ws) == 0) {
-            cols = ws.col;
-            rows = ws.row;
-        } else if (ioctl(1, std.posix.T.IOCGWINSZ, &ws) == 0) {
-            cols = ws.col;
-            rows = ws.row;
-        }
-        const tuple = values.valCons(self.g, values.valNumber(cols), values.valNumber(rows));
+        const sz = readWinSize();
+        const tuple = values.valCons(self.g, values.valNumber(sz.cols), values.valNumber(sz.rows));
         self.slots[resultSlot(eval)] = tuple;
         try self.completeSuccess(eval);
+    }
+
+    /// TaskWaitResize — SUSPENDING signalfd wait.  Lazy one-time init: block
+    /// SIGWINCH (so the signal queues into the signalfd instead of firing the
+    /// default disposition) and create a shared SFD_CLOEXEC signalfd.  Every
+    /// armed winch eval shares that one fd; drainWinch completes them all with
+    /// a fresh TIOCGWINSZ read.  A signalfd failure falls back to the
+    /// synchronous winSize probe so the app still gets a size (no hang).
+    fn leafWaitResize(self: *HostLoop, eval: *Eval) VmError!void {
+        if (self.winch_fd < 0) {
+            var mask = sigwinchMask();
+            // BLOCK before signalfd: a resize between the two syscalls is
+            // queued as pending once blocked, then reported by the signalfd.
+            std.posix.sigprocmask(std.posix.SIG.BLOCK, &mask, null);
+            const fd = std.posix.signalfd(-1, &mask, std.os.linux.SFD.CLOEXEC) catch -1;
+            if (fd < 0) {
+                // Restore the default disposition on failure, then fall back.
+                std.posix.sigprocmask(std.posix.SIG.UNBLOCK, &mask, null);
+            }
+            self.winch_fd = fd;
+        }
+        if (self.winch_fd < 0) {
+            const sz = readWinSize();
+            const tuple = values.valCons(self.g, values.valNumber(sz.cols), values.valNumber(sz.rows));
+            self.slots[resultSlot(eval)] = tuple;
+            try self.completeSuccess(eval);
+            return;
+        }
+        eval.eff = .winch;
     }
 
     /// TaskRawMode Bool — SYNCHRONOUS.  ON: save termios once, clear
@@ -824,18 +1124,218 @@ const HostLoop = struct {
         try self.completeSuccess(eval);
     }
 
+    // -------------------------------------------------------------
+    //  Time + quit leaves (M-FOUNDATION): TaskNow / TaskSleep / TaskQuit
+    // -------------------------------------------------------------
+
+    /// TaskNow — SYNCHRONOUS monotonic clock read (CLOCK_MONOTONIC).  The VM's
+    /// get-time prim is CLOCK_REALTIME (wall clock — jumps break timers), so
+    /// the host reads the monotonic clock directly and completes with ms.
+    fn leafNow(self: *HostLoop, eval: *Eval) VmError!void {
+        self.slots[resultSlot(eval)] = values.valNumber(nowMs());
+        try self.completeSuccess(eval);
+    }
+
+    /// TaskSleep ms — SUSPENDING: record an absolute monotonic deadline.  The
+    /// poll timeout is bounded by the nearest deadline (see pollTimeout) and
+    /// flushExpiredSleeps completes expired sleeps after every poll return.
+    fn leafSleep(self: *HostLoop, eval: *Eval, ms: Value) VmError!void {
+        _ = self;
+        const dur = ms.payload.number;
+        eval.eff = .{ .sleep = .{ .deadline_ms = nowMs() + dur } };
+    }
+
+    fn sleepComplete(self: *HostLoop, eval: *Eval) VmError!void {
+        eval.eff = .none;
+        self.slots[resultSlot(eval)] = values.valNil();
+        try self.completeSuccess(eval);
+    }
+
+    /// TaskQuit — set the quit latch; the main loop breaks after the current
+    /// step.  The evaluation is deactivated (no deliver): quitting means exit
+    /// with the model as-is, not a normal message round-trip.
+    fn leafQuit(self: *HostLoop, eval: *Eval) VmError!void {
+        self.quit = true;
+        self.deactivate(eval);
+    }
+
+    // -------------------------------------------------------------
+    //  Dir + stat leaves (M-FOUNDATION): TaskListDir / TaskStat
+    // -------------------------------------------------------------
+
+    /// TaskListDir path — SYNCHRONOUS directory listing.  openat(O_DIRECTORY)
+    /// + getdents64 (raw fs order — NOT sorted; sorting is app-side, Go's
+    /// os.ReadDir sorts but the filepicker wants insertion order anyway);
+    /// '.'/'..' are skipped (Go os.ReadDir parity).  isDir comes from the
+    /// dirent d_type (DT_UNKNOWN falls back to fstatat — symlinked dirs are
+    /// NOT dirs, matching Go DirEntry.IsDir).  A failed open completes []
+    /// (leafReadFile's empty-string parity).  Entries are drained into
+    /// page_allocator storage first, the fd closed, and the Elm list built
+    /// right-to-left afterwards — so no GC allocation happens while the fd is
+    /// open and every cons cell is rooted per the execComplete discipline.
+    fn leafListDir(self: *HostLoop, eval: *Eval) VmError!void {
+        const path = self.slots[eval.base].payload.vector.data.?[1];
+        var entries = std.ArrayListUnmanaged(DirEntryHost).empty;
+        defer {
+            for (entries.items) |e| pa.free(e.name);
+            entries.deinit(pa);
+        }
+        const fd = std.posix.openat(
+            std.posix.AT.FDCWD,
+            values.strSlice(path),
+            .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true },
+            0,
+        ) catch {
+            return self.listDirComplete(eval, entries.items);
+        };
+        defer _ = close(fd);
+        var buf: [4096]u8 align(8) = undefined;
+        drain: while (true) {
+            const nread = std.os.linux.getdents64(fd, &buf, buf.len);
+            if (std.os.linux.errno(nread) != .SUCCESS) break :drain; // read error: deliver what we have
+            if (nread == 0) break :drain; // end of directory
+            var off: usize = 0;
+            while (off < nread) {
+                const d: *std.os.linux.dirent64 = @alignCast(@ptrCast(&buf[off]));
+                const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&d.name)), 0);
+                const dot = name.len == 1 and name[0] == '.';
+                const dotdot = name.len == 2 and name[0] == '.' and name[1] == '.';
+                if (!dot and !dotdot) {
+                    const is_dir = if (d.type == std.os.linux.DT.UNKNOWN)
+                        dirEntryIsDir(fd, name)
+                    else
+                        d.type == std.os.linux.DT.DIR;
+                    const copy = pa.dupe(u8, name) catch break :drain; // OOM
+                    entries.append(pa, .{ .name = copy, .is_dir = is_dir }) catch {
+                        pa.free(copy);
+                        break :drain; // OOM: deliver the entries collected so far
+                    };
+                }
+                off += d.reclen;
+            }
+        }
+        try self.listDirComplete(eval, entries.items);
+    }
+
+    /// Drain results: build the Elm List of {name,isDir} records right-to-left
+    /// (each new record consed onto the rooted tail), then completeSuccess.
+    fn listDirComplete(self: *HostLoop, eval: *Eval, entries: []const DirEntryHost) VmError!void {
+        var acc_r = values.valNil();
+        self.g.rootPushValue(&acc_r);
+        defer self.g.rootPop();
+        var i = entries.len;
+        while (i > 0) {
+            i -= 1;
+            acc_r = try self.dirRecord(entries[i].name, entries[i].is_dir, acc_r);
+        }
+        self.slots[resultSlot(eval)] = acc_r;
+        try self.completeSuccess(eval);
+    }
+
+    /// Build one {name,isDir} record pair-consed onto `tail`, every
+    /// intermediate rooted (execComplete discipline).  Field pairs are
+    /// cons(name, val) (@p) and the record spine is cons-first-field — the
+    /// compiler's record layout (Lower/Expr.recordExpr: field j of the source
+    /// sits at depth j; assoc access is first-match anyway).
+    fn dirRecord(self: *HostLoop, name: []const u8, is_dir: bool, tail: Value) VmError!Value {
+        const g = self.g;
+        var tail_r = tail;
+        g.rootPushValue(&tail_r);
+        defer g.rootPop();
+        const name_v = values.valString(g, name);
+        var name_r = name_v;
+        g.rootPushValue(&name_r);
+        defer g.rootPop();
+        const name_sym = symbols.valSymbol(&self.vm.symbols, "name");
+        const pair_name = try self.runPrim("@p", &.{ name_sym, name_r });
+        var pname_r = pair_name;
+        g.rootPushValue(&pname_r);
+        defer g.rootPop();
+        const isdir_sym = symbols.valSymbol(&self.vm.symbols, "isDir");
+        const pair_isdir = try self.runPrim("@p", &.{ isdir_sym, values.valBoolean(is_dir) });
+        var pdir_r = pair_isdir;
+        g.rootPushValue(&pdir_r);
+        defer g.rootPop();
+        // The RECORD spine ends at nil here — the list tail is only consed
+        // onto the OUTSIDE of the finished record below (threading tail_r
+        // into this cons would bury the rest of the list inside the isDir
+        // pair, making assoc/isDir read the tail instead of the bool).
+        const inner = values.valCons(g, pdir_r, values.valNil());
+        var inner_r = inner;
+        g.rootPushValue(&inner_r);
+        defer g.rootPop();
+        const rec = values.valCons(g, pname_r, inner_r);
+        var rec_r = rec;
+        g.rootPushValue(&rec_r);
+        defer g.rootPop();
+        return values.valCons(g, rec_r, tail_r);
+    }
+
+    /// TaskStat path — SYNCHRONOUS fstatat(AT_FDCWD) following symlinks (Go
+    /// os.Stat parity).  Completes with {size, mode, mtimeMs, isDir, isFile};
+    /// mtimeMs = st_mtim sec*1000 + nsec/1e6, isDir/isFile are the S_IFMT
+    /// type bits.  A failed stat (ENOENT ...) completes the ZERO record —
+    /// the same shape as the sync runTask no-op (pinned by statunit).
+    fn leafStat(self: *HostLoop, eval: *Eval) VmError!void {
+        const path = self.slots[eval.base].payload.vector.data.?[1];
+        var st: Stat = undefined;
+        var ok = false;
+        if (std.posix.toPosixPath(values.strSlice(path))) |pathz| {
+            ok = fstatat(std.posix.AT.FDCWD, &pathz, &st, 0) == 0;
+        } else |_| {}
+        const size: i64 = if (ok) @intCast(st.size) else 0;
+        const mode: i64 = if (ok) @intCast(st.mode) else 0;
+        const mtime_ms: i64 = if (ok)
+            @as(i64, @intCast(st.mtim.sec)) * 1000 + @divTrunc(@as(i64, @intCast(st.mtim.nsec)), 1_000_000)
+        else
+            0;
+        const type_bits: u32 = if (ok) st.mode & std.posix.S.IFMT else 0;
+        const is_dir = type_bits == std.posix.S.IFDIR;
+        const is_file = type_bits == std.posix.S.IFREG;
+        self.slots[resultSlot(eval)] = try self.statRecord(size, mode, mtime_ms, is_dir, is_file);
+        try self.completeSuccess(eval);
+    }
+
+    /// Build the {size,mode,mtimeMs,isDir,isFile} record right-to-left (field
+    /// j of the source at depth j).  All field values are immediates, so the
+    /// only GC allocations are the rooted pair + spine conses.
+    fn statRecord(self: *HostLoop, size: i64, mode: i64, mtime_ms: i64, is_dir: bool, is_file: bool) VmError!Value {
+        const g = self.g;
+        const Field = struct { sym: []const u8, val: Value };
+        const fields = [_]Field{
+            .{ .sym = "isFile", .val = values.valBoolean(is_file) },
+            .{ .sym = "isDir", .val = values.valBoolean(is_dir) },
+            .{ .sym = "mtimeMs", .val = values.valNumber(mtime_ms) },
+            .{ .sym = "mode", .val = values.valNumber(mode) },
+            .{ .sym = "size", .val = values.valNumber(size) },
+        };
+        var acc_r = values.valNil();
+        g.rootPushValue(&acc_r);
+        defer g.rootPop();
+        for (fields) |f| {
+            const sym = symbols.valSymbol(&self.vm.symbols, f.sym);
+            const pair = try self.runPrim("@p", &.{ sym, f.val });
+            var pair_r = pair;
+            g.rootPushValue(&pair_r);
+            defer g.rootPop();
+            acc_r = values.valCons(g, pair_r, acc_r);
+        }
+        return acc_r;
+    }
+
     /// Build a host Key vector (bare ctor name + args in ctor order) rooted
     /// per execComplete: arg built + rooted first, then the vector, then plain
     /// stores (no GC alloc after the vector).  Tag compare is by name
     /// (primEq), so the bare ctor spelling is the only contract.
-    fn buildKey(self: *HostLoop, key: KeyVal) Value {
-        switch (key) {
-            .char => |s| return self.buildKeyArg("KeyChar", values.valString(self.g, s)),
-            .ctrl => |c| {
-                var cb = [1]u8{c};
+    fn buildKey(self: *HostLoop, event: InputEvent) Value {
+        const ek = event.key;
+        switch (ek.kind) {
+            .char => return self.buildKeyArg("KeyChar", values.valString(self.g, ek.char[0..ek.char_len])),
+            .ctrl => {
+                var cb = [1]u8{@intCast(ek.num)};
                 return self.buildKeyArg("KeyCtrl", values.valString(self.g, &cb));
             },
-            .other => |n| return self.buildKeyArg("KeyOther", values.valNumber(n)),
+            .other => return self.buildKeyArg("KeyOther", values.valNumber(ek.num)),
             .enter => return self.buildKey0("KeyEnter"),
             .tab => return self.buildKey0("KeyTab"),
             .backspace => return self.buildKey0("KeyBackspace"),
@@ -854,6 +1354,31 @@ const HostLoop = struct {
         }
     }
 
+    /// Build the host MouseMsg vector (bare ctor "MouseMsg" + action/button
+    /// 0-ary ctor vectors + x/y) or "MouseEof" for EOF.  The action/button
+    /// vectors are GC-allocated, so each is rooted BEFORE the next allocation
+    /// (numbers/symbols are immediate / non-GC).
+    fn buildMouse(self: *HostLoop, event: InputEvent) Value {
+        const m = event.mouse;
+        if (m.eof) return self.buildKey0("MouseEof");
+        const action = self.buildKey0(mouseActionName(m.action));
+        var a = action;
+        self.g.rootPushValue(&a);
+        defer self.g.rootPop();
+        const button = self.buildKey0(mouseButtonName(m.button));
+        var b = button;
+        self.g.rootPushValue(&b);
+        defer self.g.rootPop();
+        const v = values.valVector(self.g, 5);
+        const d = v.payload.vector.data.?;
+        d[0] = symbols.valSymbol(&self.vm.symbols, "MouseMsg");
+        d[1] = a;
+        d[2] = b;
+        d[3] = values.valNumber(m.x);
+        d[4] = values.valNumber(m.y);
+        return v;
+    }
+
     fn buildKeyArg(self: *HostLoop, name: []const u8, arg: Value) Value {
         var a = arg;
         self.g.rootPushValue(&a);
@@ -870,28 +1395,88 @@ const HostLoop = struct {
         return v;
     }
 
-    /// True iff any active readkey eval is in lone-ESC wait — drives the 50ms
-    /// poll timeout instead of blocking forever on an unconfirmed ESC.
+    /// True iff any active readkey/readmouse eval is in lone-ESC wait — drives
+    /// the 50ms poll timeout instead of blocking forever on an unconfirmed ESC.
     fn anyEscWait(self: *HostLoop) bool {
         var i: usize = 0;
         while (i < self.nevals) : (i += 1) {
             const eval = &self.evals[i];
-            if (eval.active and eval.eff == .readkey and eval.eff.readkey.esc_wait) return true;
+            if (!eval.active) continue;
+            if (eval.eff == .readkey and eval.eff.readkey.esc_wait) return true;
+            if (eval.eff == .readmouse and eval.eff.readmouse.esc_wait) return true;
         }
         return false;
     }
 
-    /// Poll timed out: every readkey eval waiting on a possible lone ESC is
-    /// now confirmed ESC (no CSI bytes followed within the deadline) — flush
-    /// them all to KeyEsc (bubbletea's deadline approach).
+    /// Poll timed out: every eval waiting on a possible lone ESC is now
+    /// confirmed ESC (no CSI bytes followed within the deadline).  A readkey
+    /// eval flushes to KeyEsc; a readmouse eval's lone ESC is a KEY, so it is
+    /// handed to an armed readkey eval (or parked) and the mouse eval keeps
+    /// waiting (bubbletea's deadline approach).
     fn flushEscWaits(self: *HostLoop) VmError!void {
         var i: usize = 0;
         while (i < self.nevals) : (i += 1) {
             const eval = &self.evals[i];
-            if (!eval.active or eval.eff != .readkey) continue;
-            if (eval.eff.readkey.esc_wait) {
-                try self.readKeyComplete(eval, .esc);
+            if (!eval.active) continue;
+            if (eval.eff == .readkey and eval.eff.readkey.esc_wait) {
+                try self.inputComplete(eval, evKey(.esc));
+            } else if (eval.eff == .readmouse and eval.eff.readmouse.esc_wait) {
+                eval.eff.readmouse.buf.clearRetainingCapacity();
+                eval.eff.readmouse.esc_wait = false;
+                try self.deliverInputEvent(evKey(.esc));
             }
+        }
+    }
+
+    /// The earliest pending sleep deadline (monotonic ms), or null if none.
+    fn nearestSleepDeadline(self: *HostLoop) ?i64 {
+        var best: ?i64 = null;
+        var i: usize = 0;
+        while (i < self.nevals) : (i += 1) {
+            const eval = &self.evals[i];
+            if (!eval.active or eval.eff != .sleep) continue;
+            const d = eval.eff.sleep.deadline_ms;
+            if (best == null or d < best.?) best = d;
+        }
+        return best;
+    }
+
+    /// Poll timeout: the existing 50ms lone-ESC bound, tightened by the nearest
+    /// pending sleep deadline (so a sleeping eval wakes the poll instead of
+    /// blocking past it).  -1 = block indefinitely (no esc_wait, no sleep).
+    fn pollTimeout(self: *HostLoop) i32 {
+        var t: i32 = if (self.anyEscWait()) 50 else -1;
+        if (self.nearestSleepDeadline()) |deadline| {
+            const remain = deadline - nowMs();
+            const rem: i32 = if (remain <= 0)
+                0
+            else
+                @intCast(@min(remain, @as(i64, std.math.maxInt(i32))));
+            t = if (t < 0) rem else @min(t, rem);
+        }
+        return t;
+    }
+
+    /// Complete every expired sleep in deadline order (earliest first).  Each
+    /// completion may deliver + spawn new evals, so re-scan from scratch after
+    /// each — a freshly spawned sleep's deadline is now+ms (future), so it
+    /// cannot make this loop livelock.
+    fn flushExpiredSleeps(self: *HostLoop) VmError!void {
+        const now = nowMs();
+        while (true) {
+            var best: ?*Eval = null;
+            var i: usize = 0;
+            while (i < self.nevals) : (i += 1) {
+                const eval = &self.evals[i];
+                if (!eval.active or eval.eff != .sleep) continue;
+                if (eval.eff.sleep.deadline_ms > now) continue;
+                if (best == null or eval.eff.sleep.deadline_ms < best.?.eff.sleep.deadline_ms) {
+                    best = eval;
+                }
+            }
+            if (best) |eval| {
+                try self.sleepComplete(eval);
+            } else return;
         }
     }
 
@@ -934,6 +1519,9 @@ const HostLoop = struct {
                     if (eval.eff.exec.errfd >= 0) self.addPoll(i, eval.eff.exec.errfd, .exec_err);
                 },
                 .readkey => if (!self.stdin_eof) self.addPoll(i, 0, .readkey),
+                .readmouse => if (!self.stdin_eof) self.addPoll(i, 0, .readkey),
+                .sleep => {},
+                .winch => if (self.winch_fd >= 0) self.addPoll(i, self.winch_fd, .winch),
             }
         }
     }
@@ -1011,6 +1599,19 @@ const HostLoop = struct {
 
     fn drainReady(self: *HostLoop) VmError!void {
         const n = self.npoll;
+        // Winch is a SHARED fd with complete-ALL semantics (one SIGWINCH wakes
+        // every armed winch eval) — drain it once up front, before the per-eval
+        // scan, so the siginfo is read exactly once per poll wake.
+        var winch_ready = false;
+        var wi: usize = 0;
+        while (wi < n) : (wi += 1) {
+            if (self.poll_role[wi] == .winch and self.pollfds[wi].revents != 0) {
+                winch_ready = true;
+                break;
+            }
+        }
+        if (winch_ready) try self.drainWinch();
+
         var i: usize = 0;
         while (i < n) : (i += 1) {
             if (self.pollfds[i].revents == 0) continue;
@@ -1025,11 +1626,44 @@ const HostLoop = struct {
                 .exec_out => try execDrainOut(eval),
                 .exec_err => try execDrainErr(eval),
                 .readkey => {
-                    // May have been flushed by a poll timeout before this scan.
-                    if (eval.eff != .readkey) continue;
-                    _ = try self.readKeyDrain(eval);
+                    // May have been flushed by a poll timeout/EOF before this
+                    // scan — drain whichever stdin-eff variant is still armed.
+                    switch (eval.eff) {
+                        .readkey => _ = try self.inputDrain(eval, false),
+                        .readmouse => _ = try self.inputDrain(eval, true),
+                        else => {},
+                    }
                 },
+                .winch => {}, // handled by drainWinch above
             }
+        }
+    }
+
+    /// One SIGWINCH arrived on the shared signalfd: drain one siginfo, read the
+    /// fresh size, and complete EVERY armed winch eval with it.  Each
+    /// completion may deliver + spawn a re-arm eval (which is .none until the
+    /// next stepAll), so rescan per completion like flushExpiredSleeps.
+    fn drainWinch(self: *HostLoop) VmError!void {
+        var si: std.os.linux.signalfd_siginfo = undefined;
+        _ = std.posix.read(self.winch_fd, std.mem.asBytes(&si)) catch {};
+        const sz = readWinSize();
+        var tuple = values.valCons(self.g, values.valNumber(sz.cols), values.valNumber(sz.rows));
+        self.g.rootPushValue(&tuple);
+        defer self.g.rootPop();
+        while (true) {
+            var found = false;
+            var i: usize = 0;
+            while (i < self.nevals) : (i += 1) {
+                const eval = &self.evals[i];
+                if (eval.active and eval.eff == .winch) {
+                    eval.eff = .none;
+                    self.slots[resultSlot(eval)] = tuple;
+                    try self.completeSuccess(eval);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return;
         }
     }
 
@@ -1049,6 +1683,14 @@ const HostLoop = struct {
     /// Close/free every pending effect (error-exit cleanup): no zombies, no
     /// leaked fds/buffers.  No GC allocation — safe to run under any root set.
     fn cleanupAll(self: *HostLoop) void {
+        // Mouse-off DECRST BEFORE the termios restore: once termios is back to
+        // canonical echo the terminal re-reads the keyboard normally, but SGR
+        // tracking modes are independent termios state — without the reset a
+        // real terminal keeps reporting clicks as raw SGR packets after exit.
+        if (self.mouse_armed) {
+            writeFdAll(1, MOUSE_OFF_SEQ);
+            self.mouse_armed = false;
+        }
         // Restore the saved termios on ANY exit path (raw mode must not leak
         // past an error).
         if (self.saved_termios) |saved| {
@@ -1056,6 +1698,7 @@ const HostLoop = struct {
             self.saved_termios = null;
         }
         self.stdin_pending.deinit(pa);
+        self.pending_events.deinit(pa);
         var i: usize = 0;
         while (i < self.nevals) : (i += 1) {
             const eval = &self.evals[i];
@@ -1078,7 +1721,23 @@ const HostLoop = struct {
                     eval.eff.readkey.buf.deinit(pa);
                     eval.eff = .none;
                 },
+                .readmouse => {
+                    eval.eff.readmouse.buf.deinit(pa);
+                    eval.eff = .none;
+                },
+                .sleep => {
+                    // No fd or buffer to free — just drop the pending sleep.
+                    eval.eff = .none;
+                },
+                .winch => {
+                    // No per-eval fd/buffer — the shared signalfd is closed below.
+                    eval.eff = .none;
+                },
             }
+        }
+        if (self.winch_fd >= 0) {
+            _ = close(self.winch_fd);
+            self.winch_fd = -1;
         }
         for (self.children[0..self.nchildren]) |*c| {
             if (c.pid < 0) continue;
@@ -1120,11 +1779,16 @@ pub fn runProgram(vm: *Vm, prog: Value) VmError!Value {
     loop.slots[HostLoop.update_slot] = data[3]; // updateFn
     loop.spawnFromCmd(data[2]); // cmd0
 
-    while (loop.nactive > 0) {
+    while (loop.nactive > 0 and !loop.quit) {
         try loop.stepAll();
+        if (loop.quit) break;
         if (loop.nactive == 0) break;
         loop.reapChildren();
         try loop.completeReady();
+        // Parked bytes from a previous drain must reach an already-armed
+        // stdin eval (and its continuation spawns must be stepped) before
+        // the poll — otherwise an empty-buf reader hangs on a silent fd0.
+        try loop.drainPendingStdin();
         if (loop.nactive == 0) break;
         // M9 fix: completeReady applies exec continuations and deliver() can
         // spawn into slots stepAll's cursor already passed, leaving PURE
@@ -1133,8 +1797,10 @@ pub fn runProgram(vm: *Vm, prog: Value) VmError!Value {
         // silently drops their messages (fast execs, pure cmd spawns).
         while (loop.hasRunnable()) {
             try loop.stepAll();
+            if (loop.quit) break;
             try loop.completeReady();
         }
+        if (loop.quit) break;
         if (loop.nactive == 0) break;
         loop.rebuildPollfds();
         if (loop.npoll == 0) {
@@ -1149,13 +1815,17 @@ pub fn runProgram(vm: *Vm, prog: Value) VmError!Value {
                 try loop.completeReady();
                 continue;
             }
-            std.debug.print("effectloop: pending effect with no pollable fd\n", .{});
-            break;
+            // Only pending sleeps remain: fall through to poll with an empty
+            // fd set — poll(2) with nfds=0 + a timeout is a bounded sleep.
+            if (loop.nearestSleepDeadline() == null) {
+                std.debug.print("effectloop: pending effect with no pollable fd\n", .{});
+                break;
+            }
         }
         // A readkey eval in lone-ESC wait needs a bounded poll (50ms) so an
-        // unconfirmed ESC flushes to KeyEsc; otherwise block until an fd is
-        // ready.
-        const poll_timeout: i32 = if (loop.anyEscWait()) 50 else -1;
+        // unconfirmed ESC flushes to KeyEsc; a pending sleep tightens that to
+        // its nearest deadline; otherwise block until an fd is ready.
+        const poll_timeout: i32 = loop.pollTimeout();
         const poll_rc = std.posix.poll(loop.pollfds[0..loop.npoll], poll_timeout) catch |e| switch (e) {
             error.NetworkDown, error.SystemResources => return error.ShenError,
             error.Unexpected => 0, // spurious — flush esc_waits like a timeout
@@ -1166,6 +1836,7 @@ pub fn runProgram(vm: *Vm, prog: Value) VmError!Value {
         loop.reapChildren();
         try loop.drainReady();
         try loop.completeReady();
+        try loop.flushExpiredSleeps();
     }
 
     return loop.slots[HostLoop.model_slot];
@@ -1179,6 +1850,12 @@ pub fn runProgram(vm: *Vm, prog: Value) VmError!Value {
 /// stdout/stderr, run a builtin in-process or execvp.  Never returns; only
 /// write(2) + libc + _exit (no GC, no Zig error paths).
 fn execChild(argv: [:null]const ?[*:0]const u8, outpipe: [2]c_int, errpipe: [2]c_int) noreturn {
+    // The host BLOCKs SIGWINCH for its signalfd; exec PRESERVES the blocked
+    // mask, so unblock it here or the exec'd child (a shell, a pager) loses
+    // its own SIGWINCH handling.  libc-only (async-signal-safe), no GC.
+    var winch_mask = sigwinchMask();
+    std.posix.sigprocmask(std.posix.SIG.UNBLOCK, &winch_mask, null);
+
     _ = close(outpipe[0]);
     _ = close(errpipe[0]);
     _ = dup2(outpipe[1], 1);
@@ -1225,13 +1902,68 @@ fn taskArity(name: []const u8) ?i32 {
         std.mem.eql(u8, name, "TaskWrite") or std.mem.eql(u8, name, "TaskReadFile") or
         std.mem.eql(u8, name, "TaskExec") or std.mem.eql(u8, name, "TaskGetenv") or
         std.mem.eql(u8, name, "TaskCd") or std.mem.eql(u8, name, "TaskGlob") or
-        std.mem.eql(u8, name, "TaskRawMode")) return 1;
+        std.mem.eql(u8, name, "TaskRawMode") or std.mem.eql(u8, name, "TaskSleep") or
+        std.mem.eql(u8, name, "TaskMouseMode") or
+        std.mem.eql(u8, name, "TaskListDir") or std.mem.eql(u8, name, "TaskStat")) return 1;
     if (std.mem.eql(u8, name, "TaskAndThen") or std.mem.eql(u8, name, "TaskOnError") or
         std.mem.eql(u8, name, "TaskWriteFile") or std.mem.eql(u8, name, "TaskSetenv")) return 2;
     if (std.mem.eql(u8, name, "TaskReadLine") or std.mem.eql(u8, name, "TaskGetcwd") or
         std.mem.eql(u8, name, "TaskGetpid") or std.mem.eql(u8, name, "TaskReadKey") or
-        std.mem.eql(u8, name, "TaskWinSize")) return 0;
+        std.mem.eql(u8, name, "TaskReadMouse") or
+        std.mem.eql(u8, name, "TaskWinSize") or std.mem.eql(u8, name, "TaskWaitResize") or
+        std.mem.eql(u8, name, "TaskNow") or std.mem.eql(u8, name, "TaskQuit")) return 0;
     return null;
+}
+
+/// Monotonic clock in milliseconds (CLOCK_MONOTONIC — NOT wall-clock; a wall
+/// clock jump would break timers).  Returns 0 on a failed read.
+fn nowMs() i64 {
+    var ts: std.posix.timespec = undefined;
+    if (std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts) != 0) return 0;
+    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
+}
+
+/// Terminal size via ioctl TIOCGWINSZ (fd0, falling back to fd1, else 0x0).
+/// Shared by leafWinSize (sync probe), leafWaitResize's signalfd-failure
+/// fallback, and drainWinch (fresh read on each SIGWINCH).
+const WinSize = struct { cols: i64, rows: i64 };
+
+/// A drained directory entry — page_allocator OWNED name bytes (GC values are
+/// only built in listDirComplete, after the dirfd is closed).
+const DirEntryHost = struct { name: []u8, is_dir: bool };
+
+/// d_type DT_UNKNOWN fallback (some filesystems): fstatat the entry relative
+/// to the open dirfd without following symlinks (Go DirEntry.IsDir parity —
+/// a symlink-to-dir is NOT a dir).
+fn dirEntryIsDir(dirfd: c_int, name: []const u8) bool {
+    const pathz = std.posix.toPosixPath(name) catch return false;
+    var st: Stat = undefined;
+    if (fstatat(dirfd, &pathz, &st, std.posix.AT.SYMLINK_NOFOLLOW) != 0) return false;
+    return st.mode & std.posix.S.IFMT == std.posix.S.IFDIR;
+}
+
+fn readWinSize() WinSize {
+    var ws: std.posix.winsize = undefined;
+    var cols: i64 = 0;
+    var rows: i64 = 0;
+    if (ioctl(0, std.posix.T.IOCGWINSZ, &ws) == 0) {
+        cols = ws.col;
+        rows = ws.row;
+    } else if (ioctl(1, std.posix.T.IOCGWINSZ, &ws) == 0) {
+        cols = ws.col;
+        rows = ws.row;
+    }
+    return .{ .cols = cols, .rows = rows };
+}
+
+/// The SIGWINCH mask: BLOCKed by the host (so the signal queues into the
+/// signalfd instead of firing the default disposition) and UNBLOCKed in exec
+/// children (exec preserves the blocked mask — a blocked SIGWINCH would break
+/// the child's own resize handling).
+fn sigwinchMask() std.posix.sigset_t {
+    var mask = std.posix.sigemptyset();
+    std.posix.sigaddset(&mask, std.posix.SIG.WINCH);
+    return mask;
 }
 
 /// Set O_NONBLOCK on an fd (GETFL|SETFL — preserves any existing flags).
@@ -1256,94 +1988,195 @@ fn writeFdAll(fd: i32, data: []const u8) void {
 }
 
 // ---------------------------------------------------------------------
-//  Terminal key decode (M1 tea) — the state machine behind TaskReadKey.
-//  Returns null when the buffer is an INCOMPLETE prefix (caller suspends;
-//  esc_wait is set iff the prefix is ESC/CSI).  Single-byte controls and
-//  UTF-8 are decoded directly; ESC introduces CSI/SS3 sequences.
+//  Terminal input decode (M1 tea + S4 mouse) — the state machine behind
+//  TaskReadKey AND TaskReadMouse.  Returns null when the buffer is an
+//  INCOMPLETE prefix (caller suspends; esc_wait is set iff the prefix is
+//  ESC/CSI).  Single-byte controls and UTF-8 are decoded directly; ESC
+//  introduces CSI/SS3 sequences, including SGR mouse (ESC [ < ... M/m).
 // ---------------------------------------------------------------------
 
-fn decodeKey(buf: []const u8) ?DecodedKey {
+fn decodeInput(buf: []const u8) ?DecodedInput {
     if (buf.len == 0) return null;
     const b0 = buf[0];
     // Ctrl keys: 0x01..0x1A EXCEPT the specials the switch maps (tab/enter/
     // backspace) — Zig switch ranges must not overlap, so this runs first.
     if (b0 >= 0x01 and b0 <= 0x1A and b0 != 0x08 and b0 != 0x09 and b0 != 0x0A and b0 != 0x0D) {
-        return .{ .consumed = 1, .key = .{ .ctrl = @intCast(b0 - 0x01 + 'a') } };
+        return .{ .consumed = 1, .event = .{ .key = .{ .kind = .ctrl, .num = @intCast(b0 - 0x01 + 'a') } } };
     }
     switch (b0) {
-        0x0D, 0x0A => return .{ .consumed = 1, .key = .enter },
-        0x09 => return .{ .consumed = 1, .key = .tab },
-        0x7F, 0x08 => return .{ .consumed = 1, .key = .backspace },
-        0x00, 0x1C...0x1F => return .{ .consumed = 1, .key = .{ .other = b0 } },
-        0x80...0xBF => return .{ .consumed = 1, .key = .{ .other = b0 } }, // stray continuation
+        0x0D, 0x0A => return .{ .consumed = 1, .event = .{ .key = .{ .kind = .enter } } },
+        0x09 => return .{ .consumed = 1, .event = .{ .key = .{ .kind = .tab } } },
+        0x7F, 0x08 => return .{ .consumed = 1, .event = .{ .key = .{ .kind = .backspace } } },
+        0x00, 0x1C...0x1F => return .{ .consumed = 1, .event = .{ .key = .{ .kind = .other, .num = b0 } } },
+        0x80...0xBF => return .{ .consumed = 1, .event = .{ .key = .{ .kind = .other, .num = b0 } } }, // stray continuation
         0x1B => return decodeEsc(buf),
         0xC0...0xF4 => return decodeUtf8(buf),
-        0x20...0x7E => return .{ .consumed = 1, .key = .{ .char = buf[0..1] } }, // plain ASCII
-        else => return .{ .consumed = 1, .key = .{ .other = b0 } }, // 0xF5..0xFF etc.
+        0x20...0x7E => return .{ .consumed = 1, .event = .{ .key = .{ .kind = .char, .char = .{ b0, 0, 0, 0 }, .char_len = 1 } } }, // plain ASCII
+        else => return .{ .consumed = 1, .event = .{ .key = .{ .kind = .other, .num = b0 } } }, // 0xF5..0xFF etc.
     }
 }
 
 /// ESC: CSI (`[`) / SS3 (`O`) with params then a final byte; a lone ESC or an
 /// unparsed prefix is incomplete (null).  ESC followed by a NON-sequence byte
 /// is a bare KeyEsc consuming ONLY the ESC — the following byte stays in the
-/// read-key accumulator (stdin_pending pushback) and the re-armed readKey
-/// decodes it as its own key.
-fn decodeEsc(buf: []const u8) ?DecodedKey {
+/// accumulator (stdin_pending pushback) and the re-armed read decodes it as
+/// its own event.  A CSI whose params start with '<' and final is 'M'/'m' is
+/// SGR mouse (decoded BEFORE the generic CSI map).
+fn decodeEsc(buf: []const u8) ?DecodedInput {
     if (buf.len < 2) return null; // lone ESC — incomplete
     const b1 = buf[1];
     if (b1 == 'O' or b1 == '[') {
         var i: usize = 2;
         while (i < buf.len) : (i += 1) {
             const c = buf[i];
-            if (c >= 0x40 and c <= 0x7E) return mapCsiFinal(buf[2..i], c, i + 1);
+            if (c >= 0x40 and c <= 0x7E) {
+                const params = buf[2..i];
+                if (b1 == '[' and params.len > 0 and params[0] == '<' and (c == 'M' or c == 'm')) {
+                    if (decodeSgrMouse(params, c, i + 1)) |d| return d;
+                }
+                return mapCsiFinal(params, c, i + 1);
+            }
             if (c < 0x30 or c > 0x3F) return null; // not a param/intermediate — incomplete
         }
         return null; // ran out before a final byte
     }
-    return .{ .consumed = 1, .key = .esc };
+    return .{ .consumed = 1, .event = .{ .key = .{ .kind = .esc } } };
+}
+
+/// SGR mouse packet: ESC [ < cb ; cx ; cy M/m.  `params` starts with '<'.
+/// cb: button bits 0-1 (0=left,1=middle,2=right,3=none), motion bit 0x20,
+/// wheel bit 0x40 (64-67 = up/down/left/right).  final 'm' = release, else
+/// press (or motion when bit 5 set).  x=cx-1, y=cy-1 (1-based -> 0-based).
+fn decodeSgrMouse(params: []const u8, final: u8, consumed: usize) ?DecodedInput {
+    if (params.len < 1 or params[0] != '<') return null;
+    var vals: [3]i64 = .{ 0, 0, 0 };
+    var n: usize = 0;
+    var acc: i64 = 0;
+    var i: usize = 1;
+    while (i < params.len) : (i += 1) {
+        const c = params[i];
+        if (c >= '0' and c <= '9') {
+            acc = acc * 10 + @as(i64, c - '0');
+        } else if (c == ';') {
+            if (n >= 3) return null;
+            vals[n] = acc;
+            n += 1;
+            acc = 0;
+        } else {
+            return null; // ':'/'?' etc — not a plain SGR mouse packet
+        }
+    }
+    if (n >= 3) return null;
+    vals[n] = acc;
+    n += 1;
+    if (n != 3) return null;
+
+    const cb = vals[0];
+    const btn = cb & 0x03;
+    var action: MouseAction = undefined;
+    var button: MouseButton = undefined;
+    if ((cb & 0x40) != 0) {
+        action = .wheel;
+        button = switch (btn) {
+            0 => .wheel_up,
+            1 => .wheel_down,
+            2 => .wheel_left,
+            3 => .wheel_right,
+            else => .none,
+        };
+    } else if ((cb & 0x20) != 0) {
+        action = .motion;
+        button = switch (btn) {
+            0 => .left,
+            1 => .middle,
+            2 => .right,
+            else => .none,
+        };
+    } else {
+        action = if (final == 'm') .release else .press;
+        button = switch (btn) {
+            0 => .left,
+            1 => .middle,
+            2 => .right,
+            else => .none,
+        };
+    }
+    return .{ .consumed = consumed, .event = .{ .mouse = .{
+        .action = action,
+        .button = button,
+        .x = vals[1] - 1,
+        .y = vals[2] - 1,
+    } } };
 }
 
 /// UTF-8 lead (0xC0..0xF4): decode iff all continuation bytes are present.
 /// Missing continuations -> incomplete (null); a non-continuation byte -> the
 /// lead is treated as a stray KeyOther byte.
-fn decodeUtf8(buf: []const u8) ?DecodedKey {
+fn decodeUtf8(buf: []const u8) ?DecodedInput {
     const b0 = buf[0];
     const need: usize = if (b0 < 0xE0) 1 else if (b0 < 0xF0) 2 else 3;
     if (buf.len < 1 + need) return null;
     var i: usize = 1;
     while (i <= need) : (i += 1) {
-        if (buf[i] & 0xC0 != 0x80) return .{ .consumed = 1, .key = .{ .other = b0 } };
+        if (buf[i] & 0xC0 != 0x80) return .{ .consumed = 1, .event = .{ .key = .{ .kind = .other, .num = b0 } } };
     }
-    return .{ .consumed = 1 + need, .key = .{ .char = buf[0 .. 1 + need] } };
+    var ek = EventKey{ .kind = .char, .char_len = 1 + need };
+    @memcpy(ek.char[0 .. 1 + need], buf[0 .. 1 + need]);
+    return .{ .consumed = 1 + need, .event = .{ .key = ek } };
 }
 
 /// Map a CSI/SS3 final byte (with the param bytes preceding it) to a key.
 /// A/B/C/D -> arrows, H/F -> home/end, `~` -> by LAST param digit
 /// (1..6 = Home/Ins/Del/End/PgUp/PgDn; params stripped, modifiers ignored).
-fn mapCsiFinal(params: []const u8, final: u8, consumed: usize) ?DecodedKey {
+fn mapCsiFinal(params: []const u8, final: u8, consumed: usize) ?DecodedInput {
     switch (final) {
-        'A' => return .{ .consumed = consumed, .key = .up },
-        'B' => return .{ .consumed = consumed, .key = .down },
-        'C' => return .{ .consumed = consumed, .key = .right },
-        'D' => return .{ .consumed = consumed, .key = .left },
-        'H' => return .{ .consumed = consumed, .key = .home },
-        'F' => return .{ .consumed = consumed, .key = .end },
+        'A' => return .{ .consumed = consumed, .event = .{ .key = .{ .kind = .up } } },
+        'B' => return .{ .consumed = consumed, .event = .{ .key = .{ .kind = .down } } },
+        'C' => return .{ .consumed = consumed, .event = .{ .key = .{ .kind = .right } } },
+        'D' => return .{ .consumed = consumed, .event = .{ .key = .{ .kind = .left } } },
+        'H' => return .{ .consumed = consumed, .event = .{ .key = .{ .kind = .home } } },
+        'F' => return .{ .consumed = consumed, .event = .{ .key = .{ .kind = .end } } },
         '~' => {
             var last: u8 = 1;
             for (params) |p| {
                 if (p >= '0' and p <= '9') last = p - '0';
             }
-            const key: KeyVal = switch (last) {
+            const kind: KeyKind = switch (last) {
                 1 => .home,
                 2 => .ins,
                 3 => .del,
                 4 => .end,
                 5 => .pgup,
                 6 => .pgdn,
-                else => .{ .other = last },
+                else => .other,
             };
-            return .{ .consumed = consumed, .key = key };
+            if (kind == .other) {
+                return .{ .consumed = consumed, .event = .{ .key = .{ .kind = .other, .num = last } } };
+            }
+            return .{ .consumed = consumed, .event = .{ .key = .{ .kind = kind } } };
         },
-        else => return .{ .consumed = consumed, .key = .{ .other = final } },
+        else => return .{ .consumed = consumed, .event = .{ .key = .{ .kind = .other, .num = final } } },
     }
+}
+
+fn mouseActionName(a: MouseAction) []const u8 {
+    return switch (a) {
+        .press => "MousePress",
+        .release => "MouseRelease",
+        .motion => "MouseMotion",
+        .wheel => "MouseWheel",
+    };
+}
+
+fn mouseButtonName(b: MouseButton) []const u8 {
+    return switch (b) {
+        .left => "MouseLeft",
+        .middle => "MouseMiddle",
+        .right => "MouseRight",
+        .none => "MouseNone",
+        .wheel_up => "MouseWheelUp",
+        .wheel_down => "MouseWheelDown",
+        .wheel_left => "MouseWheelLeft",
+        .wheel_right => "MouseWheelRight",
+    };
 }

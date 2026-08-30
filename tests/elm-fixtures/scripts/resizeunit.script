@@ -1,0 +1,10 @@
+# resizeunit: SIGWINCH delivery via signalfd + TaskWaitResize under a pty.
+# ptytest sets the window 80x24 at setup.  init probes Io.winSize (80x24) and
+# prints it, then arms Io.waitResize + Io.readKey.  `resize 40 12` fires
+# SIGWINCH -> the armed waitResize delivers the fresh 40x12 and re-arms.
+# 'q' quits via the S3 quit latch while a waitResize is still suspended.
+expect 80x24
+resize 40 12
+expect 40x12
+send q
+expect_exit 0

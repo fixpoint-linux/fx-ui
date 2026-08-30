@@ -1,0 +1,13 @@
+# mousemix: the shared decoded-event queue proof.  readKey AND readMouse are
+# BOTH armed, and one send carries keys and a mouse event INTERLEAVED.  Every
+# event must be delivered to the right reader (no drop, no mis-route):
+#   'a' -> K:a,  \e[<0;2;1M (cb=0 left, cx=2 cy=1) -> M:press:left@1,0,  'b' -> K:b
+# Separate expects (substring) prove all three events landed; the queue's
+# routing is what maps each byte run to the right reader.
+expect READY
+send a\e[<0;2;1Mb
+expect K:a
+expect M:press:left@1,0
+expect K:b
+send q
+expect_exit 0
