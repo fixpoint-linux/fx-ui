@@ -1,10 +1,12 @@
 # teademo: Tea program + TextInput widget under a real pty.
-# Frame trace (each repaint is ONE write: \e[1A move-up + \e[2K + value +
-# \e[7m \e[0m block cursor + \r\n; first paint hides the cursor):
+# Frame trace (DIFFERENTIAL repaints: each frame is ONE write; first paint
+# hides the cursor; an unchanged line emits ONLY its \r\n advance, a changed
+# line rewrites as \e[2K + text + \r\n):
 #   init    \e[?25l \e[2K\e[7m \e[0m\r\n
 #   'h'     \e[1A\e[2Kh\e[7m \e[0m\r\n
 #   'i'     \e[1A\e[2Khi\e[7m \e[0m\r\n
-#   \e[A    \e[1A\e[2Khi\e[7m \e[0m\r\n   (ignored key -> same-content repaint)
+#   \e[A    \e[1A\r\n                    (ignored key -> same-content frame:
+#                                            move-up + advance, nothing else)
 #   0x7F    \e[1A\e[2Kh\e[7m \e[0m\r\n
 #   \r      \e[?25h + exit 0
 # Frames are self-similar, so each needle spans a frame BOUNDARY (previous
@@ -14,9 +16,9 @@ expect \e[?25l
 send hi
 expect hi\e[7m
 send \e[A
-expect hi\e[7m \e[0m\r\n\e[1A\e[2Khi
+expect hi\e[7m \e[0m\r\n\e[1A\r\n
 send \x7f
-expect hi\e[7m \e[0m\r\n\e[1A\e[2Kh\e[7m
+expect hi\e[7m \e[0m\r\n\e[1A\r\n\e[1A\e[2Kh\e[7m
 send \r
 expect \e[?25h
 expect_exit 0

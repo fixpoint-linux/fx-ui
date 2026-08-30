@@ -139,6 +139,17 @@ pty() {
   add_check pty "$name" "$fn" "" "" "$script" "$FIX/$name.elm" "$OUT/$name.csexp"
 }
 
+# pty_app <name> <fn> <script-name> <app-source>: like pty, but compiles an
+# out-of-tree example app (examples/<app-source>) TOGETHER with the fixture
+# (which re-exports its main), and runs under ptytest from a FRESH TEMP CWD so
+# the app's relative-file persistence (todos.txt) never clobbers a real file
+# nor leaks state between gate runs.  module_name is scanned from the fixture.
+pty_app() {
+  local name="$1" fn="$2" script="$3" app="$4"
+  register_group "$OUT/$name.csexp" "$ROOT/examples/$app" "$FIX/$name.elm"
+  add_check ptycwd "$name" "$fn" "" "" "$script" "$FIX/$name.elm" "$OUT/$name.csexp"
+}
+
 # out_cmp <name>: compare the raw file an elmvm run wrote (iofile's hello.out)
 # against its expected bytes.
 out_cmp() {
@@ -376,6 +387,12 @@ run listunit    main   "$(read_expected listunit)"
 # "/"+"es" filters 12->6, esc clears, "/"+"es"+enter applies; q quits.
 pty listdemo    main   listdemo.script
 
+# --- S7 (EXAMPLE): the full-stack todos app (Tea v2 + ListBox + TextInput +
+# Help + Lipgloss + TaskReadFile/WriteFile persistence) under a real pty ---
+# todos.elm re-exports examples/todos/TodoApp.main; the ptycwd row runs it
+# from a temp CWD so todos.txt persistence stays isolated between runs.
+pty_app todos  main   todos.script  todos/TodoApp.elm
+
 # --- S7 (M-WIDGETS): the table — the data table ---
 # tableunit: the R7 scroll parity (10 rows / 5-high viewport / j / G / g):
 # j walks the cursor to the bottom visible row then scrolls, G jumps to the
@@ -472,6 +489,25 @@ dispatch() {
         echo "PASS $name ($qname pty)"; pass=$((pass+1))
       else
         echo "FAIL $name ($qname pty): $got"; fail=$((fail+1))
+      fi
+      ;;
+    ptycwd)
+      if head -c 4 "$outfile" | grep -q '^err '; then
+        echo "FAIL $name: compile error: $(cat "$outfile")"; fail=$((fail+1)); return
+      fi
+      mod=$(module_name "$fixfile")
+      qname="$mod.$fn"
+      tmpd="$(mktemp -d)"
+      # The example app reads/writes relative paths (todos.txt) from the CWD;
+      # run ptytest from a throwaway dir so persistence is isolated.  All the
+      # command paths below are absolute, so the cd does not break them.
+      got=$(cd "$tmpd" && "$PTYTEST" "$ELMVM" "$outfile" "$qname" "$FIX/scripts/$stdin" 2>&1)
+      rc=$?
+      rm -rf "$tmpd"
+      if [ "$rc" -eq 0 ] && printf '%s' "$got" | grep -q '^PASS'; then
+        echo "PASS $name ($qname pty, temp cwd)"; pass=$((pass+1))
+      else
+        echo "FAIL $name ($qname pty, temp cwd): $got"; fail=$((fail+1))
       fi
       ;;
     io)

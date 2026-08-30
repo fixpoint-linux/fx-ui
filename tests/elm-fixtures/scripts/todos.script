@@ -1,0 +1,43 @@
+# todos: the examples/todos app under a real pty (gate).
+#
+# The app renders a styled "Todos" header whose tail is a live state needle
+# "n=<total> d=<done> k=<keys>" — k is a per-key counter, so every frame's
+# needle is unique and each expect is deterministic (no stale-substring match).
+# Flows proven end-to-end:
+#   * add: type "buy milk" (spaces included) + enter -> n=0..1
+#   * add again: "eggs" + enter -> n=1..2
+#   * toggle done: x on the selected (first) todo -> d=0..1
+#   * filter: "/" enters filter mode, "milk" shrinks the list, enter applies
+#     (the header needle is stable through the filter lifecycle)
+#   * clear filter: esc (applied filter -> cleared, not quit)
+#   * clear done: C drops the done "buy milk" -> n=2..1
+#   * delete: d drops the selected "eggs" -> n=1..0
+#   * quit: q -> show cursor (\e[?25h) + exit 0
+#
+# Escapes: \e[?25l hide cursor, \e[?25h show cursor, \x1b esc, \r enter.
+expect n=0 d=0 k=0
+send buy milk
+expect n=0 d=0 k=8
+send \r
+expect n=1 d=0 k=9
+send eggs
+expect n=1 d=0 k=13
+send \r
+expect n=2 d=0 k=14
+send x
+expect n=2 d=1 k=15
+send /
+expect n=2 d=1 k=16
+send milk
+expect n=2 d=1 k=20
+send \r
+expect n=2 d=1 k=21
+send \x1b
+expect n=2 d=1 k=22
+send C
+expect n=1 d=0 k=23
+send d
+expect n=0 d=0 k=24
+send q
+expect \e[?25h
+expect_exit 0

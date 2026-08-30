@@ -292,11 +292,16 @@ delegate config tea m1 c1 rearm =
 
 {-| Pure renderer: given the tea model, the NEW user model, and the view's
 new frame, return the updated model (mod = the new user model, prev = frame)
-and the ONE string to write.  Invariant: every
-line is written as "clear-line, text, \r\n", so the cursor always rests one
-line BELOW the last painted line — a repaint moves up `len prev` lines first;
-a frame that shrunk gets a clear-to-end (\e[J) after its last line; the first
-paint hides the cursor.
+and the ONE string to write.  The first paint (prev = []) hides the cursor
+and writes every line ("clear-line, text, \r\n").  A repaint moves up
+`len prev` rows, then writes the frame DIFFERENTIALLY: an unchanged line
+emits only the \r\n advance (its row on screen is already exactly its
+content), a changed line rewrites itself (clear-line + text + \r\n), lines
+past prev's end are painted fully (new rows), and a frame that shrunk gets
+a clear-to-end (\e[J) after its last line, wiping the stale rows below it.
+Every emitted line ends in \r\n, so the cursor always rests one line BELOW
+the last painted line and the next repaint's moveUp (len prev) lands exactly
+on the old frame's first row.
 -}
 paint tea m frame =
   case tea.prev of
@@ -308,7 +313,7 @@ paint tea m frame =
     _ ->
       ( { mod = m, prev = frame, rows = tea.rows, cols = tea.cols }
       , String.append (moveUp (List.length tea.prev))
-          (String.append (frameString frame)
+          (String.append (diffString tea.prev frame)
             (if List.length frame < List.length tea.prev then
                 clearRest
 
@@ -317,6 +322,31 @@ paint tea m frame =
             )
           )
       )
+
+
+{-| The repaint body: walk prev and the new frame in lockstep.  An unchanged
+line (==) costs ONLY the line advance; a changed line costs a full rewrite;
+lines past prev's end are new rows and paint fully.  When prev runs out
+first, the remaining frame lines are all new; when the frame runs out first
+(shrunk), stop — paint appends clearRest for the stale rows below.
+-}
+diffString : List String -> List String -> String
+diffString prev frame =
+  case prev of
+    [] ->
+      frameString frame
+
+    p :: prevRest ->
+      case frame of
+        [] ->
+          ""
+
+        line :: frameRest ->
+          if line == p then
+            String.append newline (diffString prevRest frameRest)
+
+          else
+            String.append (paintLine line) (diffString prevRest frameRest)
 
 
 -- Wrap a frame string into a perform-wrapped write: the delivery lands on

@@ -4,4 +4,10 @@
 [2Kbeta2
 [2Kgamma
 [3A[2Konly
+[J[1A
+[2Krow2
+[2A
+[2Krow2x
+[2Krow3
+[3A
 [J"
