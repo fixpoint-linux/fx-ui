@@ -1,5 +1,6 @@
 module Lower.Module exposing
-    ( compileSources
+    ( collectTypeNames
+    , compileSources
     , compileBatch
     )
 
@@ -282,10 +283,27 @@ collectUnit file =
                     |> Result.andThen
                         (\ctors ->
                             -- Loud compile error for the import-shadowing
-                            -- footgun, BEFORE typechecking/lowering.
+                            -- footgun, BEFORE typechecking/lowering.  Type
+                            -- names (type alias + ADT) join funs+ctors: types
+                            -- live in their OWN namespace (findDuplicate below
+                            -- stays funs+ctors only), but a bare exposing row
+                            -- hides a same-named local type exactly like it
+                            -- hides a same-named function.
                             Resolve.checkImportShadowing
-                                (List.map Tuple.first funs ++ List.map Tuple.first ctors)
+                                (List.map Tuple.first funs
+                                    ++ List.map Tuple.first ctors
+                                    ++ collectTypeNames file.declarations
+                                )
                                 file.imports
+                                |> Result.andThen
+                                    (\() ->
+                                        -- Second loud footgun: two different
+                                        -- modules exposing the SAME bare name
+                                        -- (real Elm rejects the ambiguity;
+                                        -- the alias table would silently
+                                        -- first-match).
+                                        Resolve.checkAmbiguousImports file.imports
+                                    )
                                 |> Result.map
                                     (\() ->
                                         { moduleName = modName
@@ -455,6 +473,29 @@ addCtor node acc =
     case node of
         Node _ vc ->
             ( nodeString vc.name, List.length vc.arguments ) :: acc
+
+
+-- The TYPE names a module declares: type-alias names (AliasDeclaration) and
+-- custom-type (ADT) names (CustomTypeDeclaration).  NOT the value constructors
+-- — those are collectCtors' job (types and values are separate namespaces).
+-- Feeds the import-shadowing check so a local `type alias Model` / `type
+-- Model` colliding with `import X exposing (Model)` is a loud error.
+collectTypeNames : List (Node Declaration.Declaration) -> List String
+collectTypeNames decls =
+    List.filterMap typeName decls
+
+
+typeName : Node Declaration.Declaration -> Maybe String
+typeName (Node _ decl) =
+    case decl of
+        AliasDeclaration alias ->
+            Just (nodeString alias.name)
+
+        CustomTypeDeclaration typeDecl ->
+            Just (nodeString typeDecl.name)
+
+        _ ->
+            Nothing
 
 
 forbiddenDecl : Node Declaration.Declaration -> Maybe String

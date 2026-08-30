@@ -1,5 +1,6 @@
 module Lower.Resolve exposing
     ( aliasTableFor
+    , checkAmbiguousImports
     , checkImportShadowing
     , exportedNames
     , preludeModuleName
@@ -441,6 +442,47 @@ checkImportShadowing defined imports =
                             findClash rest
     in
     findClash defined
+
+
+-- The ambiguous-import footgun, made loud: the SAME bare name exposed
+-- explicitly by TWO DIFFERENT modules (`import A exposing (foo)` + `import B
+-- exposing (foo)`).  importAliases rows are first-match-wins, so today the
+-- later row is silently dead and every bare use resolves to whichever module
+-- came first — real Elm rejects the ambiguity outright.  Same-module repeats
+-- (`import A exposing (foo)` twice) are NOT ambiguous and stay allowed.
+checkAmbiguousImports : List (Node Import.Import) -> Result String ()
+checkAmbiguousImports imports =
+    let
+        bareNames =
+            List.concatMap
+                (\((Node _ imp) as node) ->
+                    List.map (\( bare, _ ) -> ( bare, String.join "." (Node.value imp.moduleName) ))
+                        (importAlias node)
+                )
+                imports
+
+        findClash names =
+            case names of
+                [] ->
+                    Ok ()
+
+                ( name, fromModule ) :: rest ->
+                    case List.filter (\( bare, mod ) -> bare == name && mod /= fromModule) rest of
+                        ( _, otherModule ) :: _ ->
+                            Err
+                                ("the name `"
+                                    ++ name
+                                    ++ "` is imported via `exposing` from two different modules: "
+                                    ++ fromModule
+                                    ++ " and "
+                                    ++ otherModule
+                                    ++ "; qualify it at use sites (real Elm rejects ambiguous imports)"
+                                )
+
+                        [] ->
+                            findClash rest
+    in
+    findClash bareNames
 
 
 -- The exported-name list of a module, honoring its exposing clause:

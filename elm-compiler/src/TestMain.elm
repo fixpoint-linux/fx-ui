@@ -17,6 +17,7 @@ import Elm.Syntax.File as File
 import Elm.Syntax.Node as Node exposing (Node(..))
 import Elm.Syntax.Range as Range
 import Platform
+import Lower.Module as LModule
 import Type.Builtins as Builtins
 import Type.Env as Env
 import Type.Error as Error
@@ -567,6 +568,65 @@ checks =
                 Resolve.checkImportShadowing [ "helper", "main" ] file.imports == Ok ()
 
             Err _ ->
+                False
+        )
+
+    -- TYPE-name half of the shadowing check: type aliases + ADT names join
+    -- funs+ctors in the clash check (types are a separate namespace from
+    -- values, so findDuplicate stays funs+ctors only).
+    , check "collectTypeNames gathers alias + ADT names (skips funs/ctors)"
+        (case Elm.Parser.parseToFile "module A exposing (main)\n\ntype alias Model = { n : Int }\n\ntype Msg = Inc | Dec\n\nhelper = 1\n\nmain = 0\n" of
+            Ok file ->
+                LModule.collectTypeNames file.declarations == [ "Model", "Msg" ]
+
+            Err _ ->
+                False
+        )
+    , check "type-alias shadowing rejected (bare exposing row vs local type)"
+        (case Elm.Parser.parseToFile "module A exposing (main)\nimport B exposing (Model)\n\ntype alias Model = { n : Int }\n\nmain = 0\n" of
+            Ok file ->
+                Resolve.checkImportShadowing (LModule.collectTypeNames file.declarations) file.imports
+                    == Err "the name `Model` is both a top-level definition and imported via `exposing` from B; remove it from the import's exposing list (real Elm rejects this)"
+
+            Err _ ->
+                False
+        )
+    , check "ADT type-name shadowing rejected end-to-end (compileSources)"
+        (case LModule.compileSources
+            [ "module A exposing (main)\nimport B exposing (Model)\n\ntype Model = M\n\nmain = 0\n" ] of
+            Err msg ->
+                String.contains "the name `Model` is both a top-level definition and imported via `exposing` from B" msg
+
+            Ok _ ->
+                False
+        )
+
+    -- AMBIGUOUS imports: the same bare name exposed by two different modules
+    -- (first-match-wins used to silently pick one).
+    , check "ambiguous imports rejected (same bare name from two modules)"
+        (case Elm.Parser.parseToFile "module A exposing (main)\nimport B exposing (foo)\nimport C exposing (foo)\n\nmain = 0\n" of
+            Ok file ->
+                Resolve.checkAmbiguousImports file.imports
+                    == Err "the name `foo` is imported via `exposing` from two different modules: B and C; qualify it at use sites (real Elm rejects ambiguous imports)"
+
+            Err _ ->
+                False
+        )
+    , check "ambiguous imports allow distinct names + same-module repeats"
+        (case Elm.Parser.parseToFile "module A exposing (main)\nimport B exposing (foo)\nimport B exposing (foo)\nimport C exposing (bar)\n\nmain = 0\n" of
+            Ok file ->
+                Resolve.checkAmbiguousImports file.imports == Ok ()
+
+            Err _ ->
+                False
+        )
+    , check "ambiguous imports rejected end-to-end (compileSources)"
+        (case LModule.compileSources
+            [ "module A exposing (main)\nimport B exposing (foo)\nimport C exposing (foo)\n\nmain = foo 0\n" ] of
+            Err msg ->
+                String.contains "from two different modules: B and C" msg
+
+            Ok _ ->
                 False
         )
     , check "infer let-generalizes (id used at Bool and String)"

@@ -209,8 +209,10 @@ run execglob     main   "$(read_expected execglob)"
 run asyncorder   main   "$(read_expected asyncorder)"
 run fastexec     main   "$(read_expected fastexec)"
 run asyncpure    main   "$(read_expected asyncpure)"
-compile_error dup         "duplicate top-level definition in Dup: f"
-compile_error shadowerr   "is both a top-level definition and imported via"
+compile_error dup          "duplicate top-level definition in Dup: f"
+compile_error shadowerr    "is both a top-level definition and imported via"
+compile_error shadowtyperr "is both a top-level definition and imported via"
+compile_error ambimperr    "from two different modules"
 
 # --- M1 bubbletea: terminal Key ADT compiler surface (pure, no terminal) ---
 run keyunit     main   "$(read_expected keyunit)"
