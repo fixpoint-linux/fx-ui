@@ -25,7 +25,7 @@ const interp = vm.interp;
 const streams = vm.streams;
 const effectloop = @import("effectloop");
 
-const HEAP_BYTES: usize = 16 * 1024 * 1024;
+const HEAP_BYTES: usize = 64 * 1024 * 1024;
 const RESERVE_BYTES: usize = 64 * 1024 * 1024;
 
 pub fn main(init: std.process.Init) !void {

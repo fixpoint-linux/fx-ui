@@ -12,10 +12,20 @@ pub fn build(b: *std.Build) void {
     // means any target is allowed, and the default is native. Other options
     // for restricting supported target set are available.
     const target = b.standardTargetOptions(.{});
-    // Standard optimization options allow the person running `zig build` to select
-    // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
-    // set a preferred release mode, allowing the user to decide how to optimize.
-    const optimize = b.standardOptimizeOption(.{});
+    // Optimization options: like standardOptimizeOption but defaulting to
+    // ReleaseFast — the interpreted VM is unusably slow in Debug (~10-25x),
+    // and `zig build` must produce a playable TUI out of the box.
+    // `-Doptimize=Debug|ReleaseSafe|...` and `--release[=fast|safe|small]`
+    // still select an explicit mode.
+    const optimize = b.option(
+        std.builtin.OptimizeMode,
+        "optimize",
+        "Prioritize performance, safety, or binary size",
+    ) orelse switch (b.release_mode) {
+        .off, .any, .fast => std.builtin.OptimizeMode.ReleaseFast,
+        .safe => .ReleaseSafe,
+        .small => .ReleaseSmall,
+    };
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including
     // target and optimize options) will be listed when running `zig build --help`

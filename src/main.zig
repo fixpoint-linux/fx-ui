@@ -42,7 +42,7 @@ pub fn main() !void {
     // explicit 64 MB VAS reservation so grow_heap has headroom without the
     // 4 GB C-default overcommit.  verbose prints the [GC ...] banners.
     var g = try gc.Gc.init(.{
-        .heap_bytes = 16 * 1024 * 1024,
+        .heap_bytes = 64 * 1024 * 1024,
         .reserve_bytes = 64 * 1024 * 1024,
         .verbose = true,
     });

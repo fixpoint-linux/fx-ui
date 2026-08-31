@@ -20,7 +20,7 @@ const parser = vm.parser;
 const interp = vm.interp;
 const streams = vm.streams;
 
-const HEAP_BYTES: usize = 16 * 1024 * 1024;
+const HEAP_BYTES: usize = 64 * 1024 * 1024;
 const RESERVE_BYTES: usize = 64 * 1024 * 1024;
 
 /// CLOCK_MONOTONIC as u128 nanoseconds.
