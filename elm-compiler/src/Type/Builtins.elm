@@ -180,6 +180,7 @@ primWrapperSchemes : Dict String Scheme
 primWrapperSchemes =
     Dict.fromList
         [ ( "cn", mono (func [ tString, tString ] tString) )
+        , ( "repeat", mono (func [ tInt, tString ] tString) )
         , ( "c-strlen", mono (func [ tString ] tInt) )
         , ( "bitwise-and", mono (func [ tInt, tInt ] tInt) )
         , ( "bitwise-or", mono (func [ tInt, tInt ] tInt) )
@@ -324,6 +325,7 @@ trustedBodies =
     , "Prelude.compare"
     , "Prelude.fromInt"
     , "Str.fromFloat"
+    , "Str.repeat"
     , "Str.countChar"
     , "Runtime.runTask"
     , "Runtime.taskAndThen"

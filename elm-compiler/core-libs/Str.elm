@@ -115,19 +115,19 @@ replace needle repl hay =
 -- ====================== padding / repetition ======================
 
 
-{-| Tail-accumulator repeat (negative n repeats nothing).
+{-| Repeat `s` `n` times (negative n repeats nothing).
+
+Rides the native VM `repeat` prim (ONE allocRaw(slen*n+1), filled by
+doubling) instead of the old tail-accumulator loop — which did n x
+String.append (n allocations + quadratic byte copy) and was the hot path
+behind Lipgloss padding/borders and the Progress bar fill.  TRUSTED body:
+the alias `repeatPrim` is typed Int -> String -> String, matching this
+annotation, so the body is skipped by Type.Builtins.trustedBodies (same
+pattern as Str.fromFloat riding `str`).
 -}
 repeat : Int -> String -> String
 repeat n s =
-    repeatGo n s ""
-
-
-repeatGo n s acc =
-    if n <= 0 then
-        acc
-
-    else
-        repeatGo (n - 1) s (String.append s acc)
+    repeatPrim n s
 
 
 {-| Pad to CELL width (`Str.width`, not String.length) with 1-cell spaces, so

@@ -159,6 +159,7 @@ primDotAliases : List ( String, String )
 primDotAliases =
     [ ( "String.append", Expr.wrapperGlobalName "cn" )
     , ( "String.length", Expr.wrapperGlobalName "c-strlen" )
+    , ( "Str.repeat", Expr.wrapperGlobalName "repeat" )
     -- NOTE: this is NOT real Elm's String.slice (start end str) — fx-ui's
     -- substring prim is LENGTH-based, so the dotted spelling is sliceLen
     -- (start len str) to keep real-Elm ports from silently mis-slicing.
@@ -306,6 +307,10 @@ streamPrimAliases =
     -- Str.fromFloat: the 1-arg `str` prim renders any scalar (a Float at
     -- this call site) to its decimal text.
     , ( "strPrim", Expr.wrapperGlobalName "str" )
+
+    -- Str.repeat: the 2-arg `repeat` prim (bare alias for the trusted
+    -- core-libs/Str.elm body; Str.repeat itself is also a primDotAlias).
+    , ( "repeatPrim", Expr.wrapperGlobalName "repeat" )
     ]
 
 

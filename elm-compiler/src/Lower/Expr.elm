@@ -162,6 +162,7 @@ primWrappers : List ( String, String )
 primWrappers =
     binaryPrims
         ++ [ ( "", "cn" )
+           , ( "", "repeat" )
            , ( "", "write-byte" )
            , ( "", "open" )
            , ( "", "setenv" )

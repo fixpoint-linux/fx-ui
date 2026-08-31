@@ -260,6 +260,9 @@ run arraystress main   "$(read_expected arraystress)"
 # strunit: width (ANSI-skip + UTF-8 cell tables), split/lines/repeat/pad/
 # truncate/replace/affixes/trim/countChar, List.take, trusted Str.fromFloat.
 run strunit     main   "$(read_expected strunit)"
+# p2pad: the P2-9 native Str.repeat prim (n=0/1/40, negative, empty) + the
+# padLeft/padRight cell-width interplay that rides it.
+run p2pad       main   "$(read_expected p2pad)"
 
 # --- S2 (M-FOUNDATION): core-libs/Lipgloss.elm faithful v1.1.0 port ---
 # lgunit: byte-exact pure renders (SGR param order incl. the v1.1.0 duplicate

@@ -502,8 +502,8 @@ checks =
         (not (Builtins.isTrusted "Prelude.map"))
     , check "every prim-wrapper alias row has a builtin scheme"
         (Builtins.uncoveredPrimRows == [])
-    , check "34 prim-wrapper schemes registered"
-        (Dict.size Builtins.primWrapperSchemes == 34)
+    , check "35 prim-wrapper schemes registered"
+        (Dict.size Builtins.primWrapperSchemes == 35)
 
     -- Type.Infer: Algorithm W over expressions/patterns, record operations,
     -- let-generalization, top-level group, and the ++/Record.remove rewrites.
