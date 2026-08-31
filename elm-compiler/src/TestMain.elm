@@ -71,6 +71,18 @@ checks =
     , check "flatten resolved program" (Emit.flatten (Emit.resolve forwardProgram) == forwardFlattened)
     , check "cur counts one, nested label resolved" (Emit.flatten (Emit.resolve curProgram) == curFlattened)
 
+    -- P3 superinstruction peephole (Emit.fuse inside Emit.resolve): the five
+    -- pair fusions, the label-block hard rule, Cur-body recursion, and jump
+    -- retargeting onto the fused pc layout.
+    , check "fuse A: access + prim" (Emit.flatten (Emit.resolve [ Emit.Access 0, Emit.Prim "hd" ]) == "(A [1:n]0 [2:s]hd)")
+    , check "fuse K: number + prim" (Emit.flatten (Emit.resolve [ Emit.Number_ 1, Emit.Prim "+" ]) == "(K [1:n]1 [1:s]+)")
+    , check "fuse Q: global + apply" (Emit.flatten (Emit.resolve [ Emit.Global "foo", Emit.Apply ]) == "(Q [3:s]foo)")
+    , check "fuse R: global + appterm" (Emit.flatten (Emit.resolve [ Emit.Global "foo", Emit.Appterm ]) == "(R [3:s]foo)")
+    , check "fuse V: prim + return" (Emit.flatten (Emit.resolve [ Emit.Prim "hd", Emit.Return ]) == "(V [2:s]hd)")
+    , check "fuse label blocks fusion" (Emit.flatten (Emit.resolve [ Emit.Prim "hd", Emit.Label_ "L", Emit.Return ]) == "(P [2:s]hd v)")
+    , check "fuse recurses into Cur" (Emit.flatten (Emit.resolve [ Emit.Cur [ Emit.Access 0, Emit.Prim "hd", Emit.Return ] ]) == "(c (A [1:n]0 [2:s]hd v))")
+    , check "fuse retargets jumps to the fused pc" (fusedJumpResolved)
+
     -- Type.Representation pretty-printer: scoped rows render VERBATIM (duplicate
     -- labels are not collapsed), row tails show their variable, function types
     -- parenthesize their argument.
@@ -963,3 +975,24 @@ curProgram =
 curFlattened : String
 curFlattened =
     "(c (f [1:n]1 v))"
+
+
+-- P3: a forward jump whose target label sits AFTER a fused pair must retarget
+-- to the fused pc (the AccessPrim occupies one slot, so the label lands at
+-- pc 2 instead of the unfused pc 3).
+fusedJumpResolved : Bool
+fusedJumpResolved =
+    case
+        Emit.resolve
+            [ Emit.Jmpf (Emit.TRef "L")
+            , Emit.Access 0
+            , Emit.Prim "hd"
+            , Emit.Label_ "L"
+            , Emit.Return
+            ]
+    of
+        [ Emit.Jmpf (Emit.TAbs 2), Emit.AccessPrim 0 "hd", Emit.Label_ "L", Emit.Return ] ->
+            True
+
+        _ ->
+            False
