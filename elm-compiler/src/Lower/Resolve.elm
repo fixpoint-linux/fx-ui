@@ -228,6 +228,12 @@ platformTable =
     , ( "Plan.cons", "Runtime.tCons" )
     , ( "Sub.none", "Runtime.subNone" )
 
+    -- Structural equality over any value (trusted-body Runtime.sameValue):
+    -- bare row so every unit incl. Tea resolves the name; Tea.skipRender uses
+    -- it to skip repaints when the model is unchanged.  Self-shadowed like
+    -- every platform row.
+    , ( "sameValue", "Runtime.sameValue" )
+
     -- M1 terminal Key ADT (foreign: defined in Runtime).  Fixtures use the
     -- UNQUALIFIED ctor names in patterns/expressions — qualified foreign ctor
     -- PATTERNS are rejected (Lower.Pattern), so these bare rows (shared by the

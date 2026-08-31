@@ -3,6 +3,7 @@ module Tea exposing
   , program
   , quit
   , paint
+  , skipRender
   )
 
 -- M1 bubbletea-style core loop (charmbracelet/bubbletea's program loop,
@@ -268,13 +269,24 @@ outerUpdate config msg tea =
 
 
 -- Every delegating branch (FKey/FMouse/FUser) shares this shape: run the user
--- update, scan for quit, repaint, re-map the user command, then re-arm the
--- inputs THAT BRANCH owns (`rearm` — FKey readKey, FMouse readMouse, FUser
--- nothing; re-arm FIRST in the batch, waitResize discipline).
+-- update, scan for quit, SKIP the repaint when the model is unchanged, repaint
+-- otherwise, re-map the user command, then re-arm the inputs THAT BRANCH owns
+-- (`rearm` — FKey readKey, FMouse readMouse, FUser nothing; re-arm FIRST in
+-- the batch, waitResize discipline).
 delegate : Config msg model -> TeaModel model -> model -> Runtime.Cmd msg -> List (Runtime.Cmd (FrameMsg msg)) -> ( TeaModel model, Runtime.Cmd (FrameMsg msg) )
 delegate config tea m1 c1 rearm =
   if hasQuit c1 then
     ( tea, exit )
+
+  else if skipRender tea m1 then
+    -- Model structurally unchanged => config.view (pure in the model) would
+    -- emit a byte-identical frame, so the repaint is skipped entirely — but
+    -- the user's command c1 still runs and the input re-arms still fire.
+    -- Never taken before the first paint (skipRender's prev == [] guard):
+    -- nothing is on screen yet, so the first frame must always paint.
+    ( { mod = m1, prev = tea.prev, rows = tea.rows, cols = tea.cols }
+    , Cmd.batch (List.append rearm [ Cmd.map FUser c1 ])
+    )
 
   else
     let
@@ -285,6 +297,23 @@ delegate config tea m1 c1 rearm =
     , Cmd.batch
         (List.append rearm [ Cmd.map FUser c1, repaint frame ])
     )
+
+
+-- Should this delivery skip the repaint?  Only when a frame is already on
+-- screen (prev /= [] — before the first paint the screen is NOT the old
+-- frame's content, so the first frame always paints) AND the new user model
+-- is structurally equal to the painted one (sameValue: the VM's deep
+-- structural `=`, not the comparable-restricted `==`).  FResize repaints
+-- unconditionally (its own branch — reflow at the new dims even when the
+-- resize folds to the same model); quit/EOF take the exit paths before this.
+skipRender : TeaModel model -> model -> Bool
+skipRender tea m1 =
+  case tea.prev of
+    [] ->
+      False
+
+    _ ->
+      sameValue tea.mod m1
 
 
 -- ---- renderer ----

@@ -14,7 +14,7 @@ module TeaUnit exposing (main)
 -- main returns the concatenated frame string (printValue emits strings raw
 -- between quotes), so expected/teaunit.txt is the byte-exact dump.
 
-import Tea exposing (paint)
+import Tea exposing (paint, skipRender)
 
 
 model0 =
@@ -45,7 +45,53 @@ main =
     ( _, s6 ) =
       paint m5 () [ "only" ]
   in
-  String.append s1
-    (String.append s2
-      (String.append s3 (String.append s4 (String.append s5 s6)))
+  String.append
+    (String.append s1
+      (String.append s2
+        (String.append s3 (String.append s4 (String.append s5 s6)))
+      )
+    )
+    skipRenderDump
+
+
+-- SKIP-RENDER (runtime-owned, Tea.delegate): a delivery whose update returns
+-- a structurally UNCHANGED model skips config.view + the repaint entirely —
+-- the pure view would re-emit a byte-identical frame.  skipRender is the
+-- guard, proven here byte-exactly (the "1"/"0" tail of the output):
+--   sr1  prev = []                 -> 0: nothing painted yet, the FIRST
+--       frame always paints (load-bearing guard — skipping it would leave a
+--       blank screen, since prev's rows are not on it);
+--   sr2  prev /= [], same model    -> 1: skip (repaint is a pure no-op);
+--   sr3  prev /= [], changed model -> 0: must repaint;
+--   sr4  deep structural equality: a freshly built RECORD equal to the
+--       painted one skips too (Runtime.sameValue lowers to the VM's deep
+--       structural `=` prim, not the comparable-restricted `==`).
+sr1 =
+  skipRender { mod = 1, prev = [], rows = 24, cols = 80 } 1
+
+
+sr2 =
+  skipRender { mod = 1, prev = [ "x" ], rows = 24, cols = 80 } 1
+
+
+sr3 =
+  skipRender { mod = 1, prev = [ "x" ], rows = 24, cols = 80 } 2
+
+
+sr4 =
+  skipRender { mod = { a = 1, b = "x" }, prev = [ "x" ], rows = 24, cols = 80 } { a = 1, b = "x" }
+
+
+bit b =
+  if b then
+    "1"
+
+  else
+    "0"
+
+
+skipRenderDump =
+  String.append "\nskipRender[prev=[],same,changed,deepEq]="
+    (String.append (bit sr1)
+      (String.append (bit sr2) (String.append (bit sr3) (bit sr4)))
     )

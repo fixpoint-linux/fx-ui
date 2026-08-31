@@ -337,6 +337,7 @@ trustedBodies =
     , "Runtime.tSym"
     , "Runtime.tNil"
     , "Runtime.tCons"
+    , "Runtime.sameValue"
     ]
 
 

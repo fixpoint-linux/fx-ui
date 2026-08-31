@@ -450,6 +450,19 @@ subNone : ()
 subNone = ()
 
 
+{-| Structural value equality over ANY value, not just comparables.  The body
+is a trusted lie (Type.Builtins.trustedBodies): the checker skips it (its `==`
+would force the annotation's `a` into the FComparable class), and the
+annotation IS the exported scheme `a -> a -> Bool`.  Lowers to the inline
+structural `=` prim (primEq), which is deep: cons trees, records, tuples —
+NaN/lambdas compare False, so a false negative just means no skip-render.
+Sole consumer: Tea.skipRender.
+-}
+sameValue : a -> a -> Bool
+sameValue x y =
+    x == y
+
+
 -- ---- stream helpers (prims + stdin/stdout pseudo-globals) ----
 
 writeString s =
