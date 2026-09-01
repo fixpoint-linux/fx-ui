@@ -137,7 +137,7 @@ program config =
                 )
               )
           )
-    , update = outerUpdate config
+    , update = \msg tea -> outerUpdate config msg tea
     , subscriptions = \_ -> Sub.none
     }
 

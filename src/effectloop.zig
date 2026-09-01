@@ -49,6 +49,14 @@ const ValueArray = types.ValueArray;
 const Vm = state.Vm;
 const VmError = state.VmError;
 
+/// Host -> Elm apply dispatcher — the ONLY seam where the host calls Elm
+/// (continuation/handler/update closures).  Defaults to the interpreted
+/// hostcall.applyClosureN; an AOT driver swaps it to aotrt.applyHost at
+/// aotInit, so REGISTERED closures native-dispatch (registry lookup-first)
+/// while unregistered ones fall back to the same vmExecEnv.  A plain fn
+/// pointer keeps this module AOT-optional: it never imports the aotrt module.
+pub var host_apply: *const fn (vm: *Vm, fnv: Value, args: []const Value) VmError!Value = &hostcall.applyClosureN;
+
 const pa = std.heap.page_allocator;
 
 /// SGR mouse-tracking DECRST (the exact set leafMouseMode Off emits) — reused
@@ -493,7 +501,7 @@ const HostLoop = struct {
             const cont = self.slots[frame.cont_slot];
             self.slots[frame.cont_slot] = values.valNil();
             const v = self.slots[resultSlot(eval)];
-            const newtask = try hostcall.applyClosureN(self.vm, cont, &.{v});
+            const newtask = try host_apply(self.vm, cont, &.{v});
             self.slots[eval.base] = newtask;
             return;
         }
@@ -516,7 +524,7 @@ const HostLoop = struct {
             const handler = self.slots[frame.cont_slot];
             self.slots[frame.cont_slot] = values.valNil();
             const e = self.slots[resultSlot(eval)];
-            const newtask = try hostcall.applyClosureN(self.vm, handler, &.{e});
+            const newtask = try host_apply(self.vm, handler, &.{e});
             self.slots[eval.base] = newtask;
             return;
         }
@@ -526,7 +534,7 @@ const HostLoop = struct {
         const model = self.slots[model_slot]; // fresh
         const update = self.slots[update_slot]; // fresh
         // update msg model -> (model', cmd') = cons(model', cmd')
-        const pair = try hostcall.applyClosureN(self.vm, update, &.{ msg, model });
+        const pair = try host_apply(self.vm, update, &.{ msg, model });
         if (pair.tag != .cons) {
             self.deactivate(eval);
             return;

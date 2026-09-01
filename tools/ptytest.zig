@@ -40,6 +40,7 @@ extern "c" fn waitpid(pid: c_int, status: ?*c_int, options: c_int) c_int;
 extern "c" fn kill(pid: c_int, sig: c_int) c_int;
 extern "c" fn _exit(code: c_int) noreturn;
 extern "c" fn clock_gettime(clk_id: c_int, tp: *std.posix.timespec) c_int;
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]u8;
 
 const O_RDWR: c_int = 2;
 const O_NOCTTY: c_int = 0x100;
@@ -219,6 +220,13 @@ pub fn main(init: std.process.Init) !void {
         // attached to a now-closing master — reap it (SIGKILL if not already
         // exited) instead of orphaning it.
         reapChild(pid);
+        // PTYTEST_DUMP=<path>: write the RAW captured bytes (the exact frame
+        // stream) to <path> on success — lets a caller byte-diff two runs
+        // (e.g. the AOT vs elmvm todos frames).  Unset by the gate, so the
+        // gate output is unchanged.
+        if (getenv("PTYTEST_DUMP")) |dump_path| {
+            std.Io.Dir.writeFile(.cwd(), io, .{ .sub_path = std.mem.span(dump_path), .data = capture.items }) catch {};
+        }
         std.process.exit(0);
     }
 

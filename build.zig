@@ -184,6 +184,63 @@ pub fn build(b: *std.Build) void {
     const ptytest_step = b.step("ptytest", "Build the ptytest terminal harness");
     ptytest_step.dependOn(&ptytest_install.step);
 
+    // ---- `aotrt`: the handwritten AOT runtime (tools/aot/runtime.zig) ----
+    // Shared by every generated module and the aotbench driver.  Imports gc +
+    // vm; the generated Zig calls back into it for tail dispatch, env builds,
+    // and the code-array -> native-fn registry.
+    const aotrt_mod = b.createModule(.{
+        .root_source_file = b.path("tools/aot/runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "gc", .module = gc_mod },
+            .{ .name = "vm", .module = vm_mod },
+        },
+    });
+
+    // ---- `aotdump`: the AOT emitter (links gc+vm, real parseBundle) ----
+    // Also imports aotrt: the dumper checks the emitted unit count against
+    // runtime.zig's REG_MAX (the registry arrays the generated aotInit fills).
+    const aotdump_mod = b.createModule(.{
+        .root_source_file = b.path("tools/aot/dump.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "gc", .module = gc_mod },
+            .{ .name = "vm", .module = vm_mod },
+            .{ .name = "runtime.zig", .module = aotrt_mod },
+        },
+    });
+    const aotdump = b.addExecutable(.{
+        .name = "aotdump",
+        .root_module = aotdump_mod,
+    });
+    const aotdump_install = b.addInstallArtifact(aotdump, .{});
+    const aotdump_step = b.step("aotdump", "Build the AOT emitter (aotdump)");
+    aotdump_step.dependOn(&aotdump_install.step);
+
+    // ---- `aot`: the AOT-to-Zig spike (fib / countdown / biglist / todos) ----
+    // Each spike exe compiles the fixture with node run.js -> aotdump -> a
+    // generated Zig module, then links it against aotrt + gc + vm.  SEPARATE
+    // from gate/test: the interpreter stays the source of truth.
+    const aot_step = b.step("aot", "Build the AOT spike exes (fib/countdown/biglist/todos)");
+    aot_step.dependOn(&aotdump_install.step);
+    inline for (.{
+        .{ .name = "aotbench-fib", .fixture = "tests/elm-fixtures/fib.elm", .entry = "Fib.fib" },
+        .{ .name = "aotbench-countdown", .fixture = "tests/elm-fixtures/countdown.elm", .entry = "Countdown.countdown" },
+        .{ .name = "aotbench-biglist", .fixture = "tests/elm-fixtures/biglist.elm", .entry = "BigList.main" },
+    }) |sp| {
+        aot_step.dependOn(addAotSpike(b, target, optimize, gc_mod, vm_mod, aotrt_mod, aotdump, sp.name, sp.fixture, sp.entry));
+    }
+    // Phase 4 headline: the full todos TUI end-to-end (Tea v2 + ListBox +
+    // TextInput + Help + Lipgloss + TaskReadFile/WriteFile).  Compiles the SAME
+    // source set as the gate's pty_app todos row (TodoApp.elm + the todos.elm
+    // re-export fixture) so the bundle and entry (Todos.main) are identical to
+    // what elmvm drives under the pty.
+    aot_step.dependOn(addAotTodosSpike(b, target, optimize, gc_mod, vm_mod, aotrt_mod, effectloop_mod, aotdump));
+
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
     // This will evaluate the `run` step rather than the default step.
@@ -274,6 +331,138 @@ pub fn build(b: *std.Build) void {
     //
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
+}
+
+/// Build one AOT spike executable: node run.js compiles the fixture to a csexp
+/// bundle, aotdump emits a generated Zig module from it, and the exe (aotbench
+/// driver, tools/aot/main.zig) links that module against aotrt + gc + vm.
+/// Returns the install step for the spike exe.
+fn addAotSpike(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    gc_mod: *std.Build.Module,
+    vm_mod: *std.Build.Module,
+    aotrt_mod: *std.Build.Module,
+    aotdump: *std.Build.Step.Compile,
+    name: []const u8,
+    fixture: []const u8,
+    entry: []const u8,
+) *std.Build.Step {
+    // 1. Elm fixture -> csexp bundle (node run.js, the gate's own compiler).
+    const node_cmd = b.addSystemCommand(&.{"node"});
+    node_cmd.addArg("elm-compiler/run.js");
+    node_cmd.addFileArg(b.path(fixture));
+    const bundle_lp = node_cmd.addOutputFileArg(b.fmt("{s}.csexp", .{name}));
+
+    // 2. csexp bundle -> generated Zig (aotdump, the REAL parser).
+    const dump_cmd = b.addRunArtifact(aotdump);
+    dump_cmd.addFileArg(bundle_lp);
+    dump_cmd.addArg(entry);
+    dump_cmd.addArg("-o");
+    const gen_lp = dump_cmd.addOutputFileArg("gen.zig");
+
+    // 3. The generated module (imports gc/vm/runtime.zig).
+    const aot_gen_mod = b.createModule(.{
+        .root_source_file = gen_lp,
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "gc", .module = gc_mod },
+            .{ .name = "vm", .module = vm_mod },
+            .{ .name = "runtime.zig", .module = aotrt_mod },
+        },
+    });
+
+    // 4. The aotbench driver exe (tools/aot/main.zig).
+    const exe_mod = b.createModule(.{
+        .root_source_file = b.path("tools/aot/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "gc", .module = gc_mod },
+            .{ .name = "vm", .module = vm_mod },
+            .{ .name = "runtime.zig", .module = aotrt_mod },
+            .{ .name = "aot_gen", .module = aot_gen_mod },
+        },
+    });
+    const exe = b.addExecutable(.{
+        .name = name,
+        .root_module = exe_mod,
+    });
+    const install = b.addInstallArtifact(exe, .{});
+    return &install.step;
+}
+
+/// Build the AOT'd todos TUI exe (aotbench-todos, Phase 4).  Same shape as
+/// addAotSpike but compiles TWO sources (the gate's exact pty_app todos set:
+/// examples/todos/TodoApp.elm + tests/elm-fixtures/todos.elm, which re-exports
+/// TodoApp.main as Todos.main) and links the elmvm-shaped todos driver
+/// (tools/aot/todos.zig) against gc + vm + aotrt + effectloop instead of the
+/// pure-bench aotbench driver.  The driver runs the baked entry, installs the
+/// applyHost hook, and drives the host effect loop under a pty (drop-in for
+/// elmvm in the pty gate).
+fn addAotTodosSpike(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    gc_mod: *std.Build.Module,
+    vm_mod: *std.Build.Module,
+    aotrt_mod: *std.Build.Module,
+    effectloop_mod: *std.Build.Module,
+    aotdump: *std.Build.Step.Compile,
+) *std.Build.Step {
+    const name = "aotbench-todos";
+
+    // 1. Elm sources -> csexp bundle (node run.js, the gate's own compiler).
+    const node_cmd = b.addSystemCommand(&.{"node"});
+    node_cmd.addArg("elm-compiler/run.js");
+    node_cmd.addFileArg(b.path("examples/todos/TodoApp.elm"));
+    node_cmd.addFileArg(b.path("tests/elm-fixtures/todos.elm"));
+    const bundle_lp = node_cmd.addOutputFileArg(b.fmt("{s}.csexp", .{name}));
+
+    // 2. csexp bundle -> generated Zig (aotdump, the REAL parser).
+    const dump_cmd = b.addRunArtifact(aotdump);
+    dump_cmd.addFileArg(bundle_lp);
+    dump_cmd.addArg("Todos.main");
+    dump_cmd.addArg("-o");
+    const gen_lp = dump_cmd.addOutputFileArg("gen.zig");
+
+    // 3. The generated module (imports gc/vm/runtime.zig).
+    const aot_gen_mod = b.createModule(.{
+        .root_source_file = gen_lp,
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "gc", .module = gc_mod },
+            .{ .name = "vm", .module = vm_mod },
+            .{ .name = "runtime.zig", .module = aotrt_mod },
+        },
+    });
+
+    // 4. The elmvm-shaped todos driver exe (tools/aot/todos.zig).
+    const exe_mod = b.createModule(.{
+        .root_source_file = b.path("tools/aot/todos.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "gc", .module = gc_mod },
+            .{ .name = "vm", .module = vm_mod },
+            .{ .name = "runtime.zig", .module = aotrt_mod },
+            .{ .name = "aot_gen", .module = aot_gen_mod },
+            .{ .name = "effectloop", .module = effectloop_mod },
+        },
+    });
+    const exe = b.addExecutable(.{
+        .name = name,
+        .root_module = exe_mod,
+    });
+    const install = b.addInstallArtifact(exe, .{});
+    return &install.step;
 }
 
 /// SAFETY-ENFORCEMENT (unit C): build one self-contained Shen GC test set
