@@ -1,7 +1,14 @@
-//! tools/aot/todos.zig — the AOT'd todos TUI driver (Phase 4 headline).
+//! tools/aot/run.zig — the generic AOT program driver (what aot-build links).
 //!
 //! elmvm-shaped CLI (the pty gate harness drives it unchanged):
-//!   aotbench-todos <bundle.csexp> <fn-name>
+//!   <bin> [bundle.csexp] [fn-name]
+//!
+//! The bundle and the entry are both baked at aot-build time: aotdump embeds
+//! the bundle text (pub const bundle) and emits the baked entry (aotEntry), so
+//! `<bin>` with NO arguments is the self-contained native binary.  Passing a
+//! bundle path overrides the embedded copy (ptytest / byte-diff symmetry with
+//! elmvm); fn-name is accepted for CLI symmetry and ignored, exactly like
+//! aotbench's.
 //!
 //! Loads the bundle, runs the generated aotInit (consts + globals cache +
 //! registry), runs the baked entry (aotEntry) to obtain the Program value,
@@ -11,12 +18,12 @@
 //! instead of a fresh interpreted vmExecEnv per call; an unregistered closure
 //! falls back to that same vmExecEnv (correctness never depends on coverage).
 //!
-//! MEASUREMENT (env-gated, so the pty frame stream on stdout stays byte-clean
-//! for the byte-identical diff):
-//!   AOTBENCH_INTERP=1    leave host_apply at the interpreted default
+//! MEASUREMENT (env-gated, so the frame stream on stdout stays byte-clean for
+//! the byte-identical diff):
+//!   AOTRUN_INTERP=1      leave host_apply at the interpreted default
 //!                        (hostcall.applyClosureN) — the elmvm baseline, timed
 //!                        on an IDENTICAL driver+pty+workload.
-//!   AOTBENCH_STATS_FILE= wrap host_apply in a timing counter and write
+//!   AOTRUN_STATS_FILE=   wrap host_apply in a timing counter and write
 //!                        "calls=… total_ns=… max_ns=… vmexec_fb=…" to that
 //!                        file at exit.
 
@@ -47,7 +54,7 @@ const VmError = state.VmError;
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]u8;
 
 // ---------------------------------------------------------------------
-//  Apply-timing counters (populated only when AOTBENCH_STATS_FILE is set)
+//  Apply-timing counters (populated only when AOTRUN_STATS_FILE is set)
 // ---------------------------------------------------------------------
 
 var apply_count: u64 = 0;
@@ -87,22 +94,24 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
     var it = init.minimal.args.iterate();
-    _ = it.next(); // program name
-    const bundle_path = it.next() orelse usage();
-    const fn_name = it.next() orelse usage(); // CLI symmetry; the entry is baked
-    _ = fn_name;
+    const prog = it.next() orelse "aot-run";
+    const bundle_arg: ?[]const u8 = it.next(); // optional: overrides the embedded bundle
+    const fn_name: ?[]const u8 = it.next(); // CLI symmetry; the entry is baked
+    if (fn_name != null and it.next() != null) usage(prog);
 
-    const interp_mode = getenv("AOTBENCH_INTERP") != null;
-    const stats_file: ?[]const u8 = if (getenv("AOTBENCH_STATS_FILE")) |p| std.mem.span(p) else null;
+    const interp_mode = getenv("AOTRUN_INTERP") != null;
+    const stats_file: ?[]const u8 = if (getenv("AOTRUN_STATS_FILE")) |p| std.mem.span(p) else null;
 
-    // ---- read the bundle file into a [:0]const u8 buffer ----
-    const file = try std.Io.Dir.openFile(.cwd(), io, bundle_path, .{});
-    defer std.Io.File.close(file, io);
-    const size = @as(usize, @intCast((try std.Io.File.stat(file, io)).size));
-    const raw = try a.alloc(u8, size + 1);
-    const n = try std.Io.File.readPositionalAll(file, io, raw[0..size], 0);
-    raw[n] = 0;
-    const bundle_z: [:0]const u8 = raw[0..n :0];
+    // ---- the bundle text: CLI arg, else the copy aotdump embedded ----
+    const bundle_z: [:0]const u8 = if (bundle_arg) |path| blk: {
+        const file = try std.Io.Dir.openFile(.cwd(), io, path, .{});
+        defer std.Io.File.close(file, io);
+        const size = @as(usize, @intCast((try std.Io.File.stat(file, io)).size));
+        const raw = try a.alloc(u8, size + 1);
+        const n = try std.Io.File.readPositionalAll(file, io, raw[0..size], 0);
+        raw[n] = 0;
+        break :blk raw[0..n :0];
+    } else aot_gen.bundle;
 
     // ---- init Gc + Vm ----
     var g = try heap.Gc.init(.{
@@ -117,7 +126,7 @@ pub fn main(init: std.process.Init) !void {
     // ---- load the bundle (registers each entry as a defun) ----
     const loaded = parser.parseBundle(&g, &v.symbols, &v, bundle_z);
     if (loaded <= 0) {
-        std.debug.print("aotbench-todos: bundle loaded 0 entries (bad bundle)\n", .{});
+        std.debug.print("aot-run: bundle loaded 0 entries (bad bundle)\n", .{});
         return error.BadBundle;
     }
 
@@ -147,7 +156,7 @@ pub fn main(init: std.process.Init) !void {
     defer g.rootPop();
     if (effectloop.isProgram(result)) {
         var final = effectloop.runProgram(&v, result) catch |e| {
-            std.debug.print("aotbench-todos: error: {s}\n", .{values.errSlice(v.err_slot)});
+            std.debug.print("aot-run: error: {s}\n", .{values.errSlice(v.err_slot)});
             return e;
         };
         g.rootPushValue(&final);
@@ -171,7 +180,7 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-fn usage() noreturn {
-    std.debug.print("usage: aotbench-todos <bundle.csexp> <fn-name>\n", .{});
+fn usage(prog: []const u8) noreturn {
+    std.debug.print("usage: {s} [bundle.csexp] [fn-name]\n  (no args = the bundle embedded at aot-build time)\n", .{prog});
     std.process.exit(2);
 }

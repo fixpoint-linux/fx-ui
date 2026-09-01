@@ -239,7 +239,26 @@ pub fn build(b: *std.Build) void {
     // source set as the gate's pty_app todos row (TodoApp.elm + the todos.elm
     // re-export fixture) so the bundle and entry (Todos.main) are identical to
     // what elmvm drives under the pty.
-    aot_step.dependOn(addAotTodosSpike(b, target, optimize, gc_mod, vm_mod, aotrt_mod, effectloop_mod, aotdump));
+    aot_step.dependOn(addAotApp(b, target, optimize, gc_mod, vm_mod, aotrt_mod, effectloop_mod, aotdump, "aotbench-todos", &.{
+        "examples/todos/TodoApp.elm",
+        "tests/elm-fixtures/todos.elm",
+    }, "Todos.main"));
+
+    // ---- `aot-build`: the 'elm make'-style command (tools/aot/aot-build.sh) ----
+    // Options-driven instance of addAotApp: -Dapp=<entry .elm> -Dentry=<Mod>.main
+    // -Dout=<exe name>.  The script extracts the entry module from the .elm
+    // module declaration and invokes this; the build graph owns the whole
+    // node run.js -> aotdump -> gen.zig -> native exe chain.  (The step only
+    // exists when -Dapp selects an app — invoke it through the script.)
+    if (b.option([]const u8, "app", "aot-build: path to the app's entry .elm source")) |app_path| {
+        const entry = b.option([]const u8, "entry", "aot-build: entry defun (<Module>.main)") orelse {
+            std.debug.print("build.zig: -Dapp={s} requires -Dentry=<Module>.main\n", .{app_path});
+            std.process.exit(1);
+        };
+        const out_name = b.option([]const u8, "out", "aot-build: output exe name") orelse "aot-app";
+        const aot_build_step = b.step("aot-build", "Build a self-contained native exe from an .elm app (see tools/aot/aot-build.sh)");
+        aot_build_step.dependOn(addAotApp(b, target, optimize, gc_mod, vm_mod, aotrt_mod, effectloop_mod, aotdump, out_name, &.{app_path}, entry));
+    }
 
     // This creates a top level step. Top level steps have a name and can be
     // invoked by name when running `zig build` (e.g. `zig build run`).
@@ -396,15 +415,16 @@ fn addAotSpike(
     return &install.step;
 }
 
-/// Build the AOT'd todos TUI exe (aotbench-todos, Phase 4).  Same shape as
-/// addAotSpike but compiles TWO sources (the gate's exact pty_app todos set:
-/// examples/todos/TodoApp.elm + tests/elm-fixtures/todos.elm, which re-exports
-/// TodoApp.main as Todos.main) and links the elmvm-shaped todos driver
-/// (tools/aot/todos.zig) against gc + vm + aotrt + effectloop instead of the
-/// pure-bench aotbench driver.  The driver runs the baked entry, installs the
-/// applyHost hook, and drives the host effect loop under a pty (drop-in for
-/// elmvm in the pty gate).
-fn addAotTodosSpike(
+/// Build one AOT'd program exe linked against the GENERIC driver
+/// (tools/aot/run.zig): node run.js compiles `sources` to a csexp bundle,
+/// aotdump emits a generated Zig module (embedding the bundle + baking the
+/// entry), and the exe links that module against gc + vm + aotrt +
+/// effectloop.  The driver runs the baked entry, installs the applyHost hook,
+/// and drives the host effect loop under a pty (drop-in for elmvm).  With no
+/// CLI bundle arg the exe runs the EMBEDDED bundle — the self-contained
+/// native binary `aot-build` emits.
+/// Returns the install step for the exe.
+fn addAotApp(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
@@ -413,20 +433,23 @@ fn addAotTodosSpike(
     aotrt_mod: *std.Build.Module,
     effectloop_mod: *std.Build.Module,
     aotdump: *std.Build.Step.Compile,
+    name: []const u8,
+    sources: []const []const u8,
+    entry: []const u8,
 ) *std.Build.Step {
-    const name = "aotbench-todos";
-
     // 1. Elm sources -> csexp bundle (node run.js, the gate's own compiler).
+    // A source may arrive as an absolute path (aot-build -Dapp), which b.path
+    // rejects — LazyPath.cwd_relative carries it (the script runs zig build
+    // from the build root, so cwd == build root).
     const node_cmd = b.addSystemCommand(&.{"node"});
     node_cmd.addArg("elm-compiler/run.js");
-    node_cmd.addFileArg(b.path("examples/todos/TodoApp.elm"));
-    node_cmd.addFileArg(b.path("tests/elm-fixtures/todos.elm"));
+    for (sources) |src| node_cmd.addFileArg(if (src[0] == '/') .{ .cwd_relative = src } else b.path(src));
     const bundle_lp = node_cmd.addOutputFileArg(b.fmt("{s}.csexp", .{name}));
 
     // 2. csexp bundle -> generated Zig (aotdump, the REAL parser).
     const dump_cmd = b.addRunArtifact(aotdump);
     dump_cmd.addFileArg(bundle_lp);
-    dump_cmd.addArg("Todos.main");
+    dump_cmd.addArg(entry);
     dump_cmd.addArg("-o");
     const gen_lp = dump_cmd.addOutputFileArg("gen.zig");
 
@@ -443,9 +466,9 @@ fn addAotTodosSpike(
         },
     });
 
-    // 4. The elmvm-shaped todos driver exe (tools/aot/todos.zig).
+    // 4. The generic driver exe (tools/aot/run.zig).
     const exe_mod = b.createModule(.{
-        .root_source_file = b.path("tools/aot/todos.zig"),
+        .root_source_file = b.path("tools/aot/run.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
