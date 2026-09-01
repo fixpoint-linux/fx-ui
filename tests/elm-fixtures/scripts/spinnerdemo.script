@@ -1,18 +1,21 @@
 # spinnerdemo: the Spinner widget (line preset, 100ms fps) driving Tea v2's
 # tick re-arm under a real pty.
-# Frame trace (each repaint is ONE write; first paint hides the cursor):
+# Frame trace (each repaint is ONE write; first paint hides the cursor;
+# repaints address rows ABSOLUTELY — \e[1;1H + \e[2K + char, no trailing
+# \r\n):
 #   resize probe (sync)  \e[?25l\e[2K|\r\n
-#   tick 1 (sleep 100)   \e[1A\e[2K/\r\n
-#   tick 2 (re-armed)    \e[1A\e[2K-\r\n
+#   tick 1 (sleep 100)   \e[1;1H\e[2K/
+#   tick 2 (re-armed)    \e[1;1H\e[2K-
 #   'q'                  \e[?25h + exit 0  (TaskQuit scan; the pending sleep
 #                         is dropped by the quit latch)
-# Frames cycle | / - \ every ~100ms, so needles span a frame BOUNDARY (prev
-# frame's tail \r\n -> next frame's \e[1A\e[2K<char>): such a substring cannot
-# exist until the NEXT frame is actually written, making every expect
+# Frames cycle | / - \ every ~100ms, so needles span a frame BOUNDARY (the
+# first-paint tail \r\n -> tick 1's \e[1;1H, then char -> \e[1;1H directly —
+# repaints emit no trailing \r\n): such a substring
+# cannot exist until the NEXT frame is actually written, making every expect
 # deterministic regardless of tick timing (R4: never assert tick counts).
 expect \e[?25l
-expect |\r\n\e[1A\e[2K/
-expect /\r\n\e[1A\e[2K-
+expect |\r\n\e[1;1H\e[2K/
+expect /\e[1;1H\e[2K-
 send q
 expect \e[?25h
 expect_exit 0

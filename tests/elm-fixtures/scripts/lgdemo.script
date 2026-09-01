@@ -10,7 +10,7 @@
 #   \e[2K\e[36m│\e[0m \e[1;36mlgdemo\e[0m<pad>\e[36m│\e[0m\r\n
 #   \e[2K\e[36m│\e[0m n=<k> last=<key> size=<c>x<r> <pad>\e[36m│\e[0m\r\n
 #   \e[2K\e[36m╰─…╯\e[0m\r\n
-# repaints are prefixed \e[6A (move up 6).
+# repaints rewrite CHANGED rows only, at absolute \e[row;1H addresses.
 #
 # Every directive is settled by an expect BEFORE the next fires — no two
 # events are ever pending at once (the host drains a pending SIGWINCH before

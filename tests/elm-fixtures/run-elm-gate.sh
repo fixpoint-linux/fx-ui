@@ -347,7 +347,7 @@ run spinunit    main   "$(read_expected spinunit)"
 # spinnerdemo: the tick re-arm under a real pty — init arms Io.sleep 100, and
 # every delivered Tick returns the NEXT tick command (Tea's FUser branch
 # re-arms nothing; the app's command IS the re-arm).  Needles span frame
-# boundaries (prev tail \r\n -> \e[1A\e[2K<next>) so tick timing is never
+# boundaries (prev tail \r\n -> \e[1;1H\e[2K<next>) so tick timing is never
 # asserted (R4); 'q' exercises the TaskQuit scan with a tick still pending.
 pty spinnerdemo main   spinnerdemo.script
 

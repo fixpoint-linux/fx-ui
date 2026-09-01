@@ -1,14 +1,4 @@
 "[?25l[2Kalpha
 [2Kbeta
-[2A[2Kalpha2
-[2Kbeta2
-[2Kgamma
-[3A[2Konly
-[J[1A
-[2Krow2
-[2A
-[2Krow2x
-[2Krow3
-[3A
-[J
+[1;1H[2Kalpha2[2;1H[2Kbeta2[3;1H[2Kgamma[1;1H[2Konly[2;1H[J[2;1H[2Krow2[2;1H[2Krow2x[3;1H[2Krow3[2;1H[J
 skipRender[prev=[],same,changed,deepEq]=0101"

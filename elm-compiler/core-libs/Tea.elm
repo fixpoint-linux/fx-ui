@@ -40,8 +40,10 @@ module Tea exposing
 --     eval set drains to zero (a delivery-time quit would leave a suspended
 --     read and the program would hang waiting for one more event);
 --   * the tea model is a plain record {mod, prev, rows, cols} — `mod` is the
---     user's model, `prev` the last painted frame (cursor rests one line
---     BELOW its last line), rows/cols the last resize dims;
+--     user's model, `prev` the last painted frame, rows/cols the last resize
+--     dims; repaints address rows ABSOLUTELY (\e[row;1H), so the cursor's
+--     resting place between frames is irrelevant (and mosh's predictive local
+--     echo, which parks the cursor anywhere, cannot derail a repaint);
 --   * every frame is joined into ONE string -> ONE TaskWrite -> one write(2)
 --     (PTY-deterministic single-write frames).
 
@@ -322,15 +324,17 @@ skipRender tea m1 =
 {-| Pure renderer: given the tea model, the NEW user model, and the view's
 new frame, return the updated model (mod = the new user model, prev = frame)
 and the ONE string to write.  The first paint (prev = []) hides the cursor
-and writes every line ("clear-line, text, \r\n").  A repaint moves up
-`len prev` rows, then writes the frame DIFFERENTIALLY: an unchanged line
-emits only the \r\n advance (its row on screen is already exactly its
-content), a changed line rewrites itself (clear-line + text + \r\n), lines
-past prev's end are painted fully (new rows), and a frame that shrunk gets
-a clear-to-end (\e[J) after its last line, wiping the stale rows below it.
-Every emitted line ends in \r\n, so the cursor always rests one line BELOW
-the last painted line and the next repaint's moveUp (len prev) lands exactly
-on the old frame's first row.
+and writes every line ("clear-line, text, \r\n").  A repaint DIFFS against
+prev with ABSOLUTE cursor addressing: a changed line rewrites itself at its
+own row (\e[row;1H + clear-line + text — NO trailing \r\n: the absolute
+position sets the row), an unchanged line emits NOTHING, lines past prev's
+end are painted fully (new rows), and a frame that shrunk moves to the row
+BELOW its new last line and clears-to-end (\e[J), wiping the stale rows
+below.  Nothing depends on where the cursor rests between frames — each
+rewrite is addressed absolutely — which is what keeps repaints correct under
+mosh's predictive local echo (it moves the cursor for its own echo, so a
+relative move-up + CRLF repaint would land one row low; vim-style absolute
+positioning does not).
 -}
 paint tea m frame =
   case tea.prev of
@@ -341,29 +345,31 @@ paint tea m frame =
 
     _ ->
       ( { mod = m, prev = frame, rows = tea.rows, cols = tea.cols }
-      , String.append (moveUp (List.length tea.prev))
-          (String.append (diffString tea.prev frame)
-            (if List.length frame < List.length tea.prev then
-                clearRest
+      , String.append (diffString 1 tea.prev frame)
+          (if List.length frame < List.length tea.prev then
+            -- Shrank: park the cursor on the row BELOW the new last line
+            -- (explicitly — the walk above may have emitted nothing) and
+            -- wipe everything below it.
+            String.append (moveTo (List.length frame + 1)) clearRest
 
-              else
-                ""
-            )
+          else
+            ""
           )
       )
 
 
-{-| The repaint body: walk prev and the new frame in lockstep.  An unchanged
-line (==) costs ONLY the line advance; a changed line costs a full rewrite;
-lines past prev's end are new rows and paint fully.  When prev runs out
-first, the remaining frame lines are all new; when the frame runs out first
-(shrunk), stop — paint appends clearRest for the stale rows below.
+{-| The repaint body: walk prev and the new frame in lockstep, carrying the
+1-based screen row.  An unchanged line (==) costs NOTHING; a changed line
+costs a full rewrite AT ITS ROW; when prev runs out first, the remaining
+frame lines are all new and paint fully; when the frame runs out first
+(shrunk), stop — paint appends \e[{n+1};1H + clearRest for the stale rows
+below.
 -}
-diffString : List String -> List String -> String
-diffString prev frame =
+diffString : Int -> List String -> List String -> String
+diffString row prev frame =
   case prev of
     [] ->
-      frameString frame
+      paintRest frame row
 
     p :: prevRest ->
       case frame of
@@ -372,10 +378,20 @@ diffString prev frame =
 
         line :: frameRest ->
           if line == p then
-            String.append newline (diffString prevRest frameRest)
+            diffString (row + 1) prevRest frameRest
 
           else
-            String.append (paintLine line) (diffString prevRest frameRest)
+            String.append (paintAt row line) (diffString (row + 1) prevRest frameRest)
+
+
+-- The all-new tail of a grown frame: every remaining line is a fresh row.
+paintRest frame row =
+  case frame of
+    [] ->
+      ""
+
+    line :: rest ->
+      String.append (paintAt row line) (paintRest rest (row + 1))
 
 
 -- Wrap a frame string into a perform-wrapped write: the delivery lands on
@@ -388,16 +404,20 @@ frameString frame =
   String.join "" (map paintLine frame)
 
 
+-- FIRST-paint line: clear-line + text + \r\n (the cursor walks down the
+-- frame as each line is written; only the first paint uses this form).
 paintLine line =
   String.append clearLine (String.append line newline)
 
 
-moveUp n =
-  if n == 0 then
-    ""
+-- REPAINT line: absolute row address + clear-line + text — no trailing
+-- \r\n (the address sets the row; nothing depends on the resting cursor).
+paintAt row line =
+  String.append (moveTo row) (String.append clearLine line)
 
-  else
-    String.append "\u{1B}[" (String.append (String.fromInt n) "A")
+
+moveTo row =
+  String.append "\u{1B}[" (String.append (String.fromInt row) ";1H")
 
 
 newline = "\r\n"

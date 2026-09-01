@@ -1,27 +1,31 @@
 # teademo: Tea program + TextInput widget under a real pty.
 # Frame trace (DIFFERENTIAL repaints: each frame is ONE write; first paint
-# hides the cursor; an unchanged line emits ONLY its \r\n advance, a changed
-# line rewrites as \e[2K + text + \r\n):
+# hides the cursor; repaints address rows ABSOLUTELY — a changed row
+# rewrites as \e[row;1H + \e[2K + text with NO trailing \r\n, an unchanged
+# row emits NOTHING):
 #   init    \e[?25l \e[2K\e[7m \e[0m\r\n
-#   'h'     \e[1A\e[2Kh\e[7m \e[0m\r\n
-#   'i'     \e[1A\e[2Khi\e[7m \e[0m\r\n
+#   'h'     \e[1;1H\e[2Kh\e[7m \e[0m
+#   'i'     \e[1;1H\e[2Khi\e[7m \e[0m
 #   \e[A    (NOTHING: ignored key -> UNCHANGED model -> runtime-owned
 #            skip-render drops the whole repaint — the frame would have been
-#            byte-identical.  Under a repaint this step wrote \e[1A\r\n.)
-#   0x7F    \e[1A\e[2Kh\e[7m \e[0m\r\n
+#            byte-identical, and even a repaint of an identical frame emits
+#            zero bytes: unchanged rows cost nothing.)
+#   0x7F    \e[1;1H\e[2Kh\e[7m \e[0m
 #   \r      \e[?25h + exit 0
 # The single expect below spans the 'i' frame's tail DIRECTLY into the
-# backspace frame's head: such a substring can only exist when the up-arrow
-# wrote NOTHING between them — under a no-op-key repaint the old \e[1A\r\n
-# churn would sit in between and the expect would time out.  So this asserts
-# BOTH halves of skip-render: the no-op key emits no repaint bytes, and the
-# changing update (backspace) still paints.
+# backspace frame's head (the 'i' frame no longer ends in \r\n — absolute
+# addressing leaves the cursor where the rewrite put it): such a substring
+# can only exist when the up-arrow wrote NOTHING between them — under a
+# no-op-key repaint of the old relative renderer the \e[1A\r\n churn would
+# sit in between and the expect would time out.  So this asserts BOTH halves
+# of skip-render: the no-op key emits no repaint bytes, and the changing
+# update (backspace) still paints.
 expect \e[?25l
 send hi
 expect hi\e[7m
 send \e[A
 send \x7f
-expect hi\e[7m \e[0m\r\n\e[1A\e[2Kh\e[7m
+expect hi\e[7m \e[0m\e[1;1H\e[2Kh\e[7m
 send \r
 expect \e[?25h
 expect_exit 0
