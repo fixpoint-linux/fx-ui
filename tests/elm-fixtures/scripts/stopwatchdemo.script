@@ -1,0 +1,32 @@
+# stopwatchdemo: the Stopwatch widget (250ms interval) driving Tea v2 under a
+# real pty (S9).
+#
+# The view is ONE row: "<state><elapsed>" — "stop 0s" fresh (Go New leaves
+# the watch STOPPED), "run <elapsed>" counting up, "stop <frozen>" paused.
+# All needles are key/event-driven; tick-timed elapsed repaints are NEVER
+# asserted (R4) EXCEPT the "run 1s" restart proof below, which is exactly
+# the StartStop-before-Tick ordering guarantee: 250ms ticks mean "run 1s"
+# only appears after FOUR accepted ticks — had the sleeping Tick overtaken
+# the StartStop delivery, it would be rejected while still stopped, no
+# re-arm would follow, and the counter would freeze below 1s forever:
+#   resize probe (sync)  \e[?25l\e[2Kstop 0s\r\n
+#   s (start)            \e[1;1H\e[2Krun 0s   (StartStop landed; the chained
+#                         sleeping Tick follows >= 250ms later)
+#   4th accepted tick    \e[1;1H\e[2Krun 1s   (the ordering proof)
+#   s (stop)             \e[1;1H\e[2Kstop <frozen>  (in-flight tick rejected)
+#   r (reset)            \e[1;1H\e[2Kstop 0s  (zeroed WITHOUT stopping)
+#   q                     \e[?25h + exit 0 (TaskQuit scan; any pending tick
+#                         sleep is dropped by the quit latch)
+# Escapes: \e[?25l hide cursor, \e[?25h show cursor.
+expect \e[?25l
+expect \e[2Kstop 0s\r\n
+send s
+expect \e[1;1H\e[2Krun 0s
+expect \e[1;1H\e[2Krun 1s
+send s
+expect \e[1;1H\e[2Kstop
+send r
+expect \e[1;1H\e[2Kstop 0s
+send q
+expect \e[?25h
+expect_exit 0

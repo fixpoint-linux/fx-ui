@@ -2,7 +2,7 @@
 # aot-build — 'elm make' for native binaries: one command from an .elm app to
 # a self-contained executable.
 #
-#   aot-build.sh <app.elm> [-o <out-bin>] [--entry <Module>.main]
+#   aot-build.sh <app.elm> [-o <out-bin>] [--entry <Module>.main] [-O <mode>]
 #
 # Pipeline (run directly, not through the zig build graph — the build-graph
 # node/aotdump steps trip a zig "failed command" quirk even when the command
@@ -23,17 +23,20 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
 usage() {
-  echo "usage: aot-build.sh <app.elm> [-o <out-bin>] [--entry <Module>.main]" >&2
+  echo "usage: aot-build.sh <app.elm> [-o <out-bin>] [--entry <Module>.main] [-O <mode>]" >&2
+  echo "  -O <mode>    zig optimize mode: Debug|ReleaseSafe|ReleaseFast|ReleaseSmall (default ReleaseFast)" >&2
   exit 2
 }
 
 app=""
 out=""
 entry=""
+optimize="ReleaseFast"
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) [ $# -ge 2 ] || usage; out="$2"; shift 2 ;;
     --entry) [ $# -ge 2 ] || usage; entry="$2"; shift 2 ;;
+    -O) [ $# -ge 2 ] || usage; optimize="$2"; shift 2 ;;
     -h|--help) usage ;;
     -*) echo "aot-build: unknown option: $1" >&2; usage ;;
     *) [ -z "$app" ] || { echo "aot-build: one .elm app per build (got '$app' and '$1')" >&2; exit 2; }
@@ -42,6 +45,10 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$app" ] || usage
 [ -f "$app" ] || { echo "aot-build: no such file: $app" >&2; exit 2; }
+case "$optimize" in
+  Debug|ReleaseSafe|ReleaseFast|ReleaseSmall) ;;
+  *) echo "aot-build: invalid optimize mode: $optimize (want Debug|ReleaseSafe|ReleaseFast|ReleaseSmall)" >&2; exit 2 ;;
+esac
 
 # The entry module from the `module <Name> exposing (...)` declaration.
 app_abs="$(cd "$(dirname "$app")" && pwd)/$(basename "$app")"
@@ -76,7 +83,7 @@ cat > "$work/build.zig" <<'BZ'
 const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseFast });
+    const optimize = b.standardOptimizeOption(.{});
     const gc_mod = b.createModule(.{ .root_source_file = b.path("vendor/zinc-vm/src/gc.zig"), .target = target, .optimize = optimize });
     const vm_mod = b.createModule(.{ .root_source_file = b.path("vendor/zinc-vm/src/vm.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "gc", .module = gc_mod }} });
     const aotrt_mod = b.createModule(.{ .root_source_file = b.path("tools/aot/runtime.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "gc", .module = gc_mod }, .{ .name = "vm", .module = vm_mod }} });
@@ -90,7 +97,7 @@ BZ
 # run the build from a dir where gen.zig is reachable: symlink gen.zig + build.zig into the work root.
 cp "$work/build.zig" "$ROOT/aot-build-build.zig"
 ln -sf "$work/gen.zig" "$ROOT/gen.zig"
-( cd "$ROOT" && zig build --build-file aot-build-build.zig --prefix "$work/out" )
+( cd "$ROOT" && zig build --build-file aot-build-build.zig --prefix "$work/out" -Doptimize="$optimize" )
 rm -f "$ROOT/aot-build-build.zig" "$ROOT/gen.zig"
 
 mkdir -p "$(dirname "$out")"

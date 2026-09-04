@@ -183,7 +183,9 @@ hasQuit cmd =
 exit =
   Task.perform (\_ -> FIgnored)
     (Task.andThen (\_ -> Io.quit)
-      (Task.andThen (\_ -> Io.rawMode False) (Io.writeString showCursor))
+      (Task.andThen (\_ -> Io.rawMode False)
+        (Io.writeString (String.append showCursor leaveAltScreen))
+      )
     )
 
 
@@ -340,7 +342,7 @@ paint tea m frame =
   case tea.prev of
     [] ->
       ( { mod = m, prev = frame, rows = tea.rows, cols = tea.cols }
-      , String.append hideCursor (frameString frame)
+      , String.append enterAltScreen (String.append hideCursor (frameString frame))
       )
 
     _ ->
@@ -429,3 +431,12 @@ clearRest = "\u{1B}[J"
 hideCursor = "\u{1B}[?25l"
 
 showCursor = "\u{1B}[?25h"
+
+-- Alternate-screen entry/exit.  mosh's predictive local echo echoes the FIRST
+-- typed char (it has no full-screen cue yet), which paints a stray line on the
+-- very first keypress.  Entering the alternate screen (\e[?1049h) is the
+-- standard signal that a program is full-screen (vim/htop do this), which makes
+-- mosh disable local echo for the session — so the first keypress stops echoing.
+enterAltScreen = "\u{1B}[?1049h"
+
+leaveAltScreen = "\u{1B}[?1049l"

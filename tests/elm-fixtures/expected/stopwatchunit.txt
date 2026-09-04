@@ -1,0 +1,13 @@
+"new=v=0s run=0 el=0 id=0
+run=1
+walk=1s,2s,3s
+tags=1,2,3
+stale=3s tag=3
+hole=4s tag=4
+for=tick=3s run=1 el=3000
+rst=v=0s tag=3 run=1
+stopped=run=0 tick=4s
+heal=restarted=1 first=5s dup=5s tag=5
+fmt=250ms,1s,1.25s
+fmt2=1m0s,1m5s,1m30s
+fmt3=1h0m0s,1h2m0.5s"

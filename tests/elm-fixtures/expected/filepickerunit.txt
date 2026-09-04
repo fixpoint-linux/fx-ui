@@ -1,0 +1,26 @@
+"z
+walk dir=tests/elm-fixtures/input/dirlist/gamma sel=0 stack=held path=tests/elm-fixtures/input/dirlist/beta.txt
+inGamma dir=tests/elm-fixtures/input/dirlist/gamma n=0 stack=held
+back dir=tests/elm-fixtures/input/dirlist sel=0 stack=empty path=tests/elm-fixtures/input/dirlist/beta.txt
+restored dir=tests/elm-fixtures/input/dirlist names=gamma/,alpha.txt,beta.txt sel=0
+sticky path=tests/elm-fixtures/input/dirlist/beta.txt stack=empty highlighted=tests/elm-fixtures/input/dirlist/gamma
+new dir=. cursor=> perms=1 size=1 hidden=0 dirAllowed=0 fileAllowed=1 autoHeight=1 files=0
+id7=3 id0=1 raw2=2
+sort=sub/,alpha.txt,no.zzz
+perm=drwxr-xr-x,-rw-r--r--,-rwxr-xr-x,----------
+join=x,x,a/b/c parent=a/b,a,.,/
+dsf(dirAllowed)=just:tests/elm-fixtures/input/dirlist/beta.txt dsf(default)=none dsf(txt)=just:tests/elm-fixtures/input/dirlist/beta.txt dsf(zzz)=none
+dsdf(txt)=none dsdf(zzz)=just:tests/elm-fixtures/input/dirlist/beta.txt
+can empty=1 can zzz-no=1 can zzz-txt=0 can zzz-dir=0
+win5=sel=0/min=0/max=1 d2=sel=2/min=1/max=2 d5=sel=4/min=3/max=4 u1=sel=3/min=3/max=4 u2=sel=2/min=2/max=3 uTop=sel=0/min=0/max=1
+top=sel=0/min=0/max=1 last=sel=4/min=3/max=4
+pd1=sel=2/min=2/max=3 pd2=sel=4/min=2/max=4 pu1=sel=2/min=0/max=2 pu2=sel=0/min=0/max=2
+setH=sel=0/min=0/max=1 rsz=sel=0/min=0/max=0
+v1[  drwxr-xr-x   4096 sub
+> -rw-r--r--  12345 alpha.txt
+  -rw-r--r--      7 no.zzz
+]
+v2[  Bummer. No Files Found.
+                         ]
+v3[[38;5;247m>[0m[38;5;247m alpha.txt[0m
+]"

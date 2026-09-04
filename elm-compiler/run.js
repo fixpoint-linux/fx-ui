@@ -39,7 +39,8 @@ const CORPUS = [
        'Tuple.elm', 'JsArray.elm', 'Array.elm', 'Tea.elm', 'TextInput.elm',
        'Str.elm', 'Lipgloss.elm', 'Key.elm', 'Help.elm', 'Paginator.elm',
        'Progress.elm', 'Spinner.elm', 'Viewport.elm', 'Textarea.elm',
-       'ListBox.elm', 'Table.elm' ]
+       'ListBox.elm', 'Table.elm', 'Timer.elm', 'Stopwatch.elm', 'Tree.elm',
+       'FilePicker.elm' ]
     .map((f) => fs.readFileSync(path.join(__dirname, 'core-libs', f), 'utf8')),
 ];
 

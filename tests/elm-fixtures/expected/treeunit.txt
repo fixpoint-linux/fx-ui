@@ -1,0 +1,48 @@
+"golden=→ ▼ ~/charm                                                           
+  ├──ayman                                                            
+  ├──▼ bash                                                           
+  │  └──▼ tools                                                       
+  │     ├──zsh                                                        
+  │     └──doom-emacs                                                 
+  ├──▼ carlos                                                         
+  │  └──▼ emotes                                                      
+  │     ├──chefkiss.png                                               
+  │     └──kekw.png                                                   
+  └──maas                                                             
+                                                                      
+↓/j down • ↑/k up • ⏎ toggle • ? more                                 
+closed=→ ▶ ~/charm                                                           
+                                                                      
+                                                                      
+                                                                      
+                                                                      
+                                                                      
+                                                                      
+                                                                      
+                                                                      
+                                                                      
+                                                                      
+                                                                      
+↓/j down • ↑/k up • ⏎ toggle • ? more                                 
+toggleEq=1
+reopenEq=1
+walk=1/2/3
+nodes=tools
+cursor6=→ ├──▼ carlos  
+bottom=10/maas
+up2=8 top=0
+allnodes=11
+nodeAt10=maas
+nodeAt11=nothing
+tallpg=8@5,16@13,8@4,4@1,5@2
+enterClose=▶ ~
+lOpen=1
+hClose=1 vis=8
+jkgG=1/10/0
+badkey=1 y=1
+nohelp=13 back=13
+helpall=1 rows=17
+styled=[1;38;5;212m→[0m [38;2;92;92;92m▼ [0m[1;38;2;238;111;248m~/charm[0m                             
+setnodes=2/1
+wide0=→ wwwwwwwwwwwwwwwwww
+wide1=          "

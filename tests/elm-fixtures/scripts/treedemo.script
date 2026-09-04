@@ -1,0 +1,47 @@
+# treedemo: the Tree widget driving Tea v2 under a real pty (S10).
+#
+# The view is a live "cur=<y> <value>:<open>" header above the tree, so every
+# state has a UNIQUE needle.  The demo app keeps a scalar model and rebuilds
+# the widget transiently (the full Tree.Model exceeds the pty buffer), so the
+# needles also prove the rebuild restores selection + open flags exactly.
+# Coverage: j walks the preorder over VISIBLE nodes (a closed parent's
+# children are skipped: h on bash makes the next j land on carlos), h/l
+# close/open the selected node, enter toggles the root, g/G jump to the
+# top/bottom of the visible tree, ? flips short->full help (the full block's
+# "½ page down" desc is the needle) and back.  The flip-BACK needle is the
+# differential renderer's SHRINK-CLEAR \e[15;1H\e[J (the 18-row full-help
+# frame collapsing to the 14-row short frame): the short help line itself is
+# SGR-wrapped (\e[38;...m⏎\e[0m toggle — no plain "⏎ toggle" substring) and
+# its first-paint twin would stale-match, while \e[J is emitted exactly once,
+# when a frame shrinks.  q quits via the TaskQuit scan.
+#
+# The tree rows render through the DEFAULT dark styleset (SGR bytes between
+# every cell — see treeunit for the byte-exact stripped render), so the
+# needles here are the PLAIN header/substrings only; trailing-space row
+# padding is never asserted (R4).
+#
+# Escapes: \e[?25l hide cursor, \e[?25h show cursor.
+expect \e[?25l\e[2Kcur=0 ~/charm:1\r\n
+send j
+expect cur=1 ayman:0
+send j
+expect cur=2 bash:1
+send h
+expect cur=2 bash:0
+send j
+expect cur=3 carlos:1
+send G
+expect cur=7 maas:0
+send g
+expect cur=0 ~/charm:1
+send \r
+expect cur=0 ~/charm:0
+send l
+expect cur=0 ~/charm:1
+send ?
+expect ½ page down
+send ?
+expect \e[15;1H\e[J
+send q
+expect \e[?25h
+expect_exit 0

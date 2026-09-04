@@ -1,0 +1,51 @@
+# filepickerdemo: the FilePicker widget driving Tea v2 under a real pty (S11).
+#
+# The view is a live "#<presses> dir=<last segment> n=<count> sel=<name|->
+# pick=<0|1>" header above the widget rows: the press counter makes every
+# frame's needle unique forever (an expect needle that occurred in an earlier
+# frame stale-matches instantly), so the needles below each pin exactly one
+# state transition.  The widget rows themselves are SGR-wrapped per cell
+# (default dark styleset), so only the PLAIN header is ever asserted; the
+# async listing round trip shows up as the STALE-files frames: after l into
+# gamma the dir flips with n still 3 (the old listing) until the GotDir
+# lands (n=0 — the hidden .keep filters to an empty listing / "Bummer"), and
+# after h back the stack-restored sel reads "-" off the still-empty listing
+# until the parent GotDir lands.
+# Coverage: init listing, j/j walk, G clamp at the last row, k back, g to
+# top, k clamp at the top, enter on a FILE records the path (pick 1, sticky
+# across g/l/h — dirAllowed=false directories never record), l descends into
+# gamma (push + re-list), h pops the stack and re-lists the parent (sel
+# restored to the pushed 0 = gamma).  q quits via the TaskQuit scan.
+#
+# Escapes: \e[?25l hide cursor, \e[?25h show cursor.
+expect \e[?25l
+expect #0 dir=dirlist n=3 sel=gamma pick=0
+send j
+expect #1 dir=dirlist n=3 sel=alpha.txt pick=0
+send j
+expect #2 dir=dirlist n=3 sel=beta.txt pick=0
+send G
+expect #3 dir=dirlist n=3 sel=beta.txt pick=0
+send k
+expect #4 dir=dirlist n=3 sel=alpha.txt pick=0
+send g
+expect #5 dir=dirlist n=3 sel=gamma pick=0
+send k
+expect #6 dir=dirlist n=3 sel=gamma pick=0
+send j
+expect #7 dir=dirlist n=3 sel=alpha.txt pick=0
+send j
+expect #8 dir=dirlist n=3 sel=beta.txt pick=0
+send \r
+expect #9 dir=dirlist n=3 sel=beta.txt pick=1
+send g
+expect #10 dir=dirlist n=3 sel=gamma pick=1
+send l
+expect #11 dir=gamma n=3 sel=gamma pick=1
+expect #11 dir=gamma n=0 sel=- pick=1
+send h
+expect #12 dir=dirlist n=0 sel=- pick=1
+expect #12 dir=dirlist n=3 sel=gamma pick=1
+send q
+expect \e[?25h
+expect_exit 0

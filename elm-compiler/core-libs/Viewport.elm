@@ -8,6 +8,7 @@ module Viewport exposing
   , setHeight
   , setHorizontalStep
   , maxYOffset
+  , maxHeight
   , maxXOffset
   , atTop
   , atBottom

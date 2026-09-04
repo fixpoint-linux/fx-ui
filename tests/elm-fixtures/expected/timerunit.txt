@@ -1,0 +1,15 @@
+"new=5s run=1 to=0 id=0
+walk=4s,3s,2s,1s,0s
+cross=run=0 to=1 v=0s
+t6=0s to=1
+tag=5s for=5s wild=4s
+stop=run=0 tick=5s
+restart=run=1 v=5s
+ssFor=1 ssWild(run field)=0
+toStart=run=0 to=1
+notice=5s run=1
+neg=-500ms to=1
+fmt=59s,1m0s,1m1s
+fmt2=1h0m0s,1h1m1.5s,2h2m5s
+fmt3=1.5s,1.05s,1.005s
+fmt4=750ms,50ms,0s"

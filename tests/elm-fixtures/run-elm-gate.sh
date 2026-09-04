@@ -409,6 +409,78 @@ run tableunit    main   "$(read_expected tableunit)"
 # quits.
 pty tabledemo    main   tabledemo.script
 
+# --- S9 (M-WIDGETS): timer + stopwatch — Cmd-producing widgets #2/#3 ---
+# timerunit: the Go update semantics over model-only folds — the 5s/1s
+# countdown crossing zero on the 5th accepted tick (6th REJECTED: Running()
+# false), the vestigial tag guard, ID routing with the 0 wildcard, the
+# StartStop flip vs the tick gate, the timed-out state (a StartStop cannot
+# resurrect it), and the byte-exact Go duration formats ("1m30s"/"1h0m0s"
+# zero components, ".5s"/".05s"/".005s" fractions, "750ms", "0s", the
+# negative "-500ms").
+run timerunit     main   "$(read_expected timerunit)"
+# stopwatchunit: New leaves the watch STOPPED at "0s", accepted ticks ADD
+# one interval and BUMP the tag, the tag guard drops a stale tick, the tag-0
+# hole is Go parity (0 > 0 is false), Reset zeroes WITHOUT touching tag/run,
+# and the restart heal (first same-tag tick accepted, duplicate rejected).
+run stopwatchunit main   "$(read_expected stopwatchunit)"
+# timerdemo: the tick re-arm under a real pty — s stop/start flips the
+# header deterministically, the countdown resumes from the frozen value, the
+# crossing tick fires the Timedout notice ("over 0s"); q quits with the
+# timeout chain drained.
+pty timerdemo     main   timerdemo.script
+# stopwatchdemo: the StartStop-before-Tick ordering proof under a real pty —
+# after s(start), "run 1s" can only appear if the StartStop delivery landed
+# before the chained sleeping Tick (an overtaken tick freezes the watch
+# below 1s forever); s stop, r reset-while-stopped ("stop 0s"); q quits.
+pty stopwatchdemo main   stopwatchdemo.script
+
+# --- S10 (M-WIDGETS): tree — the PURE widget (model-only update) ---
+# treeunit: the byte-exact UNSTYLED render (plainStyles + blanked help
+# styles) equal to the ansi-stripped default_tree.golden — the "→ ▼ " cursor
+# + root-indicator line, the "│  "/"   " indenter segments, the "├──"/
+# "└──" enumerators glued to the values, per-parent "▼ " indicators, the
+# 70-column viewport padding, the blank help padding row — plus the
+# close/open/toggle folds, the preorder y-offset walk over VISIBLE nodes,
+# goToBottom/goToTop, the 8-high-viewport scrolloff reveal (off = min 5,
+# 8//2 = 4) with the pageUp reveal-above pin, the cursor column riding the
+# selected row, the key surface (enter/l/h/j/G/g through `update`, an
+# unmatched key a no-op), the help flip (showAll + Go's no-SetSize quirk
+# keeping the 11-row viewport: 17 total rows), the dark styleset painting
+# SGR bytes (bold+212 cursor, #5C5C5C indicator, #EE6FF8+bold selected
+# root), and SetNodes clamping a kept selection into the new tree's size.
+# The wide rows pin the over-wide root value at width 70: the tree block
+# wraps at the FULL width (one row, the viewport cutting the cursor-joined
+# row back to width), not at width - cursor - frame.
+run treeunit main   "$(read_expected treeunit)"
+# treedemo: the tree under a real pty — the scalar-model rebuild (the full
+# Tree.Model exceeds the pty buffer) restores selection + open flags exactly;
+# j walks the preorder over visible nodes (a closed parent's children are
+# skipped), h/l close/open, enter toggles the root, g/G jump, ? flips
+# short->full help and back; q quits.
+pty treedemo     main   treedemo.script
+
+# --- S11 (M-WIDGETS): filepicker — the RUNTIME-DEPENDENT widget (host listDir
+# + stat through the module's own readDirCmd) ---
+# filepickerunit: the full host round trip over input/dirlist (committed
+# stable files) — the sorted listing (dirs first then name, hidden .keep
+# filtered to n=0 in gamma/), the scripted j j enter k k enter walk (enter
+# records the file path — enter matches open AND select — then descends into
+# gamma pushing the stack) and the h back-out (pop restoration + the sticky
+# path), GotDir id routing, the window folds over a 5-entry/2-high picker
+# (down/up scroll shifts + clamps, g/G, pageDown/pageUp clamps), resize's
+# AutoHeight rows-5 recompute + setHeight, did-/canSelect (kind gate,
+# dirAllowed, AllowedTypes suffixes, the disabled-type didSelect), the pure
+# helpers (permOf modes, joinPath/parentDir shapes, sortEntries), and the
+# byte-exact plainStyles views (cursor column, %7s sizes, disabled row, the
+# padded "Bummer" block) + the default styleset's fg-247 disabled-row SGR.
+run filepickerunit main   "$(read_expected filepickerunit)"
+# filepickerdemo: the picker under a real pty — the "#<n> dir= n= sel= pick="
+# header gives every frame a unique needle: j/j walk, G/k clamps at both
+# ends, enter on a file records the sticky pick, l descends into gamma (the
+# stale-listing frame then the GotDir n=0 "Bummer"), h pops the stack and
+# re-lists the parent (restored sel); q quits.
+pty filepickerdemo main   filepickerdemo.script
+
 # --- S7: typechecker extensible-record surface (scoped labels) ---
 run rowpoly     main   "$(read_expected rowpoly)"
 run extrec      main   "$(read_expected extrec)"

@@ -1,0 +1,26 @@
+# timerdemo: the Timer widget (5s timeout, 1s interval) driving Tea v2 under
+# a real pty (S9).
+#
+# The view is ONE row: "<state><remaining>" — "run 5s" while counting down,
+# "stop <frozen>" while paused, "over 0s" once timed out.  Key-driven header
+# flips are deterministic needles; tick-timed countdown repaints are NEVER
+# asserted (R4) — only the first paint and the event-driven "over" flip:
+#   resize probe (sync)  \e[?25l\e[2Krun 5s\r\n
+#   tick 1 (sleep 1s)    \e[1;1H\e[2Krun 4s   (no trailing \r\n)
+#   s (stop)             \e[1;1H\e[2Kstop <frozen>s
+#   s (start)            \e[1;1H\e[2Krun <frozen>s   (re-arms; the countdown
+#                         resumes from the frozen value)
+#   5th accepted tick     Timedout notice -> \e[1;1H\e[2Kover 0s
+#                         (rejected ticks repaint nothing — skipRender)
+#   q                     \e[?25h + exit 0 (TaskQuit scan)
+# Escapes: \e[?25l hide cursor, \e[?25h show cursor.
+expect \e[?25l
+expect 5s\r\n
+send s
+expect \e[1;1H\e[2Kstop
+send s
+expect \e[1;1H\e[2Krun
+expect \e[1;1H\e[2Kover 0s
+send q
+expect \e[?25h
+expect_exit 0
