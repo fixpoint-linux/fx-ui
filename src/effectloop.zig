@@ -43,6 +43,14 @@ const symbols = @import("vm").symbols;
 const execplan = @import("vm").execplan;
 const hostcall = @import("vm").hostcall;
 
+// P2 photon-gui: the SDL-free GUI pure logic (keymap/layout/records) and the
+// window backend selected by build.zig (-Dgui: gui_sdl.zig | gui_stub.zig).
+const gui = @import("gui_model");
+const guibackend = @import("gui_backend");
+// P4 photon-gui: the host TerminalRenderer (byte-parity twin of Tea's paint
+// path) for TaskRender frames that arrive with no GUI window open.
+const terminal = @import("terminal");
+
 const Gc = gc.Gc;
 const Value = types.Value;
 const ValueArray = types.ValueArray;
@@ -169,6 +177,7 @@ const Eff = union(enum) {
     readmouse: ReadMouseEff,
     sleep: SleepEff,
     winch, // SIGWINCH wait — no per-eval fd (all share HostLoop.winch_fd)
+    guipipe, // TaskGuiPoll wait — no per-eval fd/buf (shares gui_buf/pending)
 };
 
 /// A decoded terminal key, before it is built into a host Key vector.  The
@@ -253,7 +262,7 @@ const Eval = struct {
     eff: Eff = .none,
 };
 
-const PollRole = enum { readfile, exec_out, exec_err, readkey, winch };
+const PollRole = enum { readfile, exec_out, exec_err, readkey, winch, guipipe };
 
 const Child = struct {
     pid: c_int = -1,
@@ -309,6 +318,21 @@ const HostLoop = struct {
     /// winch eval — on readiness drainWinch completes ALL of them with a fresh
     /// TIOCGWINSZ read.
     winch_fd: i32 = -1,
+    /// P1 photon-gui: --render-dump latch (elmvm flag).  When set, leafRender
+    /// dumps the decoded TaskRender Frame payload to stderr as a fixture
+    /// oracle INSTEAD of drawing (oracle mode — see leafRender).
+    render_dump: bool = false,
+    /// P4 photon-gui: host TerminalRenderer state (the per-row damage cache
+    /// over ENCODED rows — the twin of Tea's `prev`).  Since the Tea.elm
+    /// switch, TaskRender frames arriving with no GUI window open ARE the
+    /// terminal path (always-on; the FX_HOSTTERM bring-up gate is gone).
+    term: terminal.TerminalRenderer = terminal.TerminalRenderer.init(pa),
+    /// P2 photon-gui self-pipe state: leftover record bytes from a partial
+    /// read (a fixed-size record straddling a read boundary) and decoded
+    /// records queued for the next guiPoll arm (typeahead, like
+    /// pending_events — one record completes ONE guiPoll eval).
+    gui_buf: std.ArrayListUnmanaged(u8) = .empty,
+    gui_pending: std.ArrayListUnmanaged(gui.EvRecord) = .empty,
 
     const model_slot = 0;
     const update_slot = 1;
@@ -464,6 +488,14 @@ const HostLoop = struct {
                 try self.leafListDir(eval);
             } else if (std.mem.eql(u8, name, "TaskStat")) {
                 try self.leafStat(eval);
+            } else if (std.mem.eql(u8, name, "TaskRender")) {
+                try self.leafRender(eval);
+            } else if (std.mem.eql(u8, name, "TaskGuiOpen")) {
+                try self.leafGuiOpen(eval);
+            } else if (std.mem.eql(u8, name, "TaskGuiPoll")) {
+                try self.leafGuiPoll(eval);
+            } else if (std.mem.eql(u8, name, "TaskGuiClose")) {
+                try self.leafGuiClose(eval);
             } else {
                 // Unknown Task ctor — drop the evaluation defensively.
                 self.deactivate(eval);
@@ -1331,6 +1363,222 @@ const HostLoop = struct {
         return acc_r;
     }
 
+    // -------------------------------------------------------------
+    //  GUI leaves (photon-gui P1 stubs -> P2 real): TaskRender /
+    //  TaskGuiOpen / TaskGuiPoll / TaskGuiClose
+    // -------------------------------------------------------------
+
+    /// TaskRender frame — decode the Frame payload (the Elm-built DrawList,
+    /// Draw.Frame = List (List (Span String Int Int Int)) ctor vectors) and,
+    /// when the --render-dump latch is set, dump the decoded structure to
+    /// stderr as a fixture oracle.  When a GUI window is open, decode the
+    /// frame into plain spans and hand it to the backend, which layouts it
+    /// onto the cell grid, feeds the rencache damage tracker, and presents
+    /// ONLY the dirty rects.  With NO window open the frame is the TERMINAL
+    /// path (P4 switched): TerminalRenderer diffs+paints it to fd 1.  Always
+    /// completes with unit: the render result is consumed host-side.  A
+    /// decode/present failure is fail-soft (the frame is skipped, the task
+    /// still completes).
+    fn leafRender(self: *HostLoop, eval: *Eval) VmError!void {
+        const frame = self.slots[eval.base].payload.vector.data.?[1];
+        if (self.render_dump) {
+            // Oracle mode: dump the decoded Frame INSTEAD of drawing — the
+            // dump fixtures pin the decoded seam bytes in the same captured
+            // streams the draw would pollute (P1 renderdump contract).
+            dumpFrame(frame);
+        } else if (guibackend.opened()) {
+            var arena = std.heap.ArenaAllocator.init(pa);
+            defer arena.deinit();
+            if (decodeFrameSpans(arena.allocator(), frame)) |rows| {
+                guibackend.present(rows);
+            } else |_| {}
+        } else {
+            // P4 switched: terminal-mode TaskRender (Tea.program submitting
+            // Draw.fromAnsiLog view) — render the Frame to the terminal with
+            // the byte-parity Tea.paint twin.  ONE write per frame (the
+            // TaskWrite single-write discipline); fail-soft on decode/OOM.
+            var arena = std.heap.ArenaAllocator.init(pa);
+            defer arena.deinit();
+            if (decodeFrameSpans(arena.allocator(), frame)) |rows| {
+                var aw: std.Io.Writer.Allocating = .init(pa);
+                defer aw.deinit();
+                self.term.render(&aw.writer, rows) catch {};
+                writeFdAll(1, aw.writer.buffered());
+            } else |_| {}
+        }
+        self.slots[resultSlot(eval)] = values.valNil();
+        try self.completeSuccess(eval);
+    }
+
+    /// TaskGuiOpen title cols rows — open the SDL window (title, cell dims
+    /// -> px via the font metrics).  Fail-soft: without -Dgui (stub backend)
+    /// or on an SDL/font failure this completes unit and the armed guiPoll
+    /// then completes unit too, which Tea's GUI branch treats as GIgnore —
+    /// the program drains to exit instead of hanging.
+    fn leafGuiOpen(self: *HostLoop, eval: *Eval) VmError!void {
+        const data = self.slots[eval.base].payload.vector.data.?;
+        const cols = @as(u16, @intCast(@max(@min(numOf(data[2]), 4096), 1)));
+        const rows = @as(u16, @intCast(@max(@min(numOf(data[3]), 4096), 1)));
+        _ = guibackend.open(pa, values.strSlice(data[1]), cols, rows);
+        self.slots[resultSlot(eval)] = values.valNil();
+        try self.completeSuccess(eval);
+    }
+
+    /// TaskGuiPoll — the GUI analogue of leafReadKey over the SDL event
+    /// thread's SELF-PIPE: complete ONE event record at a time.  A queued
+    /// record (decoded by an earlier drain) pops first (typeahead); else the
+    /// eval suspends (.guipipe) until the pipe polls readable.
+    /// HARD RULE (renderer/gui_sdl.zig): the SDL thread never touches the
+    /// VM/GC — the records crossing the pipe are fixed-size PODs and ALL
+    /// Value manufacture happens HERE, on the effectloop thread.
+    fn leafGuiPoll(self: *HostLoop, eval: *Eval) VmError!void {
+        if (!guibackend.opened()) {
+            self.slots[resultSlot(eval)] = values.valNil();
+            try self.completeSuccess(eval);
+            return;
+        }
+        if (self.popGuiPending()) |rec| {
+            const v = try self.guiBuildEvent(rec);
+            self.slots[resultSlot(eval)] = v;
+            try self.completeSuccess(eval);
+            return;
+        }
+        eval.eff = .guipipe;
+        _ = try self.guiPipeDrain(eval); // completes or suspends
+    }
+
+    /// TaskGuiClose — tear the window down (joins the SDL event thread,
+    /// destroys the window, frees fonts/glyphs/tracker).  Idempotent.
+    fn leafGuiClose(self: *HostLoop, eval: *Eval) VmError!void {
+        guibackend.close();
+        self.slots[resultSlot(eval)] = values.valNil();
+        try self.completeSuccess(eval);
+    }
+
+    /// Drain the GUI self-pipe: parse every complete buffered record into
+    /// the queue (expose records invalidate the backend instead of queuing),
+    /// pop one for THIS eval, or read more bytes; WouldBlock suspends.  Pipe
+    /// EOF / a read error means the event thread is gone — complete GClose
+    /// so Tea takes its exit path.  Returns true iff the eval COMPLETED.
+    fn guiPipeDrain(self: *HostLoop, eval: *Eval) VmError!bool {
+        const fd = guibackend.eventFd();
+        var tmp: [4096]u8 = undefined;
+        while (true) {
+            while (self.gui_buf.items.len >= @sizeOf(gui.EvRecord)) {
+                var rec: gui.EvRecord = undefined;
+                @memcpy(std.mem.asBytes(&rec), self.gui_buf.items[0..@sizeOf(gui.EvRecord)]);
+                const rest = self.gui_buf.items[@sizeOf(gui.EvRecord)..];
+                std.mem.copyForwards(u8, self.gui_buf.items[0..rest.len], rest);
+                self.gui_buf.items.len = rest.len;
+                if (rec.kind == @intFromEnum(gui.EvKind.expose)) {
+                    guibackend.invalidate(); // repaint-all, not a Tea event
+                } else {
+                    self.gui_pending.append(pa, rec) catch break;
+                }
+            }
+            if (self.popGuiPending()) |rec| {
+                const v = try self.guiBuildEvent(rec);
+                eval.eff = .none;
+                self.slots[resultSlot(eval)] = v;
+                try self.completeSuccess(eval);
+                return true;
+            }
+            const n = std.posix.read(fd, &tmp) catch |e| {
+                if (e == error.WouldBlock) return false; // suspend
+                break; // real error: fall to the EOF path
+            };
+            if (n == 0) break; // pipe EOF: the event thread exited
+            self.gui_buf.appendSlice(pa, tmp[0..n]) catch return false;
+        }
+        const v = self.buildKey0("GClose");
+        eval.eff = .none;
+        self.slots[resultSlot(eval)] = v;
+        try self.completeSuccess(eval);
+        return true;
+    }
+
+    /// Pop the first queued GUI record (typeahead), skipping expose records
+    /// (they only invalidate the backend).  Mirrors popPending.
+    fn popGuiPending(self: *HostLoop) ?gui.EvRecord {
+        while (self.gui_pending.items.len > 0) {
+            const rec = self.gui_pending.orderedRemove(0);
+            if (rec.kind == @intFromEnum(gui.EvKind.expose)) {
+                guibackend.invalidate();
+                continue;
+            }
+            return rec;
+        }
+        return null;
+    }
+
+    /// Manufacture the GuiEv value for one record — GKey (Key vector), GMouse
+    /// (MouseMsg vector), GResize (cols, rows), or GClose — on THIS thread
+    /// only.  The ctor spellings/tag arity are the Tea.elm GuiEv ADT
+    /// contract (GKey 1, GMouse 1, GResize 2, GClose/GIgnore 0).
+    fn guiBuildEvent(self: *HostLoop, rec: gui.EvRecord) VmError!Value {
+        switch (@as(gui.EvKind, @enumFromInt(rec.kind))) {
+            .key_down => {
+                if (gui.mapKey(rec.scancode, rec.ctrl != 0)) |desc| {
+                    switch (desc) {
+                        .named => |name| return self.buildKeyArg("GKey", self.buildKey0(name)),
+                        .ctrl => |c| {
+                            var cb = [1]u8{c};
+                            return self.buildKeyArg("GKey", self.buildKeyArg("KeyCtrl", values.valString(self.g, &cb)));
+                        },
+                    }
+                }
+                // Unmapped scancode (plain letter/digit/F-key): printables
+                // arrive as their text record — this one is swallowed.
+                return self.buildKey0("GIgnore");
+            },
+            .text => {
+                const txt = gui.filterTextInput(rec.text[0..rec.text_len]);
+                if (txt) |t| return self.buildKeyArg("GKey", self.buildKeyArg("KeyChar", values.valString(self.g, t)));
+                return self.buildKey0("GIgnore");
+            },
+            .mouse, .wheel => {
+                var ev = InputEvent{ .mouse = .{} };
+                const m = &ev.mouse;
+                if (rec.kind == @intFromEnum(gui.EvKind.wheel)) {
+                    m.action = .wheel;
+                    m.button = if (rec.button == 0) .wheel_up else .wheel_down;
+                } else {
+                    m.action = switch (rec.act) {
+                        @intFromEnum(gui.RecMouseAct.press) => .press,
+                        @intFromEnum(gui.RecMouseAct.release) => .release,
+                        else => .motion,
+                    };
+                    m.button = switch (rec.button) {
+                        1 => .left,
+                        2 => .middle,
+                        3 => .right,
+                        else => .none,
+                    };
+                }
+                const dims = guibackend.cellDims();
+                const grid = guibackend.gridSize();
+                const pos = gui.pxToCell(rec.x, rec.y, dims.w, dims.h, grid.cols, grid.rows);
+                m.x = pos.c;
+                m.y = pos.r;
+                return self.buildKeyArg("GMouse", self.buildMouse(ev));
+            },
+            .resize => {
+                const dims = guibackend.cellDims();
+                const cols = @divTrunc(@max(rec.x, 1), @max(dims.w, 1));
+                const rows = @divTrunc(@max(rec.y, 1), @max(dims.h, 1));
+                const v = values.valVector(self.g, 3);
+                const d = v.payload.vector.data.?;
+                d[0] = symbols.valSymbol(&self.vm.symbols, "GResize");
+                d[1] = values.valNumber(cols);
+                d[2] = values.valNumber(rows);
+                return v;
+            },
+            .close => return self.buildKey0("GClose"),
+            .expose => return self.buildKey0("GIgnore"), // drained pre-queue
+            .none => return self.buildKey0("GIgnore"),
+        }
+    }
+
     /// Build a host Key vector (bare ctor name + args in ctor order) rooted
     /// per execComplete: arg built + rooted first, then the vector, then plain
     /// stores (no GC alloc after the vector).  Tag compare is by name
@@ -1530,6 +1778,8 @@ const HostLoop = struct {
                 .readmouse => if (!self.stdin_eof) self.addPoll(i, 0, .readkey),
                 .sleep => {},
                 .winch => if (self.winch_fd >= 0) self.addPoll(i, self.winch_fd, .winch),
+                .guipipe => if (guibackend.eventFd() >= 0)
+                    self.addPoll(i, guibackend.eventFd(), .guipipe),
             }
         }
     }
@@ -1643,6 +1893,11 @@ const HostLoop = struct {
                     }
                 },
                 .winch => {}, // handled by drainWinch above
+                .guipipe => {
+                    // May have been completed by an earlier drain this round;
+                    // drain whichever guiPoll eval is still armed.
+                    if (eval.eff == .guipipe) _ = try self.guiPipeDrain(eval);
+                },
             }
         }
     }
@@ -1691,6 +1946,8 @@ const HostLoop = struct {
     /// Close/free every pending effect (error-exit cleanup): no zombies, no
     /// leaked fds/buffers.  No GC allocation — safe to run under any root set.
     fn cleanupAll(self: *HostLoop) void {
+        // P4: free the terminal renderer's damage cache (owned encoded rows).
+        self.term.deinit();
         // Mouse-off DECRST BEFORE the termios restore: once termios is back to
         // canonical echo the terminal re-reads the keyboard normally, but SGR
         // tracking modes are independent termios state — without the reset a
@@ -1741,8 +1998,19 @@ const HostLoop = struct {
                     // No per-eval fd/buffer — the shared signalfd is closed below.
                     eval.eff = .none;
                 },
+                .guipipe => {
+                    // No per-eval fd/buffer — the shared self-pipe dies with
+                    // the window close below.
+                    eval.eff = .none;
+                },
             }
         }
+        // Tear the GUI window down on ANY exit path (quit latch, error,
+        // drain): joins the SDL event thread so no write(2) outlives the
+        // pipe, and SDL_Quit() restores the video driver state.
+        if (guibackend.opened()) guibackend.close();
+        self.gui_buf.deinit(pa);
+        self.gui_pending.deinit(pa);
         if (self.winch_fd >= 0) {
             _ = close(self.winch_fd);
             self.winch_fd = -1;
@@ -1767,10 +2035,14 @@ pub fn isProgram(v: Value) bool {
     return std.mem.eql(u8, values.symSlice(tag), "Program");
 }
 
-/// Drive the M9 event loop over a Program vector, returning the final model.
-/// The caller must keep `prog` rooted for the duration (its data[1..3] are
-/// extracted into the loop's own permanent slots before any allocation).
+/// Drive the M9 event loop over a Program vector (default: no render dump).
 pub fn runProgram(vm: *Vm, prog: Value) VmError!Value {
+    return runProgramWith(vm, prog, false);
+}
+
+/// runProgram with the P1 --render-dump latch (elmvm flag): leafRender dumps
+/// each decoded TaskRender Frame to stderr.
+pub fn runProgramWith(vm: *Vm, prog: Value, render_dump: bool) VmError!Value {
     std.debug.assert(prog.tag == .vector);
     const data = prog.payload.vector.data.?;
 
@@ -1778,6 +2050,7 @@ pub fn runProgram(vm: *Vm, prog: Value) VmError!Value {
         .vm = vm,
         .g = vm.gc,
         .slots = [_]Value{values.valNil()} ** MAX_SLOTS,
+        .render_dump = render_dump,
     };
     vm.gc.rootPushValueArray(&loop.slots, &loop.nslots);
     defer vm.gc.rootPop();
@@ -1904,6 +2177,128 @@ fn singleCommandArgv(prog: *execplan.RProg) ?[:null]const ?[*:0]const u8 {
     return c.argv;
 }
 
+/// P1 render-dump decoder: walk the TaskRender payload Frame — a cons list of
+/// rows, each row a cons list of `Span` ctor vectors [tag text fg bg attrs] —
+/// with the buildKeyArg/buildKey0 read-only discipline (symSlice tag compare,
+/// direct payload reads, NO GC allocation or rooting), and print the decoded
+/// structure to stderr (fd 2).  This is the fixture oracle for the seam: what
+/// the host RECEIVES for one renderFrame, not what it would draw.
+fn dumpFrame(frame: Value) void {
+    const stats = frameStats(frame);
+    std.debug.print("render-dump rows={d} spans={d}\n", .{ stats.rows, stats.spans });
+    var r: usize = 0;
+    var cur = frame;
+    while (cur.tag == .cons) : (r += 1) {
+        const row = cur.payload.cons.car.?.*;
+        std.debug.print("r{d}:", .{r});
+        var sp = row;
+        while (sp.tag == .cons) {
+            const v = sp.payload.cons.car.?.*;
+            dumpSpanValue(v);
+            sp = sp.payload.cons.cdr.?.*;
+        }
+        if (sp.tag != .nil) std.debug.print(" <malformed row tail>", .{});
+        std.debug.print("\n", .{});
+        cur = cur.payload.cons.cdr.?.*;
+    }
+    if (cur.tag != .nil) std.debug.print("<malformed frame tail>\n", .{});
+}
+
+/// Count rows/spans of a Frame (read-only pre-walk for the header line).
+fn frameStats(frame: Value) struct { rows: usize, spans: usize } {
+    var rows: usize = 0;
+    var spans: usize = 0;
+    var cur = frame;
+    while (cur.tag == .cons) : (rows += 1) {
+        var sp = cur.payload.cons.car.?.*;
+        while (sp.tag == .cons) : (spans += 1) {
+            sp = sp.payload.cons.cdr.?.*;
+        }
+        cur = cur.payload.cons.cdr.?.*;
+    }
+    return .{ .rows = rows, .spans = spans };
+}
+
+/// One span: `fg=<n> bg=<n> attrs=<n> "<escaped text>"`, or a marker for a
+/// malformed payload (defensive — never an OOB read).
+fn dumpSpanValue(v: Value) void {
+    if (v.tag != .vector or v.payload.vector.len != 5) {
+        std.debug.print(" <malformed span>", .{});
+        return;
+    }
+    const d = v.payload.vector.data.?;
+    const tag = d[0];
+    if (tag.tag != .symbol or !std.mem.eql(u8, values.symSlice(tag), "Span") or d[1].tag != .string) {
+        std.debug.print(" <non-Span ctor>", .{});
+        return;
+    }
+    var buf: [1024]u8 = undefined;
+    std.debug.print(" fg={d} bg={d} attrs={d} \"{s}\"", .{
+        numOf(d[2]), numOf(d[3]), numOf(d[4]),
+        dumpEscape(&buf, values.strSlice(d[1])),
+    });
+}
+
+fn numOf(v: Value) i64 {
+    return if (v.tag == .number) v.payload.number else -999;
+}
+
+/// Printable-ASCII escape of span text: control bytes -> \xNN, `"` -> \",
+/// `\` -> \\.  Truncates at the buffer bound (a dump, not a renderer).
+fn dumpEscape(buf: []u8, s: []const u8) []const u8 {
+    var n: usize = 0;
+    for (s) |c| {
+        if (n + 4 >= buf.len) break;
+        if (c == '"') {
+            @memcpy(buf[n .. n + 2], "\\\"");
+            n += 2;
+        } else if (c == '\\') {
+            @memcpy(buf[n .. n + 2], "\\\\");
+            n += 2;
+        } else if (c >= 32 and c < 127) {
+            buf[n] = c;
+            n += 1;
+        } else {
+            _ = std.fmt.bufPrint(buf[n .. n + 4], "\\x{X:0>2}", .{c}) catch break;
+            n += 4;
+        }
+    }
+    return buf[0..n];
+}
+
+/// P2 render decoder: walk the TaskRender payload Frame — a cons list of
+/// rows, each row a cons list of `Span` ctor vectors [tag text fg bg attrs] —
+/// with the dumpFrame read-only discipline (symSlice tag compare, direct
+/// payload reads, NO GC allocation: span text bytes are duped into the
+/// caller's arena), producing plain gui.Span rows for the backend.  A
+/// malformed row tail/span is skipped (defensive, never an OOB read).
+fn decodeFrameSpans(alloc: std.mem.Allocator, frame: Value) ![]const []const gui.Span {
+    var rows: std.ArrayListUnmanaged([]const gui.Span) = .empty;
+    var cur = frame;
+    while (cur.tag == .cons) {
+        const row = cur.payload.cons.car.?.*;
+        var spans: std.ArrayListUnmanaged(gui.Span) = .empty;
+        var sp = row;
+        while (sp.tag == .cons) {
+            const v = sp.payload.cons.car.?.*;
+            sp = sp.payload.cons.cdr.?.*;
+            if (v.tag != .vector or v.payload.vector.len != 5) continue;
+            const d = v.payload.vector.data.?;
+            const tag = d[0];
+            if (tag.tag != .symbol or !std.mem.eql(u8, values.symSlice(tag), "Span") or d[1].tag != .string) continue;
+            spans.append(alloc, .{
+                .text = alloc.dupe(u8, values.strSlice(d[1])) catch break,
+                .fg = numOf(d[2]),
+                .bg = numOf(d[3]),
+                .attrs = numOf(d[4]),
+            }) catch break;
+        }
+        rows.append(alloc, spans.toOwnedSlice(alloc) catch &.{}) catch break;
+        cur = cur.payload.cons.cdr.?.*;
+    }
+    return rows.toOwnedSlice(alloc);
+}
+
 /// Task ctor arity (vector len == arity + 1), or null for an unknown ctor.
 fn taskArity(name: []const u8) ?i32 {
     if (std.mem.eql(u8, name, "TaskSucceed") or std.mem.eql(u8, name, "TaskFail") or
@@ -1912,14 +2307,17 @@ fn taskArity(name: []const u8) ?i32 {
         std.mem.eql(u8, name, "TaskCd") or std.mem.eql(u8, name, "TaskGlob") or
         std.mem.eql(u8, name, "TaskRawMode") or std.mem.eql(u8, name, "TaskSleep") or
         std.mem.eql(u8, name, "TaskMouseMode") or
-        std.mem.eql(u8, name, "TaskListDir") or std.mem.eql(u8, name, "TaskStat")) return 1;
+        std.mem.eql(u8, name, "TaskListDir") or std.mem.eql(u8, name, "TaskStat") or
+        std.mem.eql(u8, name, "TaskRender")) return 1;
+    if (std.mem.eql(u8, name, "TaskGuiOpen")) return 3;
     if (std.mem.eql(u8, name, "TaskAndThen") or std.mem.eql(u8, name, "TaskOnError") or
         std.mem.eql(u8, name, "TaskWriteFile") or std.mem.eql(u8, name, "TaskSetenv")) return 2;
     if (std.mem.eql(u8, name, "TaskReadLine") or std.mem.eql(u8, name, "TaskGetcwd") or
         std.mem.eql(u8, name, "TaskGetpid") or std.mem.eql(u8, name, "TaskReadKey") or
         std.mem.eql(u8, name, "TaskReadMouse") or
         std.mem.eql(u8, name, "TaskWinSize") or std.mem.eql(u8, name, "TaskWaitResize") or
-        std.mem.eql(u8, name, "TaskNow") or std.mem.eql(u8, name, "TaskQuit")) return 0;
+        std.mem.eql(u8, name, "TaskNow") or std.mem.eql(u8, name, "TaskQuit") or
+        std.mem.eql(u8, name, "TaskGuiPoll") or std.mem.eql(u8, name, "TaskGuiClose")) return 0;
     return null;
 }
 

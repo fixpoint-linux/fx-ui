@@ -37,7 +37,7 @@ const CORPUS = [
   fs.readFileSync(path.join(__dirname, 'src', 'Runtime.elm'), 'utf8'),
   ...[ 'Dict.elm', 'Set.elm', 'Maybe.elm', 'Result.elm',
        'Tuple.elm', 'JsArray.elm', 'Array.elm', 'Tea.elm', 'TextInput.elm',
-       'Str.elm', 'Lipgloss.elm', 'Key.elm', 'Help.elm', 'Paginator.elm',
+       'Str.elm', 'Lipgloss.elm', 'Draw.elm', 'Key.elm', 'Help.elm', 'Paginator.elm',
        'Progress.elm', 'Spinner.elm', 'Viewport.elm', 'Textarea.elm',
        'ListBox.elm', 'Table.elm', 'Timer.elm', 'Stopwatch.elm', 'Tree.elm',
        'FilePicker.elm' ]

@@ -1,4 +1,4 @@
-module TodoApp exposing (main)
+module TodoApp exposing (main, config)
 
 -- fx-ui example: a playable CLI todos app on the full widget stack — Tea v2
 -- (program loop), ListBox (the filterable, paginated todo list), TextInput
@@ -76,16 +76,19 @@ type Msg
   | Noop
 
 
+config =
+  { init = \_ -> ( initModel, Task.perform Loaded (Io.readFile "todos.txt") )
+  , update = update
+  , view = view
+  , resize = applyResize
+  , onKey = GotKey
+  , onMouse = \_ -> Noop
+  , mouse = MouseModeOff
+  }
+
+
 main =
-  program
-    { init = \_ -> ( initModel, Task.perform Loaded (Io.readFile "todos.txt") )
-    , update = update
-    , view = view
-    , resize = applyResize
-    , onKey = GotKey
-    , onMouse = \_ -> Noop
-    , mouse = MouseModeOff
-    }
+  program config
 
 
 initModel : Model

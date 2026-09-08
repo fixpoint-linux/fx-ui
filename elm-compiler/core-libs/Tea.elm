@@ -1,8 +1,8 @@
 module Tea exposing
   ( Config
   , program
+  , guiProgram
   , quit
-  , paint
   , skipRender
   )
 
@@ -40,12 +40,16 @@ module Tea exposing
 --     eval set drains to zero (a delivery-time quit would leave a suspended
 --     read and the program would hang waiting for one more event);
 --   * the tea model is a plain record {mod, prev, rows, cols} — `mod` is the
---     user's model, `prev` the last painted frame, rows/cols the last resize
---     dims; repaints address rows ABSOLUTELY (\e[row;1H), so the cursor's
+--     user's model, `prev` the last SUBMITTED frame (skipRender's unchanged-
+--     model guard), rows/cols the last resize dims; repaints address rows
+--     ABSOLUTELY (\e[row;1H, host-side), so the cursor's
 --     resting place between frames is irrelevant (and mosh's predictive local
 --     echo, which parks the cursor anywhere, cannot derail a repaint);
---   * every frame is joined into ONE string -> ONE TaskWrite -> one write(2)
---     (PTY-deterministic single-write frames).
+--   * every frame is submitted as ONE TaskRender (the structured
+--     Draw.Frame via Draw.fromAnsiLog) -> ONE host render(2): the HOST
+--     TerminalRenderer (src/renderer/terminal.zig) diffs+paints with the
+--     same per-row damage vocabulary (PTY-deterministic single-write
+--     frames, byte-parity with the retired Elm-side paint).
 
 
 {-| The app contract.  `init`/`update`/`view`/`resize` are the same shape as
@@ -65,7 +69,7 @@ type alias Config msg model =
   }
 
 
--- The tea-internal model: the user's `mod` plus the painter's cursor state.
+-- The tea-internal model: the user's `mod` plus the submitted-frame state.
 type alias TeaModel model =
   { mod : model
   , prev : List String
@@ -86,9 +90,27 @@ type FrameMsg msg
   = FKey Runtime.Key
   | FMouse Runtime.MouseMsg
   | FResize Int Int
+  | FGui GuiEv
   | FUser msg
   | FQuit
   | FIgnored
+
+
+{-| The GUI events the host completes TaskGuiPoll with (the fixed-size
+self-pipe record decode in src/effectloop.zig leafGuiPoll/guiBuildEvent —
+the ctor spellings GKey/GMouse/GResize/GClose/GIgnore are the host
+contract).  GKey/GMouse carry the SAME decoded Key/MouseMsg values the
+terminal readKey/readMouse leaves build, so the app's onKey/onMouse hooks
+are unchanged; GResize carries the window size in CELLS; GClose is the
+window-close / SDL-QUIT event; GIgnore marks a swallowed record (an unmapped
+scancode or a filtered text byte) — re-armed, never delegated to the app.
+-}
+type GuiEv
+  = GKey Runtime.Key
+  | GMouse Runtime.MouseMsg
+  | GResize Int Int
+  | GClose
+  | GIgnore
 
 
 {-| Turn a user config `Config msg model` into a host Program.  init batches
@@ -148,6 +170,319 @@ resizeToFrame size =
   FResize (Tuple.first size) (Tuple.second size)
 
 
+-- The terminal path: every repaint is the structured Frame (view ->
+-- frameRepaintLog -> Io.renderFrame); the HOST diffs and paints (the
+-- frameRepaintLog body: store the view as prev — skipRender parity — and
+-- submit the SGR-event-log Frame).  Shape unchanged from the Elm-paint
+-- version — same branches, same re-arm discipline; only the paint mechanism
+-- moved behind the seam.
+outerUpdate : Config msg model -> FrameMsg msg -> TeaModel model -> ( TeaModel model, Runtime.Cmd (FrameMsg msg) )
+outerUpdate config msg tea =
+  case msg of
+    FKey key ->
+      case key of
+        -- stdin EOF is never a normal key: delegating + re-arming here would
+        -- livelock (deliver -> update -> re-arm -> instant KeyEof), so take
+        -- the exit path — no delegation, no re-arm.
+        KeyEof ->
+          ( tea, exit )
+
+        _ ->
+          let
+            ( m1, c1 ) =
+              config.update (config.onKey key) tea.mod
+          in
+          delegate config tea m1 c1 [ Task.perform FKey Io.readKey ]
+
+    FMouse mm ->
+      case mm of
+        -- stdin EOF, same as KeyEof: exit directly, never re-arm.
+        MouseEof ->
+          ( tea, exit )
+
+        _ ->
+          let
+            ( m1, c1 ) =
+              config.update (config.onMouse mm) tea.mod
+          in
+          -- Re-arm readMouse FIRST in the batch (waitResize discipline): the
+          -- readMouse eval must be armed before the frame render, so a second
+          -- wheel event that races the repaint is not missed.
+          delegate config tea m1 c1 [ Task.perform FMouse Io.readMouse ]
+
+    -- The initial dims probe and every live SIGWINCH (the re-armed
+    -- Io.waitResize below): the user's `resize` hook folds the dims into the
+    -- user model, then the frame repaints at the new size.  prev is carried
+    -- through, NOT forced to []: a key decoded before this delivery (startup
+    -- typeahead) may already have painted a frame; forcing prev to [] would
+    -- skipRender away the repaint and leave the stale frame stuck on screen.
+    -- Carrying prev keeps skipRender's invariant — at a true first paint prev
+    -- is still [] and the first frame always paints.  The waitResize re-arm
+    -- is FIRST in the batch: leafWaitResize blocks SIGWINCH + arms the
+    -- signalfd before the frame render can become visible to the peer, so a
+    -- `resize` directive can never race the arming.  FResize repaints
+    -- unconditionally (reflow at the new dims even when the resize folds to
+    -- the same model).
+    FResize cols rows ->
+      let
+        m1 =
+          config.resize cols rows tea.mod
+
+        ( tea1, rc ) =
+          frameRepaintLog config { mod = m1, prev = tea.prev, rows = rows, cols = cols } m1
+      in
+      ( tea1
+      , Cmd.batch
+          [ Task.perform resizeToFrame Io.waitResize
+          , rc
+          ]
+      )
+
+    -- The app's own command deliveries (sleep ticks, etc.): full delegation
+    -- twin of FKey, but NO input re-arm — the command that produced this
+    -- delivery self-re-arms via the commands it returns.
+    FUser u ->
+      let
+        ( m1, c1 ) =
+          config.update u tea.mod
+      in
+      delegate config tea m1 c1 []
+
+    FGui _ ->
+      -- not a GUI program; a stray GuiEv delivery (mixed harness) is a no-op
+      ( tea, Cmd.none )
+
+    -- Quit marker delivered (only possible when the scan above missed):
+    -- run the exit path, no re-arm.
+    FQuit ->
+      ( tea, exit )
+
+    -- Frame renders, raw-mode flips, mouse-mode flips: nothing to do.
+    FIgnored ->
+      ( tea, Cmd.none )
+
+
+-- Every delegating branch (FKey/FMouse/FUser) shares this shape: run the user
+-- update, scan for quit, SKIP the repaint when the model is unchanged, repaint
+-- otherwise, re-map the user command, then re-arm the inputs THAT BRANCH owns
+-- (`rearm` — FKey readKey, FMouse readMouse, FUser nothing; re-arm FIRST in
+-- the batch, waitResize discipline).
+delegate : Config msg model -> TeaModel model -> model -> Runtime.Cmd msg -> List (Runtime.Cmd (FrameMsg msg)) -> ( TeaModel model, Runtime.Cmd (FrameMsg msg) )
+delegate config tea m1 c1 rearm =
+  if hasQuit c1 then
+    ( tea, exit )
+
+  else if skipRender tea m1 then
+    -- Model structurally unchanged => config.view (pure in the model) would
+    -- emit a byte-identical frame, so the repaint is skipped entirely — but
+    -- the user's command c1 still runs and the input re-arms still fire.
+    -- Never taken before the first paint (skipRender's prev == [] guard):
+    -- nothing is on screen yet, so the first frame must always paint.
+    ( { mod = m1, prev = tea.prev, rows = tea.rows, cols = tea.cols }
+    , Cmd.batch (List.append rearm [ Cmd.map FUser c1 ])
+    )
+
+  else
+    let
+      ( tea1, rc ) =
+        frameRepaintLog config tea m1
+    in
+    ( tea1
+    , Cmd.batch
+        (List.append rearm [ Cmd.map FUser c1, rc ])
+    )
+
+
+-- guiRepaint's body with fromAnsi swapped for fromAnsiLog: the terminal
+-- seam carries the SGR-event markers so the HOST renderer reproduces the
+-- exact byte stream (stacked nested prefixes included), while prev still
+-- stores the raw view (skipRender parity).
+frameRepaintLog : Config msg model -> TeaModel model -> model -> ( TeaModel model, Runtime.Cmd (FrameMsg msg) )
+frameRepaintLog config tea m =
+  let
+    frame =
+      config.view m
+  in
+  ( { mod = m, prev = frame, rows = tea.rows, cols = tea.cols }
+  , render (Draw.fromAnsiLog frame)
+  )
+
+
+{-| The GUI twin of `program` (photon-gui P2): the SAME Config renders into
+the host's SDL window instead of the terminal — apps switch backends at ONE
+call site.  init arms guiOpen plus ONE self-re-arming guiPoll (the GUI
+analogue of the rawMode->winSize->readKey(+mouse) chain); the window's first
+event is the host's initial GResize at the real cell size, which triggers
+the first paint.  The app-side view pipeline is UNCHANGED: `view` still
+returns List String, and GUI mode feeds it through Draw.fromAnsi and
+submits the STRUCTURED Frame to the host (TaskRender) — damage tracking and
+presenting are host-side (rencache, dirty rects only).  (Since the P4
+switch the TERMINAL path renders host-side too — the Elm-side
+Tea.paint/diffString painter is retired; the two modes differ only in the
+parser: plain fromAnsi here, the SGR-event-log fromAnsiLog on the terminal
+seam.)  `config.mouse` is ignored: the window delivers mouse
+events through guiPoll, so no tracking mode is armed.  Exit = GClose (window
+close) or the app's quit, both via guiClose + the quit latch.
+
+Fail-soft: without a window backend (-Dgui off) guiOpen/guiPoll complete
+unit, the GUI branch treats that as a non-event, no re-arm fires, and the
+program drains to exit instead of hanging.
+-}
+guiProgram config =
+  let
+    ( m0, c0 ) =
+      config.init ()
+  in
+  Platform.program
+    { init =
+        \_ ->
+          ( { mod = m0, prev = [], rows = 0, cols = 0 }
+          , Cmd.batch
+              [ Cmd.map FUser c0
+                -- guiOpen completes synchronously BEFORE the guiArm eval
+                -- steps (batch spawn order + a synchronous leaf), so the
+                -- window and its initial-size record exist by then.
+              , Task.perform (\_ -> FIgnored) (Io.guiOpen "fx-ui" 80 24)
+              , guiArm
+              ]
+          )
+    , update = \msg tea -> guiUpdate config msg tea
+    , subscriptions = \_ -> Sub.none
+    }
+
+
+-- The GUI poll arm: exactly ONE guiPoll eval is armed at a time (the
+-- readKey/readMouse re-arm discipline); every GUI branch re-arms it.
+-- Task.perform already yields a Cmd (a Task list) — no extra [ ] wrap.
+guiArm : Runtime.Cmd (FrameMsg msg)
+guiArm =
+  Task.perform FGui TaskGuiPoll
+
+
+-- GUI update: the FGui branch handles GUI events; everything else (FUser
+-- deliveries, FIgnored render/frame writes, FQuit, and the terminal
+-- branches for a mixed harness) is outerUpdate's.
+guiUpdate : Config msg model -> FrameMsg msg -> TeaModel model -> ( TeaModel model, Runtime.Cmd (FrameMsg msg) )
+guiUpdate config msg tea =
+  case msg of
+    FGui ev ->
+      guiEvent config tea ev
+
+    _ ->
+      outerUpdate config msg tea
+
+
+guiEvent : Config msg model -> TeaModel model -> GuiEv -> ( TeaModel model, Runtime.Cmd (FrameMsg msg) )
+guiEvent config tea ev =
+  case ev of
+    GKey key ->
+      case key of
+        -- Defensive only (the host sends GClose for window close, never a
+        -- GUI KeyEof): take the exit path, no delegation, no re-arm.
+        KeyEof ->
+          ( tea, guiExit )
+
+        _ ->
+          let
+            ( m1, c1 ) =
+              config.update (config.onKey key) tea.mod
+          in
+          delegateGui config tea m1 c1
+
+    GMouse mm ->
+      case mm of
+        MouseEof ->
+          ( tea, guiExit )
+
+        _ ->
+          let
+            ( m1, c1 ) =
+              config.update (config.onMouse mm) tea.mod
+          in
+          delegateGui config tea m1 c1
+
+    -- The window resized (the initial size arrives the same way): fold the
+    -- cell dims through the app's resize hook and repaint at the new size —
+    -- the host resets its damage grid (full repaint) on its side.
+    GResize cols rows ->
+      let
+        m1 =
+          config.resize cols rows tea.mod
+
+        ( tea1, rc ) =
+          guiRepaint config { mod = m1, prev = tea.prev, rows = rows, cols = cols } m1
+      in
+      ( tea1, Cmd.batch [ guiArm, rc ] )
+
+    GClose ->
+      ( tea, guiExit )
+
+    -- A swallowed host record (unmapped scancode, filtered text byte): not
+    -- an app event — just keep polling.
+    GIgnore ->
+      ( tea, guiArm )
+
+    -- The stub backend (no -Dgui) completes guiPoll with unit: not a GuiEv.
+    -- No re-arm — the program drains to exit (fail-soft open).
+    _ ->
+      ( tea, Cmd.none )
+
+
+-- The GUI delegate twin: run the user update, scan for quit, skip the
+-- render when the model is unchanged (same skipRender contract), else
+-- repaint through the structured-Frame pipeline.  The re-arm is guiArm (the
+-- single GUI poll), FIRST in the batch (waitResize discipline).
+delegateGui : Config msg model -> TeaModel model -> model -> Runtime.Cmd msg -> ( TeaModel model, Runtime.Cmd (FrameMsg msg) )
+delegateGui config tea m1 c1 =
+  if hasQuit c1 then
+    ( tea, guiExit )
+
+  else if skipRender tea m1 then
+    ( { mod = m1, prev = tea.prev, rows = tea.rows, cols = tea.cols }
+    , Cmd.batch [ guiArm, Cmd.map FUser c1 ]
+    )
+
+  else
+    let
+      ( tea1, rc ) =
+        guiRepaint config tea m1
+    in
+    ( tea1
+    , Cmd.batch [ guiArm, Cmd.map FUser c1, rc ]
+    )
+
+
+-- Paint one frame in GUI mode: store the view as prev (skipRender parity)
+-- and submit Draw.fromAnsi view as a TaskRender Frame — the host owns the
+-- damage cache and presents only dirty cells.  NO ANSI string building or
+-- diffing happens on the Elm side anywhere since the P4 switch (the terminal
+-- seam's twin, frameRepaintLog, swaps in fromAnsiLog for the exact-byte
+-- SGR-event replay).
+guiRepaint : Config msg model -> TeaModel model -> model -> ( TeaModel model, Runtime.Cmd (FrameMsg msg) )
+guiRepaint config tea m =
+  let
+    frame =
+      config.view m
+  in
+  ( { mod = m, prev = frame, rows = tea.rows, cols = tea.cols }
+  , render (Draw.fromAnsi frame)
+  )
+
+
+-- Submit one Frame to the host renderer (TaskRender): the delivery lands on
+-- the ignored branch of guiUpdate/outerUpdate.
+render frame =
+  Task.perform (\_ -> FIgnored) (Io.renderFrame frame)
+
+
+-- GUI exit path: tear the window down, then set the host quit latch (a
+-- batch runs out of spawn order, so this is a CHAIN like `exit`).  No
+-- raw-mode / alt-screen / cursor restore: the terminal was never touched.
+guiExit =
+  Task.perform (\_ -> FIgnored)
+    (Task.andThen (\_ -> Io.quit) Io.guiClose)
+
+
 {-| Append to the command your update returns to quit: outerUpdate sees the
 marker synchronously, skips the repaint/re-arm, and runs the exit path.
 -}
@@ -189,120 +524,6 @@ exit =
     )
 
 
-outerUpdate : Config msg model -> FrameMsg msg -> TeaModel model -> ( TeaModel model, Runtime.Cmd (FrameMsg msg) )
-outerUpdate config msg tea =
-  case msg of
-    FKey key ->
-      case key of
-        -- stdin EOF is never a normal key: delegating + re-arming here would
-        -- livelock (deliver -> update -> re-arm -> instant KeyEof), so take
-        -- the exit path — no delegation, no re-arm.
-        KeyEof ->
-          ( tea, exit )
-
-        _ ->
-          let
-            ( m1, c1 ) =
-              config.update (config.onKey key) tea.mod
-          in
-          delegate config tea m1 c1 [ Task.perform FKey Io.readKey ]
-
-    FMouse mm ->
-      case mm of
-        -- stdin EOF, same as KeyEof: exit directly, never re-arm.
-        MouseEof ->
-          ( tea, exit )
-
-        _ ->
-          let
-            ( m1, c1 ) =
-              config.update (config.onMouse mm) tea.mod
-          in
-          -- Re-arm readMouse FIRST in the batch (waitResize discipline): the
-          -- readMouse eval must be armed before the frame write, so a second
-          -- wheel event that races the repaint is not missed.
-          delegate config tea m1 c1 [ Task.perform FMouse Io.readMouse ]
-
-    -- The initial dims probe and every live SIGWINCH (the re-armed
-    -- Io.waitResize below): the user's `resize` hook folds the dims into the
-    -- user model, then the frame repaints at the new size.  prev is carried
-    -- through, NOT forced to []: a key decoded before this delivery (startup
-    -- typeahead) may already have painted a frame; forcing prev to [] would
-    -- repaint over it with NO moveUp and leave the stale frame stuck on
-    -- screen.  Carrying prev keeps paint's cursor invariant — at a true first
-    -- paint prev is still [] and the first-frame branch is taken exactly as
-    -- before.  The waitResize re-arm is FIRST in the batch: leafWaitResize
-    -- blocks SIGWINCH + arms the signalfd before the frame write can become
-    -- visible to the peer, so a `resize` directive can never race the arming.
-    FResize cols rows ->
-      let
-        m1 =
-          config.resize cols rows tea.mod
-
-        resized =
-          { mod = m1, prev = tea.prev, rows = rows, cols = cols }
-
-        ( tea1, frame ) =
-          paint resized m1 (config.view m1)
-      in
-      ( tea1
-      , Cmd.batch
-          [ Task.perform resizeToFrame Io.waitResize
-          , repaint frame
-          ]
-      )
-
-    -- The app's own command deliveries (sleep ticks, etc.): full delegation
-    -- twin of FKey, but NO input re-arm — the command that produced this
-    -- delivery self-re-arms via the commands it returns.
-    FUser u ->
-      let
-        ( m1, c1 ) =
-          config.update u tea.mod
-      in
-      delegate config tea m1 c1 []
-
-    -- Quit marker delivered (only possible when the scan above missed):
-    -- run the exit path, no re-arm.
-    FQuit ->
-      ( tea, exit )
-
-    -- Frame writes, raw-mode flips, mouse-mode flips: nothing to do.
-    FIgnored ->
-      ( tea, Cmd.none )
-
-
--- Every delegating branch (FKey/FMouse/FUser) shares this shape: run the user
--- update, scan for quit, SKIP the repaint when the model is unchanged, repaint
--- otherwise, re-map the user command, then re-arm the inputs THAT BRANCH owns
--- (`rearm` — FKey readKey, FMouse readMouse, FUser nothing; re-arm FIRST in
--- the batch, waitResize discipline).
-delegate : Config msg model -> TeaModel model -> model -> Runtime.Cmd msg -> List (Runtime.Cmd (FrameMsg msg)) -> ( TeaModel model, Runtime.Cmd (FrameMsg msg) )
-delegate config tea m1 c1 rearm =
-  if hasQuit c1 then
-    ( tea, exit )
-
-  else if skipRender tea m1 then
-    -- Model structurally unchanged => config.view (pure in the model) would
-    -- emit a byte-identical frame, so the repaint is skipped entirely — but
-    -- the user's command c1 still runs and the input re-arms still fire.
-    -- Never taken before the first paint (skipRender's prev == [] guard):
-    -- nothing is on screen yet, so the first frame must always paint.
-    ( { mod = m1, prev = tea.prev, rows = tea.rows, cols = tea.cols }
-    , Cmd.batch (List.append rearm [ Cmd.map FUser c1 ])
-    )
-
-  else
-    let
-      ( tea1, frame ) =
-        paint tea m1 (config.view m1)
-    in
-    ( tea1
-    , Cmd.batch
-        (List.append rearm [ Cmd.map FUser c1, repaint frame ])
-    )
-
-
 -- Should this delivery skip the repaint?  Only when a frame is already on
 -- screen (prev /= [] — before the first paint the screen is NOT the old
 -- frame's content, so the first frame always paints) AND the new user model
@@ -323,120 +544,21 @@ skipRender tea m1 =
 -- ---- renderer ----
 
 
-{-| Pure renderer: given the tea model, the NEW user model, and the view's
-new frame, return the updated model (mod = the new user model, prev = frame)
-and the ONE string to write.  The first paint (prev = []) hides the cursor
-and writes every line ("clear-line, text, \r\n").  A repaint DIFFS against
-prev with ABSOLUTE cursor addressing: a changed line rewrites itself at its
-own row (\e[row;1H + clear-line + text — NO trailing \r\n: the absolute
-position sets the row), an unchanged line emits NOTHING, lines past prev's
-end are painted fully (new rows), and a frame that shrunk moves to the row
-BELOW its new last line and clears-to-end (\e[J), wiping the stale rows
-below.  Nothing depends on where the cursor rests between frames — each
-rewrite is addressed absolutely — which is what keeps repaints correct under
-mosh's predictive local echo (it moves the cursor for its own echo, so a
-relative move-up + CRLF repaint would land one row low; vim-style absolute
-positioning does not).
--}
-paint tea m frame =
-  case tea.prev of
-    [] ->
-      ( { mod = m, prev = frame, rows = tea.rows, cols = tea.cols }
-      , String.append enterAltScreen (String.append hideCursor (frameString frame))
-      )
+-- The byte-painting the retired Elm-side renderer emitted (first paint
+-- = enterAltScreen + hideCursor + clear-line/row/CRLF walk; repaint =
+-- per-row \e[row;1H + \e[2K; shrink = \e[n+1;1H + \e[J) is now the HOST
+-- TerminalRenderer's contract (src/renderer/terminal.zig, unit-pinned in
+-- terminal_test.zig, byte-parity-pinned by the pty fixtures).  Only the
+-- EXIT side still writes bytes here.
 
-    _ ->
-      ( { mod = m, prev = frame, rows = tea.rows, cols = tea.cols }
-      , String.append (diffString 1 tea.prev frame)
-          (if List.length frame < List.length tea.prev then
-            -- Shrank: park the cursor on the row BELOW the new last line
-            -- (explicitly — the walk above may have emitted nothing) and
-            -- wipe everything below it.
-            String.append (moveTo (List.length frame + 1)) clearRest
-
-          else
-            ""
-          )
-      )
-
-
-{-| The repaint body: walk prev and the new frame in lockstep, carrying the
-1-based screen row.  An unchanged line (==) costs NOTHING; a changed line
-costs a full rewrite AT ITS ROW; when prev runs out first, the remaining
-frame lines are all new and paint fully; when the frame runs out first
-(shrunk), stop — paint appends \e[{n+1};1H + clearRest for the stale rows
-below.
--}
-diffString : Int -> List String -> List String -> String
-diffString row prev frame =
-  case prev of
-    [] ->
-      paintRest frame row
-
-    p :: prevRest ->
-      case frame of
-        [] ->
-          ""
-
-        line :: frameRest ->
-          if line == p then
-            diffString (row + 1) prevRest frameRest
-
-          else
-            String.append (paintAt row line) (diffString (row + 1) prevRest frameRest)
-
-
--- The all-new tail of a grown frame: every remaining line is a fresh row.
-paintRest frame row =
-  case frame of
-    [] ->
-      ""
-
-    line :: rest ->
-      String.append (paintAt row line) (paintRest rest (row + 1))
-
-
--- Wrap a frame string into a perform-wrapped write: the delivery lands on
--- the ignored branch of outerUpdate.
-repaint frame =
-  Task.perform (\_ -> FIgnored) (Io.writeString frame)
-
-
-frameString frame =
-  String.join "" (map paintLine frame)
-
-
--- FIRST-paint line: clear-line + text + \r\n (the cursor walks down the
--- frame as each line is written; only the first paint uses this form).
-paintLine line =
-  String.append clearLine (String.append line newline)
-
-
--- REPAINT line: absolute row address + clear-line + text — no trailing
--- \r\n (the address sets the row; nothing depends on the resting cursor).
-paintAt row line =
-  String.append (moveTo row) (String.append clearLine line)
-
-
-moveTo row =
-  String.append "\u{1B}[" (String.append (String.fromInt row) ";1H")
-
-
-newline = "\r\n"
-
-clearLine = "\u{1B}[2K"
-
-clearRest = "\u{1B}[J"
-
-hideCursor = "\u{1B}[?25l"
-
-showCursor = "\u{1B}[?25h"
 
 -- Alternate-screen entry/exit.  mosh's predictive local echo echoes the FIRST
 -- typed char (it has no full-screen cue yet), which paints a stray line on the
 -- very first keypress.  Entering the alternate screen (\e[?1049h) is the
 -- standard signal that a program is full-screen (vim/htop do this), which makes
--- mosh disable local echo for the session — so the first keypress stops echoing.
-enterAltScreen = "\u{1B}[?1049h"
+-- mosh disable local echo for the session — so the first keypress stops
+-- echoing.  The ENTRY side is the host renderer's first-paint bytes; only the
+-- LEAVE side is still written here (the exit chain).
+showCursor = "\u{1B}[?25h"
 
 leaveAltScreen = "\u{1B}[?1049l"

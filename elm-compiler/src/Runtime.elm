@@ -43,6 +43,10 @@ type Task x a
     | TaskReadMouse
     | TaskListDir String
     | TaskStat String
+    | TaskRender a
+    | TaskGuiOpen String Int Int
+    | TaskGuiPoll
+    | TaskGuiClose
 
 
 -- A decoded terminal key (M1 tea input surface).  The HOST event loop builds
@@ -276,6 +280,25 @@ runTask task =
         TaskStat _ ->
             Ok { size = 0, mode = 0, mtimeMs = 0, isDir = False, isFile = False }
 
+        -- P1 GUI leaves (photon-gui plan).  Sync no-ops: no window host in the
+        -- sync worker.  The HOST event loop (src/effectloop.zig) dispatches the
+        -- same tags: TaskRender decodes the Frame payload host-side
+        -- (leafRender, --render-dump oracle); guiOpen/guiPoll/guiClose become
+        -- the real SDL-window leaves in P2.  TaskRender's payload is
+        -- POLYMORPHIC (arity 1) so Runtime needs no Draw import: the Frame
+        -- crosses the seam opaquely as an ADT ctor vector.
+        TaskRender _ ->
+            Ok ()
+
+        TaskGuiOpen _ _ _ ->
+            Ok ()
+
+        TaskGuiPoll ->
+            Ok ()
+
+        TaskGuiClose ->
+            Ok ()
+
 
 cmdNone : List (Task Never msg)
 cmdNone = []
@@ -444,6 +467,33 @@ taskListDir path =
 taskStat : String -> Task x { size : Int, mode : Int, mtimeMs : Int, isDir : Bool, isFile : Bool }
 taskStat path =
     TaskStat path
+
+
+{-| P1 GUI leaves (photon-gui plan): host-call helpers over the four new Task
+ctors, reached from call sites as Io.renderFrame / Io.guiOpen / Io.guiPoll /
+Io.guiClose (platformTable alias rows).  renderFrame submits the DrawList
+Frame (a Draw.* value, opaque here) to the host renderer; guiOpen arms the P2
+window (title, cols, rows); guiPoll is the P2 self-re-arming event read;
+guiClose tears the window down.
+-}
+taskRender : a -> Task x ()
+taskRender frame =
+    TaskRender frame
+
+
+taskGuiOpen : String -> Int -> Int -> Task x ()
+taskGuiOpen title cols rows =
+    TaskGuiOpen title cols rows
+
+
+taskGuiPoll : Task x ()
+taskGuiPoll =
+    TaskGuiPoll
+
+
+taskGuiClose : Task x ()
+taskGuiClose =
+    TaskGuiClose
 
 
 subNone : ()

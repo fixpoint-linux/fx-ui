@@ -115,6 +115,58 @@ pub fn build(b: *std.Build) void {
     // The HOST-SIDE effect-manager event loop is fx-ui-ONLY — it is NOT part
     // of the zinc-vm package — so it lives here as a local module over the
     // package's vm (state/values/interp/prims/execplan/hostcall).
+    //
+    // ---- renderer GUI modules (photon-gui P2 items 10-13) ----
+    // `gui_model` is the SDL-free pure logic (src/renderer/gui.zig: layout,
+    // keymap, px->cell, EvRecord) — always compiled, headless-tested.
+    // `gui_backend` is the WINDOW backend selected by -Dgui: gui_sdl.zig
+    // (SDL2 + stb_truetype window, software surface, event thread + self-
+    // pipe) or gui_stub.zig (fail-soft no-ops).  DEFAULT OFF so neither the
+    // default build, `zig build test`, nor any gate/CI host needs SDL.
+    const gui = b.option(bool, "gui", "Link the SDL2 window backend into elmvm (P2 GUI; needs sdl2 + fonts)") orelse false;
+
+    const gui_model_mod = b.createModule(.{
+        .root_source_file = b.path("src/renderer/gui.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // P4 host TerminalRenderer (src/renderer/terminal.zig): the byte-parity
+    // twin of Tea's paint path over DECODED Frames.  Consumes gui.zig as a
+    // module import (a file may belong to only one module in the graph) so
+    // its Span type is the exact shape leafRender decodes for BOTH backends.
+    const terminal_mod = b.createModule(.{
+        .root_source_file = b.path("src/renderer/terminal.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    terminal_mod.addImport("gui_model", gui_model_mod);
+
+    const gui_backend_mod = b.createModule(if (gui) .{
+        .root_source_file = b.path("src/renderer/gui_sdl.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    } else .{
+        .root_source_file = b.path("src/renderer/gui_stub.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    if (gui) {
+        // stb_truetype compiled as C (Zig 0.16 translate-c cannot compile the
+        // header); SDL is bound through extern declarations in gui_sdl.zig,
+        // so only the library link is needed here.
+        gui_backend_mod.addCSourceFile(.{
+            .file = b.path("vendor/stb/stb_truetype_impl.c"),
+            .flags = &.{"-std=c99"},
+        });
+        gui_backend_mod.linkSystemLibrary("SDL2", .{});
+    }
+    // gui.zig is the root of gui_model; the backends consume it as a module
+    // import (a file may belong to only one module in a build graph).
+    gui_backend_mod.addImport("gui_model", gui_model_mod);
+
     const effectloop_mod = b.createModule(.{
         .root_source_file = b.path("src/effectloop.zig"),
         .target = target,
@@ -123,6 +175,9 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "gc", .module = gc_mod },
             .{ .name = "vm", .module = vm_mod },
+            .{ .name = "gui_model", .module = gui_model_mod },
+            .{ .name = "gui_backend", .module = gui_backend_mod },
+            .{ .name = "terminal", .module = terminal_mod },
         },
     });
 
@@ -325,6 +380,83 @@ pub fn build(b: *std.Build) void {
     const vm_test_step = b.step("vm-test", "Run Shen VM tests (honours -Doptimize)");
     vm_test_step.dependOn(addVmTestSet(b, target, optimize));
     test_step.dependOn(vm_test_step);
+
+    // ---- rencache damage-tracker unit tests (renderer P2, plan item 9) ----
+    // Pure no-SDL headless tests for the photon-port damage algorithm; also
+    // hooked into the default `test` step below.
+    const rencache_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/renderer/rencache_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const rencache_tests = b.addTest(.{ .root_module = rencache_test_mod });
+    const run_rencache_tests = b.addRunArtifact(rencache_tests);
+    const rencache_test_step = b.step("rencache-test", "Run rencache damage-tracker unit tests");
+    rencache_test_step.dependOn(&run_rencache_tests.step);
+    test_step.dependOn(rencache_test_step);
+
+    // ---- TerminalRenderer unit tests (renderer P4): byte-parity twins of
+    // Tea.paint/diffString over synthetic Frames — hand-written expected
+    // strings replicating the Elm painter's exact escape vocabulary. ----
+    const terminal_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/renderer/terminal_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    terminal_test_mod.addImport("terminal", terminal_mod);
+    terminal_test_mod.addImport("gui_model", gui_model_mod);
+    const terminal_tests = b.addTest(.{ .root_module = terminal_test_mod });
+    const run_terminal_tests = b.addRunArtifact(terminal_tests);
+    const terminal_test_step = b.step("terminal-test", "Run host TerminalRenderer byte-parity unit tests");
+    terminal_test_step.dependOn(&run_terminal_tests.step);
+    test_step.dependOn(terminal_test_step);
+
+    // ---- renderer width (photon-gui P2 step 8): codegen gate + unit tests ----
+    // tools/genwidth.zig re-parses Str.elm's runewidth tables and byte-diffs
+    // the regenerated src/renderer/width.zig against the checked-in file, so
+    // the Elm widgets and the GUI renderer can never disagree about cell
+    // widths (plan risk 3).  Wired into `test`; `zig run tools/genwidth.zig
+    // -- elm-compiler/core-libs/Str.elm src/renderer/width.zig` regenerates.
+    const genwidth = b.addExecutable(.{
+        .name = "genwidth",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/genwidth.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const width_check = b.addRunArtifact(genwidth);
+    width_check.addArg("--check");
+    width_check.addFileArg(b.path("elm-compiler/core-libs/Str.elm"));
+    width_check.addFileArg(b.path("src/renderer/width.zig"));
+    const width_check_step = b.step("width-check", "Regen width.zig from Str.elm and diff (Elm/Zig cell-width parity)");
+    width_check_step.dependOn(&width_check.step);
+    test_step.dependOn(width_check_step);
+
+    // Pure-Zig width unit tests (no SDL/vm): ASCII/CJK/combining/box-drawing/
+    // control boundaries, ANSI skip, invalid-UTF-8 tolerance, advance cuts.
+    const width_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/renderer/width_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const width_tests = b.addTest(.{ .root_module = width_test_mod });
+    test_step.dependOn(&b.addRunArtifact(width_tests).step);
+
+    // ---- GUI pure-logic unit tests (photon-gui P2 item 10 gate) ----
+    // Headless tests for the SDL-free half of the backend: Frame-decode-to-
+    // cells (span layout with wide/combining/clip), the SDL scancode ->
+    // Runtime.Key ctor-name keymap, text-input dedup, px->cell, and the
+    // packed-color decode.  Runs in the default test step (no SDL).
+    const gui_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/renderer/gui_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const gui_tests = b.addTest(.{ .root_module = gui_test_mod });
+    const gui_test_step = b.step("gui-test", "Run GUI pure-logic unit tests (layout/keymap/px-to-cell)");
+    gui_test_step.dependOn(&b.addRunArtifact(gui_tests).step);
+    test_step.dependOn(gui_test_step);
 
     // ---- `gate`: the permanent ReleaseSafe build gate (unit C) ----
     // Runs the full Shen GC + VM suites in Debug + ReleaseSafe + ReleaseFast in

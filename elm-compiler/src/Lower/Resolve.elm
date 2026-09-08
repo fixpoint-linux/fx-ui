@@ -222,6 +222,13 @@ platformTable =
     , ( "Io.readMouse", "Runtime.taskReadMouse" )
     , ( "Io.listDir", "Runtime.taskListDir" )
     , ( "Io.stat", "Runtime.taskStat" )
+
+    -- P1 photon-gui leaves: the Elm-built DrawList Frame crosses the seam as
+    -- the TaskRender payload (polymorphic — Runtime never imports Draw).
+    , ( "Io.renderFrame", "Runtime.taskRender" )
+    , ( "Io.guiOpen", "Runtime.taskGuiOpen" )
+    , ( "Io.guiPoll", "Runtime.taskGuiPoll" )
+    , ( "Io.guiClose", "Runtime.taskGuiClose" )
     , ( "Plan.str", "Runtime.tStr" )
     , ( "Plan.num", "Runtime.tNum" )
     , ( "Plan.sym", "Runtime.tSym" )
@@ -287,6 +294,10 @@ platformTable =
     -- Same bare-name/foreign-ctor mechanism as the Key rows.
     , ( "TaskQuit", "Runtime.TaskQuit" )
     , ( "TaskSucceed", "Runtime.TaskSucceed" )
+    -- P2 guiProgram arms its event poll with the same mechanism: the bare
+    -- TaskGuiPoll ctor (polymorphic like TaskQuit) is Tea's ONE poll arm,
+    -- completed by the host with a GuiEv value (leafGuiPoll).
+    , ( "TaskGuiPoll", "Runtime.TaskGuiPoll" )
     ]
 
 

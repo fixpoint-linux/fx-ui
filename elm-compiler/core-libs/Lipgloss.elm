@@ -79,6 +79,8 @@ module Lipgloss exposing
     , tabWidth
     , setString
     , render
+    , renderStyled
+    , styleSpan
     , width
     , height
     , size
@@ -145,6 +147,8 @@ styles + truecolor host):
     reset `\e[m`.  Hyperlinks (OSC 8) are copied through but never tracked;
     colon sub-param color forms (38:5:N) are not tracked.
 -}
+
+import Draw
 
 
 -- ====================== types ======================
@@ -2695,3 +2699,423 @@ placeVertical height pos str =
                 in
                 String.append (Str.repeat top (String.append emptyLine "\n"))
                     (String.append str (Str.repeat bottom (String.append "\n" emptyLine)))
+
+
+-- ====================== P3 (photon-gui): style-as-data (Draw.Frame) path ======================
+-- The span-level equivalent of the ANSI text pipeline above: renderStyled
+-- builds Draw spans DIRECTLY (no ANSI produced, no re-parse), pinned to be
+-- byte-equal to the oracle Draw.fromAnsi [ render s str ] for every
+-- geometry-free single-line style+string (gated by tests/elm-fixtures/
+-- lgstyled.elm).  Nothing here changes render's ANSI output.
+
+
+{-| The parser-style state Draw.fromAnsi carries across one row (fg/bg packed
++ attr bits, Draw conventions exactly).
+-}
+type alias Psr =
+    { fg : Int
+    , bg : Int
+    , attrs : Int
+    }
+
+
+psrDefault =
+    { fg = Draw.colorNo, bg = Draw.colorNo, attrs = 0 }
+
+
+{-| Draw.applySgr verbatim over Psr (the closed SGR subset Draw.fromAnsi
+accepts).  styleOfParams is the span attributes for one `sgr params` run.
+-}
+sgrApply : List Int -> Psr -> Psr
+sgrApply params st =
+    case params of
+        [] ->
+            st
+
+        p :: rest ->
+            if p == 0 then
+                sgrApply rest psrDefault
+
+            else if p == 1 then
+                sgrApply rest { st | attrs = Bitwise.or st.attrs Draw.attrBold }
+
+            else if p == 2 then
+                sgrApply rest { st | attrs = Bitwise.or st.attrs Draw.attrFaint }
+
+            else if p == 3 then
+                sgrApply rest { st | attrs = Bitwise.or st.attrs Draw.attrItalic }
+
+            else if p == 4 then
+                sgrApply rest { st | attrs = Bitwise.or st.attrs Draw.attrUnderline }
+
+            else if p == 5 then
+                sgrApply rest { st | attrs = Bitwise.or st.attrs Draw.attrBlink }
+
+            else if p == 7 then
+                sgrApply rest { st | attrs = Bitwise.or st.attrs Draw.attrReverse }
+
+            else if p == 9 then
+                sgrApply rest { st | attrs = Bitwise.or st.attrs Draw.attrStrikethrough }
+
+            else if p == 22 then
+                sgrApply rest { st | attrs = Bitwise.and st.attrs (Bitwise.complement (Bitwise.or Draw.attrBold Draw.attrFaint)) }
+
+            else if p == 23 then
+                sgrApply rest { st | attrs = Bitwise.and st.attrs (Bitwise.complement Draw.attrItalic) }
+
+            else if p == 24 then
+                sgrApply rest { st | attrs = Bitwise.and st.attrs (Bitwise.complement Draw.attrUnderline) }
+
+            else if p == 25 then
+                sgrApply rest { st | attrs = Bitwise.and st.attrs (Bitwise.complement Draw.attrBlink) }
+
+            else if p == 27 then
+                sgrApply rest { st | attrs = Bitwise.and st.attrs (Bitwise.complement Draw.attrReverse) }
+
+            else if p == 29 then
+                sgrApply rest { st | attrs = Bitwise.and st.attrs (Bitwise.complement Draw.attrStrikethrough) }
+
+            else if p >= 30 && p <= 37 then
+                sgrApply rest { st | fg = p - 30 }
+
+            else if p == 39 then
+                sgrApply rest { st | fg = Draw.colorNo }
+
+            else if p >= 40 && p <= 47 then
+                sgrApply rest { st | bg = p - 40 }
+
+            else if p == 49 then
+                sgrApply rest { st | bg = Draw.colorNo }
+
+            else if p >= 90 && p <= 97 then
+                sgrApply rest { st | fg = (p - 90) + 8 }
+
+            else if p >= 100 && p <= 107 then
+                sgrApply rest { st | bg = (p - 100) + 8 }
+
+            else if p == 38 then
+                case rest of
+                    n :: rest1 ->
+                        if n == 5 then
+                            case rest1 of
+                                v :: rest2 ->
+                                    sgrApply rest2 { st | fg = Draw.packAnsi256 v }
+
+                                [] ->
+                                    st
+
+                        else if n == 2 then
+                            case rest1 of
+                                r :: g :: b :: rest2 ->
+                                    sgrApply rest2 { st | fg = Draw.packRgb r g b }
+
+                                _ ->
+                                    st
+
+                        else
+                            st
+
+                    [] ->
+                        st
+
+            else if p == 48 then
+                case rest of
+                    n :: rest1 ->
+                        if n == 5 then
+                            case rest1 of
+                                v :: rest2 ->
+                                    sgrApply rest2 { st | bg = Draw.packAnsi256 v }
+
+                                [] ->
+                                    st
+
+                        else if n == 2 then
+                            case rest1 of
+                                r :: g :: b :: rest2 ->
+                                    sgrApply rest2 { st | bg = Draw.packRgb r g b }
+
+                                _ ->
+                                    st
+
+                        else
+                            st
+
+                    [] ->
+                        st
+
+            else
+                sgrApply rest st
+
+
+styleOfParams : List String -> Psr
+styleOfParams params =
+    if isEmpty params then
+        psrDefault
+
+    else
+        -- teParamsOf/spaceParamsOf elements may THEMSELVES carry semicolons
+        -- ("38;5;212", "48;2;r;g;b"), so parse the JOINED param string.
+        sgrApply (sgrNumParams (String.join ";" params) 0 0 []) psrDefault
+
+
+{-| "1;38;5;212" -> [1,38,5,212] (Draw.sgrParams semantics; the subset only
+ever emits digits and semicolons).
+-}
+sgrNumParams : String -> Int -> Int -> List Int -> List Int
+sgrNumParams s i cur acc =
+    let
+        c =
+            charCode s i
+    in
+    if c == -1 then
+        List.reverse (cur :: acc)
+
+    else if c == 59 then
+        sgrNumParams s (i + 1) 0 (cur :: acc)
+
+    else
+        sgrNumParams s (i + 1) ((cur * 10) + (c - 48)) acc
+
+
+{-| SGR detector + param reader for EMBEDDED escapes (a nested render riding
+inside the string): Draw.isSgrAt / Draw.sgrParams verbatim; the escape SKIP is
+this file's own escEnd.  An SGR flushes the current run and restyles; any
+other escape flushes and skips whole — control bytes never become span text.
+-}
+isSgrAtP : String -> Int -> Int -> Bool
+isSgrAtP s i len =
+    if len < 3 then
+        False
+
+    else if charCode s (i + 1) /= 91 then
+        False
+
+    else if charCode s (i + len - 1) /= 109 then
+        False
+
+    else
+        sgrDigitsP s (i + 2) (i + len - 1)
+
+
+sgrDigitsP : String -> Int -> Int -> Bool
+sgrDigitsP s lo hi =
+    if lo >= hi then
+        True
+
+    else
+        let
+            c =
+                charCode s lo
+        in
+        if (c >= 48 && c <= 57) || c == 59 then
+            sgrDigitsP s (lo + 1) hi
+
+        else
+            False
+
+
+sgrEmbedded : String -> Int -> Int -> List Int
+sgrEmbedded s i j =
+    sgrNumParams (String.sliceLen (i + 2) ((j - 1) - (i + 2)) s) 0 0 []
+
+
+{-| Append the run [start, i) of `line` styled `st` to the reversed acc (Draw
+flushRun: empty runs emit nothing).
+-}
+flushPsr : Psr -> String -> Int -> Int -> List Draw.Span -> List Draw.Span
+flushPsr st line start i acc =
+    if i <= start then
+        acc
+
+    else
+        Draw.Span (String.sliceLen start (i - start) line) st.fg st.bg st.attrs :: acc
+
+
+flushText : Psr -> String -> List Draw.Span -> List Draw.Span
+flushText st txt acc =
+    if txt == "" then
+        acc
+
+    else
+        Draw.Span txt st.fg st.bg st.attrs :: acc
+
+
+{-| Whole-line path (useSpaceStyler == False): the ANSI is one
+`\e[<te>m line \e[0m` pair (or bare line when te is empty), so the row is
+`line` walked with the te style PRE-APPLIED — embedded escapes flush and
+restyle exactly as Draw.fromAnsi would walking that ANSI.  Draw.parseRow with
+a non-default initial state.
+-}
+escRow : Psr -> String -> Draw.Row
+escRow st0 line =
+    escRowGo st0 line 0 0 []
+
+
+escRowGo : Psr -> String -> Int -> Int -> List Draw.Span -> List Draw.Span
+escRowGo st line start i acc =
+    let
+        c =
+            charCode line i
+    in
+    if c == -1 then
+        List.reverse (flushPsr st line start i acc)
+
+    else if c == 27 then
+        let
+            j =
+                escEnd line i
+        in
+        if isSgrAtP line i (j - i) then
+            escRowGo (sgrApply (sgrEmbedded line i j) st) line j j (flushPsr st line start i acc)
+
+        else
+            escRowGo st line j j (flushPsr st line start i acc)
+
+    else
+        escRowGo st line start (i + 1) acc
+
+
+{-| Space-styler path (styleRunes): the ANSI wraps EVERY rune in its own
+`\\e[<params>m rune \\e[0m` pair (spaces/tab by teSpace, the rest by te), so
+fromAnsi yields ONE SPAN PER WRAPPED RUNE; runes whose params are empty emit
+no escapes and ride the surrounding default-style run, so consecutive bare
+runes merge into one span — exactly what this walk builds.  (A bare rune is
+always plain text here: escapes in the input are whole-line-path territory.)
+-}
+runesRow : List String -> List String -> String -> Draw.Row
+runesRow teP spP line =
+    runesRowGo teP spP line 0 "" []
+
+
+runesRowGo : List String -> List String -> String -> Int -> String -> List Draw.Span -> List Draw.Span
+runesRowGo teP spP line i pending acc =
+    let
+        c =
+            charCode line i
+    in
+    if c == -1 then
+        List.reverse (flushText psrDefault pending acc)
+
+    else
+        let
+            need =
+                runeBytes c
+
+            r =
+                String.sliceLen i need line
+
+            params =
+                if c == 32 || c == 9 then
+                    spP
+
+                else
+                    teP
+        in
+        if isEmpty params then
+            runesRowGo teP spP line (i + need) (String.append pending r) acc
+
+        else
+            let
+                st =
+                    styleOfParams params
+
+                acc1 =
+                    Draw.Span r st.fg st.bg st.attrs :: flushText psrDefault pending acc
+            in
+            runesRowGo teP spP line (i + need) "" acc1
+
+
+{-| render ONE line of `str` under `s` as Draw spans — the style-as-data twin
+of the ANSI text pipeline.  For geometry-free single-line styles the oracle
+
+    Draw.frameEq (Draw.fromAnsi [ render s str ]) [ renderStyled s str ]
+
+holds byte-for-byte (fixture-gated).  Mirrors render/setString value prefix,
+the `props == 0` plain shortcut, tab conversion, and renderText's per-line
+rule (one te pair per line, or the per-rune space styler).  NOT applied:
+width/wrap/padding/margins/border/align/height/truncation — those transform
+whole frames, not one row.  Input contract: ONE line (no '\n').  A widget
+maps a row list with `List.map renderStyled` where Tea.guiProgram would
+Draw.fromAnsi an ANSI row list.
+-}
+renderStyled : Style -> String -> Draw.Row
+renderStyled s str =
+    let
+        full =
+            if s.value == "" then
+                str
+
+            else
+                String.append s.value (String.append " " str)
+    in
+    if s.props == 0 then
+        let
+            line =
+                maybeConvertTabs s full
+        in
+        if line == "" then
+            []
+
+        else
+            [ Draw.Span line Draw.colorNo Draw.colorNo 0 ]
+
+    else
+        let
+            line =
+                maybeConvertTabs s full
+
+            teP =
+                teParamsOf s
+        in
+        if useSpaceStylerOf s then
+            runesRow teP (spaceParamsOf s) line
+
+        else
+            escRow (styleOfParams teP) line
+
+
+{-| The plain single-span form: str under s's colors/attrs packed Draw-style
+(ColorNo -1 / palette n / RGB24), no run-splitting.  Exact for plain text
+when useSpaceStyler is False and teParamsOf is non-empty; otherwise use
+renderStyled (teParamsOf empty — e.g. a padding-only style — renders PLAIN).
+-}
+styleSpan : Style -> String -> Draw.Span
+styleSpan s str =
+    Draw.Span str (packColorOf s.fg) (packColorOf s.bg) (attrBitsOf s)
+
+
+packColorOf : Color -> Int
+packColorOf c =
+    case c of
+        ColorNo ->
+            Draw.colorNo
+
+        ColorAnsi n ->
+            Draw.packAnsi n
+
+        ColorAnsi256 n ->
+            Draw.packAnsi256 n
+
+        ColorRgb r g b ->
+            Draw.packRgb r g b
+
+
+attrBitsOf : Style -> Int
+attrBitsOf s =
+    List.foldl
+        (\kv acc ->
+            if getAsBool (Tuple.first kv) False s then
+                Bitwise.or acc (Tuple.second kv)
+
+            else
+                acc
+        )
+        0
+        [ ( boldKey, Draw.attrBold )
+        , ( faintKey, Draw.attrFaint )
+        , ( italicKey, Draw.attrItalic )
+        , ( underlineKey, Draw.attrUnderline )
+        , ( blinkKey, Draw.attrBlink )
+        , ( reverseKey, Draw.attrReverse )
+        , ( strikethroughKey, Draw.attrStrikethrough )
+        ]

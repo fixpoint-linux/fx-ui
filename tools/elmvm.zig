@@ -34,7 +34,17 @@ pub fn main(init: std.process.Init) !void {
 
     var it = init.minimal.args.iterate();
     _ = it.next(); // program name
-    const bundle_path = it.next() orelse usage();
+
+    // P1 photon-gui: optional --render-dump (must precede the bundle path).
+    // Arms the host effect loop's leafRender dump: each TaskRender Frame is
+    // decoded and printed to stderr as the fixture oracle.
+    var render_dump = false;
+    var arg0 = it.next() orelse usage();
+    if (std.mem.eql(u8, arg0, "--render-dump")) {
+        render_dump = true;
+        arg0 = it.next() orelse usage();
+    }
+    const bundle_path = arg0;
     const fn_name = it.next() orelse usage();
 
     // ---- read the bundle file into a [:0]const u8 buffer ----
@@ -142,7 +152,7 @@ pub fn main(init: std.process.Init) !void {
     g.rootPushValue(&result);
     defer g.rootPop();
     if (effectloop.isProgram(result)) {
-        var final = effectloop.runProgram(&v, result) catch |e| {
+        var final = effectloop.runProgramWith(&v, result, render_dump) catch |e| {
             std.debug.print("elmvm: error: {s}\n", .{values.errSlice(v.err_slot)});
             return e;
         };

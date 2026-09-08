@@ -1,0 +1,6 @@
+render-dump rows=1 spans=1
+r0: fg=4 bg=17437726 attrs=1 "ab cd"
+render-dump rows=2 spans=3
+r0: fg=196 bg=16843267 attrs=1 "XY" fg=-1 bg=-1 attrs=0 " plain " fg=-1 bg=-1 attrs=8 "u"
+r1:
+"1|1|1|1"

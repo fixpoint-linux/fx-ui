@@ -8,3 +8,7 @@ elm-compiler/test-compiler.js
 
 # elm-fixtures generated output (iofile test writes this each gate run)
 tests/elm-fixtures/out/hello.out
+
+# runtime artifacts of the todos example app (generated each run)
+todos-bin
+todos.txt

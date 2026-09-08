@@ -150,6 +150,17 @@ pty_app() {
   add_check ptycwd "$name" "$fn" "" "" "$script" "$FIX/$name.elm" "$OUT/$name.csexp"
 }
 
+# renderdump <name> <fn> <expected>: like run, but elmvm is started WITH
+# --render-dump and BOTH streams are compared: stdout is the final model, and
+# stderr carries the host's leafRender dumps (the decoded TaskRender Frame for
+# every Io.renderFrame the fixture submitted).  This is the P1 photon-gui seam
+# oracle: what the host RECEIVES for a render, not what it draws.
+renderdump() {
+  local name="$1" fn="$2" exp="$3"
+  register_group "$OUT/$name.csexp" "$FIX/$name.elm"
+  add_check rdump "$name" "$fn" "$exp" "" "" "$FIX/$name.elm" "$OUT/$name.csexp"
+}
+
 # out_cmp <name>: compare the raw file an elmvm run wrote (iofile's hello.out)
 # against its expected bytes.
 out_cmp() {
@@ -270,6 +281,35 @@ run p2pad       main   "$(read_expected p2pad)"
 # rounded border boxes + the corner-suppression matrix; marginBg margins;
 # maxWidth/maxHeight; joinH/joinV/place; width/height/size; CJK box width).
 run lgunit      main   "$(read_expected lgunit)"
+
+# --- P3 (photon-gui): Lipgloss style-as-data (Draw.Frame) path ---
+# lgstyled: Lipgloss.renderStyled builds Draw spans directly (no ANSI).  Each
+# case asserts Draw.frameEq (Draw.fromAnsi [render s str]) [renderStyled s
+# str] — the ANSI round-trip is the oracle — across bold/ANSI/256/RGB colors,
+# the full attr stack, the per-rune space styler (underlineSpaces variants,
+# bare-run merging, CJK), nested mid-string SGR, value prefix, tabs, and
+# empty strings; dumpFrame pins pin the span structure.  ADDITIVE: render's
+# ANSI bytes are untouched (lgunit stays byte-identical).
+run lgstyled    main   "$(read_expected lgstyled)"
+
+# --- P1 (photon-gui): the DrawList as the Elm<->host render API ---
+# renderdump: core-libs/Draw.elm end to end, fixture-gated.  Elm-side
+# (stdout model): the self-oracle render -> fromAnsi -> toAnsi -> fromAnsi ==
+# id (frameEq) on a REAL Lipgloss render and a hand-written ANSI row, plus
+# the hand-pinned decoded structures (Draw.dumpFrame).  Host-side (stderr):
+# the same frames submitted via Io.renderFrame cross the seam as TaskRender
+# ctor vectors and leafRender decodes them -- the --render-dump stderr dump is
+# byte-pinned in the same expected file.  No terminal-path change.
+renderdump renderdump main   "$(read_expected renderdump)"
+
+# --- P2 (photon-gui): cell-width parity, Elm vs the Zig renderer ---
+# widthparity: representative Str.width/Str.truncate classes (ASCII, CJK/
+# fullwidth, combining/zero-width, box-drawing borders, control bytes, ANSI
+# CSI/OSC skip, emoji+VS16, ZWJ family, range edges, truncate walk) pinned as
+# ALL-ONES bits — a 0 bit is a live Elm-vs-Zig width divergence.  The same
+# values are asserted Zig-side in src/renderer/width_test.zig, and the tables
+# are byte-gated by tools/genwidth.zig (zig build width-check).
+run widthparity main   "$(read_expected widthparity)"
 
 # --- S3 (M-FOUNDATION): host TaskNow/Sleep/Quit leaves (monotonic time) ---
 # nowunit: sleep 30 then now-diff >= 25 (CLOCK_MONOTONIC, not the wall-clock
@@ -583,6 +623,19 @@ dispatch() {
         echo "PASS $name ($qname pty, temp cwd)"; pass=$((pass+1))
       else
         echo "FAIL $name ($qname pty, temp cwd): $got"; fail=$((fail+1))
+      fi
+      ;;
+    rdump)
+      if head -c 4 "$outfile" | grep -q '^err '; then
+        echo "FAIL $name: compile error: $(cat "$outfile")"; fail=$((fail+1)); return
+      fi
+      mod=$(module_name "$fixfile")
+      qname="$mod.$fn"
+      got=$("$ELMVM" --render-dump "$outfile" "$qname" 2>&1)
+      if [ "$got" = "$exp" ]; then
+        echo "PASS $name ($qname --render-dump)"; pass=$((pass+1))
+      else
+        echo "FAIL $name ($qname --render-dump): exp[$exp] got[$got]"; fail=$((fail+1))
       fi
       ;;
     io)

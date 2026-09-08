@@ -1,0 +1,24 @@
+"ok 0 bold
+ok 1 fg-ansi
+ok 2 fg-bright
+ok 3 fg-black
+ok 4 bg-256
+ok 5 rgb-both
+ok 6 stack-nound
+ok 7 underline-spaces
+ok 8 underline-fg
+ok 9 ulspaces
+ok 10 strike-spaces
+ok 11 nested-mid
+ok 12 value-prefix
+ok 13 plain
+ok 14 tab-plain
+ok 15 tab-styled
+ok 16 cjk-underline
+ok 17 empty-styled
+ok 18 empty-plain
+ok 19 cw-plain
+r0: fg=-1 bg=-1 attrs=1 "hi"
+r0: fg=-1 bg=-1 attrs=8 "a" | fg=-1 bg=-1 attrs=8 " " | fg=-1 bg=-1 attrs=8 "b"
+r0: fg=29910066 bg=17437726 attrs=0 "x"
+r0: fg=1 bg=-1 attrs=0 "a" | fg=6 bg=-1 attrs=1 "mid" | fg=-1 bg=-1 attrs=0 "b""
