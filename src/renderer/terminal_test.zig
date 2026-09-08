@@ -153,6 +153,30 @@ test "replay: attr-clear markers re-emit their SGR code" {
     try expectEncoded(alloc, &.{mark(-1, -1, 4096 | 22)}, "\x1b[22m");
 }
 
+test "replay: combined clear+set events survive as ordered markers" {
+    // Draw.fromAnsiLog packs ONE marker per param (never the folded
+    // 4096|22|1 = 4119 that aliased to \e[23m); the host replays both
+    // halves in event order and the pen keeps the re-set / re-color.
+    const alloc = std.testing.allocator;
+    try expectEncoded(
+        alloc,
+        &.{ mark(-1, -1, 4096 | 22), mark(-1, -1, gui.ATTR_BOLD), sp("x") },
+        "\x1b[22m\x1b[1mx",
+    );
+    try expectEncoded(
+        alloc,
+        &.{ mark(-1, -1, 4096 | 24), mark(-1, -1, gui.ATTR_UNDERLINE), sp("x") },
+        // the re-set replays in teParamsOf order: the v1.1.0 duplicate 4
+        "\x1b[24m\x1b[4;4mx",
+    );
+    try expectEncoded(
+        alloc,
+        &.{ mark(-1, -1, 4096 | 22), mark(1, -1, 0), sp("x") },
+        // packed fg 1 = ANSI 31 (red)
+        "\x1b[22m\x1b[31mx",
+    );
+}
+
 test "replay: bare attrLogClear marker is the wrapReset \\e[m" {
     const alloc = std.testing.allocator;
     try expectEncoded(alloc, &.{mark(-1, -1, 4096)}, "\x1b[m");

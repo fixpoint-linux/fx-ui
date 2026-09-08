@@ -71,8 +71,11 @@ const color_none: i64 = -1;
 /// Packed RGB24 base (Draw.packRgb: 0x1000000 bor RGB24).
 const rgb_base: i64 = 0x1000000;
 
-/// Draw.attrLogClear (elm-compiler/core-libs/Draw.elm): a marker span's
-/// attrs pack `4096 | sgr_code` (22..29) for a raw attr-clear replay.
+/// Draw.attrLogClear (elm-compiler/core-libs/Draw.elm): an attr-CLEAR marker
+/// span's attrs pack `4096 | sgr_code` (22..25/27/29).  fromAnsiLog emits one
+/// such span PER clear param and never folds a clear code into a span that
+/// also carries attr BITS, so the `& 0xFF` decode below cannot alias (the
+/// folded packing once replayed `\e[22;1m` as `\e[23m` — bold lost).
 const attr_log_clear: i64 = 4096;
 
 // ====================== ANSI encoder ======================

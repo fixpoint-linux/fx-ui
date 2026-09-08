@@ -457,7 +457,13 @@ fn eventThreadMain(st: *State) void {
     // Value manufacture happens on the effectloop thread.
     var e: SDL_Event = undefined;
     while (st.running.load(.acquire)) {
-        if (SDL_WaitEvent(&e) != 1) return; // SDL error — pipe EOF => GClose
+        if (SDL_WaitEvent(&e) != 1) {
+            // SDL error — the event loop is dead, so deliver GClose
+            // (best-effort: EAGAIN drops) or a suspended guiPoll would hang
+            // forever on a pipe that will never carry another record.
+            writeRecord(st, .{ .kind = @intFromEnum(gui.EvKind.close) });
+            return;
+        }
         translateEvent(st, &e);
     }
 }
@@ -593,7 +599,18 @@ pub fn present(frame: []const []const gui.Span) void {
         nrects = 1;
     } else {
         for (st.dirty.items) |r| {
-            if (nrects >= rects.len) break;
+            if (nrects >= rects.len) {
+                // More merged rects than the update-array cap (a
+                // checkerboard/striped update merges to ~cols*rows/2
+                // rects).  endFrame already swapped the damage buffers, so
+                // dropping the overflow rects would leave those cells
+                // drawn-NEVER and hash-clean FOREVER — fall back to a
+                // whole-grid draw (force_full semantics) instead.
+                drawCells(st, surf, .{ .x = 0, .y = 0, .w = cols, .h = rows }, grid);
+                rects[0] = .{ .x = 0, .y = 0, .w = surf.w, .h = surf.h };
+                nrects = 1;
+                break;
+            }
             drawCells(st, surf, r, grid);
             rects[nrects] = .{
                 .x = @as(c_int, r.x) * st.cell_w,

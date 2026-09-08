@@ -10,8 +10,9 @@ module RenderDump exposing (main)
 --    render -> Draw.fromAnsi -> Draw.toAnsi -> fromAnsi is the identity
 --    (frameEq), and Draw.dumpFrame pins the DECODED STRUCTURE of a real
 --    Lipgloss render (bold cyan fg-4 box line + reset + 256-color fg-212 /
---    RGB bg span) and of a hand-written ANSI row (multi-param SGR, empty
---    row kept as an empty row for frame geometry).
+--    RGB bg span), of a hand-written ANSI row (multi-param SGR, empty
+--    row kept as an empty row for frame geometry), and of a fromAnsiLog
+--    row (ordered clear+set markers, no-op events dropped).
 --
 -- 2. HOST ORACLE (Zig-side, stderr): the same frames submitted through
 --    Io.renderFrame cross the seam as TaskRender ctor vectors; the host
@@ -75,6 +76,37 @@ dumpB =
         ]
 
 
+-- fromAnsiLog oracle: the SGR-EVENT-LOG parser.  A combined attr-clear+set
+-- event lands as ORDERED marker spans, one per param (the old folded packing
+-- aliased `\e[22;1m` to attrs 4119 -> replayed `\e[23m`, losing the bold
+-- re-set); a no-op event (unknown 21, 39 alone) lands NO marker (the host
+-- would replay the all-default marker as a full `\e[0m` pen reset); a
+-- literal `\e[0m` still lands the all-default marker it replays as.
+logView =
+    [ "\u{1B}[22;1mX"
+    , "\u{1B}[24;4mY"
+    , "\u{1B}[22;31mZ"
+    , "\u{1B}[21mW"
+    , "\u{1B}[39mV"
+    , "\u{1B}[0mQ"
+    ]
+
+
+frameC =
+    Draw.fromAnsiLog logView
+
+
+dumpC =
+    String.join "\n"
+        [ "r0: fg=-1 bg=-1 attrs=4118 \"\" | fg=-1 bg=-1 attrs=1 \"\" | fg=-1 bg=-1 attrs=1 \"X\""
+        , "r1: fg=-1 bg=-1 attrs=4120 \"\" | fg=-1 bg=-1 attrs=8 \"\" | fg=-1 bg=-1 attrs=8 \"Y\""
+        , "r2: fg=-1 bg=-1 attrs=4118 \"\" | fg=1 bg=-1 attrs=0 \"\" | fg=1 bg=-1 attrs=0 \"Z\""
+        , "r3: fg=-1 bg=-1 attrs=0 \"W\""
+        , "r4: fg=-1 bg=-1 attrs=0 \"V\""
+        , "r5: fg=-1 bg=-1 attrs=0 \"\" | fg=-1 bg=-1 attrs=0 \"Q\""
+        ]
+
+
 b cond =
     if cond then
         "1"
@@ -91,10 +123,12 @@ init () =
         , -- structure oracle: the decoded Frame matches the hand-pinned dump
           b (Draw.dumpFrame frameA == dumpA)
         , b (Draw.dumpFrame frameB == dumpB)
+        , b (Draw.dumpFrame frameC == dumpC)
         ]
     , Cmd.batch
         [ Task.perform GotA (Io.renderFrame frameA)
         , Task.perform GotB (Io.renderFrame frameB)
+        , Task.perform GotC (Io.renderFrame frameC)
         ]
     )
 
@@ -102,6 +136,7 @@ init () =
 type Msg
     = GotA ()
     | GotB ()
+    | GotC ()
 
 
 update msg model =
@@ -110,4 +145,7 @@ update msg model =
             ( model, Cmd.none )
 
         GotB _ ->
+            ( model, Cmd.none )
+
+        GotC _ ->
             ( model, Cmd.none )

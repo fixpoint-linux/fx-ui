@@ -57,6 +57,16 @@ v1, but `update` now takes the APP'S OWN message type (produced by `onKey`/
 `onMouse` from a decoded input, or by the app's own commands) and returns
 `Cmd msg` of that same type.  `mouse` picks the terminal tracking mode —
 `MouseModeOff` arms no readMouse at all.
+
+CLOSED-SUBSET VIEW CONTRACT: a `view` row is expected to carry ONLY the SGR
+that Lipgloss renders emit.  Rows are re-parsed by Draw.fromAnsiLog into a
+Draw.Frame before they cross to the host, so any ANSI an app embeds in a
+view row is CANONICALIZED OR DROPPED: unknown SGR params (21/26/28/51..55/
+58...) and no-op events vanish, attr-clear/set params replay in canonical
+order, non-SGR escapes (OSC, other CSI) are eaten and never reach the
+screen.  Hand-rolled escapes will NOT round-trip byte-for-byte — if you
+need a style, emit it through Lipgloss (see Draw.fromAnsiLog for the full
+contract).
 -}
 type alias Config msg model =
   { init : () -> ( model, Runtime.Cmd msg )

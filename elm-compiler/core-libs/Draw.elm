@@ -609,8 +609,19 @@ event), so a row WITH a marker is unambiguous: the host replays; a row
 WITHOUT (plain fromAnsi, toAnsi output, hand-built) renders piece-style.
 The marker vocabulary is the closed emitter subset: SGR 0 (default marker),
 attrs 1/2/3/4/5/7/9, fg/bg 30..37/39/40..47/49/90..97/100..107/38;5/38;2/
-48;5/48;2, and the attr-clear codes 22..29 packed as attrLogClear + code
-(no corpus emitter uses them today; kept so a marker never lies).
+48;5/48;2, and the attr-clear codes 22..25/27/29 — EACH as its own marker
+span (attrs = attrLogClear + the code, never folded with attr bits), so a
+combined clear+set event like `\e[22;1m` replays both halves in order.  An
+event with NO recognized effect emits no marker at all (replaying the
+all-default marker would be a full `\e[0m` pen reset the event never was).
+
+CLOSED-SUBSET CONTRACT (the Tea `view` contract, see Tea.elm's Config):
+fromAnsiLog is NOT a general ANSI emulator.  View rows are expected to carry
+ONLY the SGR that Lipgloss renders emit.  Anything else an app embeds in a
+view row — its own CSI/OSC sequences, unknown SGR params (21/26/28/51..55/
+58...), non-canonical param orders — is canonicalized, rewritten or silently
+DROPPED, and non-SGR escapes never reach span text.  It will not round-trip
+byte-for-byte; reach for Lipgloss instead of hand-rolled escapes.
 -}
 attrLogClear =
     4096
@@ -631,9 +642,11 @@ fromRowsLog rows acc =
 
 
 {-| parseRow with event markers: an SGR flushes the pending run (with the
-CURRENT style, exactly like parseRow), then appends the event's marker span,
-then applies the params.  Any other escape is skipped unchanged (no marker,
-no text — control bytes never leak into span text).
+CURRENT style, exactly like parseRow), then appends the event's marker
+spans (see sgrMarkers — usually one, possibly several for a mixed
+clear+set event, possibly NONE for a no-op event), then applies the
+params.  Any other escape is skipped unchanged (no marker, no text —
+control bytes never leak into span text).
 -}
 parseRowLog : String -> Sgr -> Int -> Int -> List Span -> List Span
 parseRowLog s st start i acc =
@@ -663,7 +676,7 @@ parseRowLog s st start i acc =
                             :: flushRun s st start i acc
 
                     else
-                        sgrMarker params :: flushRun s st start i acc
+                        append (sgrMarkers params) (flushRun s st start i acc)
 
                 st1 =
                     applySgr params st
@@ -677,18 +690,128 @@ parseRowLog s st start i acc =
         parseRowLog s st start (i + 1) acc
 
 
-{-| Pack one SGR event's params as a marker span (empty text).  Attr-adds
-set their bit, colors set their slot, 0 makes the DEFAULT marker (the host
-replays it as the reset the event was), attr-clears pack attrLogClear + the
-SGR code, unknown codes contribute nothing.
+{-| Pack one SGR event's params as zero-width marker spans (empty text).
+Corpus-subset params fold into ONE span (the host replays it as the one
+`\e[..;..m` piece the event was); 0 makes the DEFAULT marker (the host
+replays it as the reset the event was); each attr-clear param gets its
+OWN span (attrs = attrLogClear + the code, a field no fold marker can
+reach — fold markers never set bit 12).  Folding the raw code into the
+same int as the attr BITS once replayed a combined clear+set event WRONG:
+`\e[22;1m` packed 4096|22|1 = 4119, decoded &0xFF = 23 -> `\e[23m`
+(italic-off, bold lost).  An event that reduces to NOTHING in the marker
+vocabulary (unknown codes 21/26/28/51-55/58..., or 39/49 alone — the
+slots they set are already at default) emits NO marker at all: the host
+would replay the all-default marker as a FULL `\e[0m` reset, striking
+pen state the event never touched.
+
+The returned list is in parseRowLog's REVERSED-ACCUMULATOR order (the
+caller prepends it onto acc; the row's final reverse restores event
+order — a clear param replays before a later set param).
 -}
-sgrMarker : List Int -> Span
-sgrMarker params =
-    let
-        m =
-            markerDelta params emptyMarker
-    in
+sgrMarkers : List Int -> List Span
+sgrMarkers params =
+    sgrMarkerGo params emptyMarker [] False
+
+
+markerSpan : Marker -> Span
+markerSpan m =
     Span "" m.fg m.bg m.attrs
+
+
+markerDefault : Marker -> Bool
+markerDefault m =
+    m.fg == colorNo && m.bg == colorNo && m.attrs == 0
+
+
+-- Fold `m` onto the (reversed) marker list unless it is the empty fold.
+addMarker : Marker -> List Span -> List Span
+addMarker m acc =
+    if markerDefault m then
+        acc
+
+    else
+        markerSpan m :: acc
+
+
+sgrMarkerGo : List Int -> Marker -> List Span -> Bool -> List Span
+sgrMarkerGo params m acc hadReset =
+    case params of
+        [] ->
+            if not (markerDefault m) then
+                markerSpan m :: acc
+
+            else if hadReset then
+                -- the event WAS `\e[0m`: keep the all-default marker so the
+                -- host replays exactly that (never dropped).
+                markerSpan emptyMarker :: acc
+
+            else
+                -- nothing recognized: no marker (a full-reset replay would
+                -- lie far worse than silence).
+                acc
+
+        p :: rest ->
+            if p == 0 then
+                sgrMarkerGo rest emptyMarker acc True
+
+            else if attrBitOf p /= 0 then
+                -- attrs 1,2,3,4,5,7,9 mapped to their Draw attrBITS (the
+                -- bits are NOT the SGR codes: italic 3->4, underline 4->8,
+                -- blink 5->16, reverse 7->32, strike 9->64)
+                sgrMarkerGo rest { m | attrs = Bitwise.or m.attrs (attrBitOf p) } acc hadReset
+
+            else if (p >= 22 && p <= 25) || p == 27 || p == 29 then
+                -- attr-clear code (21/26/28 are outside the corpus set): a
+                -- marker of its own, AFTER the fold accumulated so far, so
+                -- `\e[22;1m` replays clear-then-set in event order.
+                sgrMarkerGo rest
+                    emptyMarker
+                    (addMarker m (Span "" colorNo colorNo (Bitwise.or attrLogClear p) :: acc))
+                    False
+
+            else if p >= 30 && p <= 37 then
+                sgrMarkerGo rest { m | fg = p - 30 } acc hadReset
+
+            else if p == 39 then
+                sgrMarkerGo rest { m | fg = colorNo } acc hadReset
+
+            else if p >= 40 && p <= 47 then
+                sgrMarkerGo rest { m | bg = p - 40 } acc hadReset
+
+            else if p == 49 then
+                sgrMarkerGo rest { m | bg = colorNo } acc hadReset
+
+            else if p >= 90 && p <= 97 then
+                sgrMarkerGo rest { m | fg = (p - 90) + 8 } acc hadReset
+
+            else if p >= 100 && p <= 107 then
+                sgrMarkerGo rest { m | bg = (p - 100) + 8 } acc hadReset
+
+            else if p == 38 then
+                case rest of
+                    5 :: v :: rest2 ->
+                        sgrMarkerGo rest2 { m | fg = v } acc hadReset
+
+                    2 :: r :: g :: b :: rest2 ->
+                        sgrMarkerGo rest2 { m | fg = packRgb r g b } acc hadReset
+
+                    -- malformed ext-color: drop the tail, like markerDelta did
+                    _ ->
+                        sgrMarkerGo [] m acc hadReset
+
+            else if p == 48 then
+                case rest of
+                    5 :: v :: rest2 ->
+                        sgrMarkerGo rest2 { m | bg = v } acc hadReset
+
+                    2 :: r :: g :: b :: rest2 ->
+                        sgrMarkerGo rest2 { m | bg = packRgb r g b } acc hadReset
+
+                    _ ->
+                        sgrMarkerGo [] m acc hadReset
+
+            else
+                sgrMarkerGo rest m acc hadReset
 
 
 type alias Marker =
@@ -730,71 +853,6 @@ attrBitOf p =
 
     else
         0
-
-
-markerDelta : List Int -> Marker -> Marker
-markerDelta params m =
-    case params of
-        [] ->
-            m
-
-        p :: rest ->
-            if p == 0 then
-                markerDelta rest emptyMarker
-
-            else if attrBitOf p /= 0 then
-                -- attrs 1,2,3,4,5,7,9 mapped to their Draw attrBITS (the
-                -- bits are NOT the SGR codes: italic 3->4, underline 4->8,
-                -- blink 5->16, reverse 7->32, strike 9->64)
-                markerDelta rest { m | attrs = Bitwise.or m.attrs (attrBitOf p) }
-
-            else if (p >= 22 && p <= 25) || p == 27 || p == 29 then
-                -- attr-clear codes: attrLogClear + the code (21/26/28 are
-                -- outside the corpus set; 22/23/24/25/27/29 replay raw)
-                markerDelta rest { m | attrs = Bitwise.or m.attrs (Bitwise.or attrLogClear p) }
-
-            else if p >= 30 && p <= 37 then
-                markerDelta rest { m | fg = p - 30 }
-
-            else if p == 39 then
-                markerDelta rest { m | fg = colorNo }
-
-            else if p >= 40 && p <= 47 then
-                markerDelta rest { m | bg = p - 40 }
-
-            else if p == 49 then
-                markerDelta rest { m | bg = colorNo }
-
-            else if p >= 90 && p <= 97 then
-                markerDelta rest { m | fg = (p - 90) + 8 }
-
-            else if p >= 100 && p <= 107 then
-                markerDelta rest { m | bg = (p - 100) + 8 }
-
-            else if p == 38 then
-                case rest of
-                    5 :: v :: rest2 ->
-                        markerDelta rest2 { m | fg = v }
-
-                    2 :: r :: g :: b :: rest2 ->
-                        markerDelta rest2 { m | fg = packRgb r g b }
-
-                    _ ->
-                        m
-
-            else if p == 48 then
-                case rest of
-                    5 :: v :: rest2 ->
-                        markerDelta rest2 { m | bg = v }
-
-                    2 :: r :: g :: b :: rest2 ->
-                        markerDelta rest2 { m | bg = packRgb r g b }
-
-                    _ ->
-                        m
-
-            else
-                markerDelta rest m
 
 
 -- ====================== dumpFrame: the structure oracle ======================

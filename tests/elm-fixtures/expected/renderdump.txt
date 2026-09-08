@@ -3,4 +3,11 @@ r0: fg=4 bg=17437726 attrs=1 "ab cd"
 render-dump rows=2 spans=3
 r0: fg=196 bg=16843267 attrs=1 "XY" fg=-1 bg=-1 attrs=0 " plain " fg=-1 bg=-1 attrs=8 "u"
 r1:
-"1|1|1|1"
+render-dump rows=6 spans=13
+r0: fg=-1 bg=-1 attrs=4118 "" fg=-1 bg=-1 attrs=1 "" fg=-1 bg=-1 attrs=1 "X"
+r1: fg=-1 bg=-1 attrs=4120 "" fg=-1 bg=-1 attrs=8 "" fg=-1 bg=-1 attrs=8 "Y"
+r2: fg=-1 bg=-1 attrs=4118 "" fg=1 bg=-1 attrs=0 "" fg=1 bg=-1 attrs=0 "Z"
+r3: fg=-1 bg=-1 attrs=0 "W"
+r4: fg=-1 bg=-1 attrs=0 "V"
+r5: fg=-1 bg=-1 attrs=0 "" fg=-1 bg=-1 attrs=0 "Q"
+"1|1|1|1|1"
