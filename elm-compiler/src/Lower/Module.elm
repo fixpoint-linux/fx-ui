@@ -140,7 +140,7 @@ compileSources sources =
                                                             -- table; concatenation preserves any
                                                             -- order (keys are globally unique).
                                                             sequenceMaps (List.map (compileUnit globals) checkedUnits)
-                                                                |> Result.map (Csexp.list << List.concat)
+                                                                |> Result.map (\xs -> Csexp.list (List.concat xs))
                                                 )
                                     )
                         )
@@ -226,7 +226,7 @@ compileOneGroup env corpusUnits corpusEntries groupSources =
 
                                                             Ok globals ->
                                                                 sequenceMaps (List.map (compileUnit globals) groupUnits)
-                                                                    |> Result.map (Csexp.list << (++) corpusEntries << List.concat)
+                                                                    |> Result.map (\xs -> Csexp.list (corpusEntries ++ List.concat xs))
                                                     )
                                         )
                             )
@@ -387,6 +387,8 @@ compileUnit globals unit =
         baseCtx =
             Expr.newContext modName globals
                 |> Expr.withImport aliasTable
+                |> Expr.withModuleAliases (Resolve.moduleAliasTable unit.file.imports)
+                |> Expr.withOpenTypeModules (Resolve.openTypeModules unit.file.imports)
     in
     compileFuns baseCtx unit.funs
         |> Result.map
@@ -627,7 +629,12 @@ synthesize : String -> List (Node Pattern.Pattern) -> Node Expression -> Functio
 synthesize name args body =
     { documentation = Nothing
     , signature = Nothing
-    , declaration = Node (Node.range body) (FunctionImplementation (Node Range.empty name) args body)
+    , declaration =
+        Node (Node.range body)
+            { name = Node Range.empty name
+            , arguments = args
+            , expression = body
+            }
     }
 
 

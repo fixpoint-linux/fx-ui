@@ -21,6 +21,7 @@ module Prelude exposing
     , resultWithDefault
     , isEmpty
     , head
+    , maybeHead
     , tail
     , singleton
     , reverse
@@ -36,6 +37,43 @@ module Prelude exposing
     , length
     , drop
     , take
+    , member
+    , any
+    , all
+    , concatMap
+    , filterMap
+    , map2
+    , indexedMap
+    , partition
+    , range
+    , repeat
+    , modBy
+    , stringFromChar
+    , charToCode
+    , charFromCode
+    , stringToList
+    , stringSlice
+    , stringDropLeft
+    , stringDropRight
+    , stringStartsWith
+    , stringEndsWith
+    , stringFromFloat
+    , stringFromList
+    , stringToLower
+    , stringToUpper
+    , stringAny
+    , stringCons
+    , stringFoldr
+    , charIsLower
+    , charIsUpper
+    , charIsAlpha
+    , charIsDigit
+    , charIsOctDigit
+    , charIsHexDigit
+    , charIsAlphaNum
+    , basicsToFloat
+    , basicsIsNaN
+    , stringToFloat
     )
 
 -- The M3 prelude: a pure-core Elm module compiled BY the compiler itself at
@@ -416,6 +454,20 @@ head xs =
             "head of empty list"
 
 
+-- The REAL Elm `List.head : List a -> Maybe a` (the bare `head` above is a
+-- legacy element-returning convenience with a String fallback; the dotted
+-- `List.head` spelling used by the compiler's own source needs the Maybe
+-- shape).
+maybeHead : List a -> Maybe a
+maybeHead xs =
+    case xs of
+        y :: _ ->
+            Just y
+
+        [] ->
+            Nothing
+
+
 tail xs =
     case xs of
         _ :: rest ->
@@ -553,3 +605,393 @@ removeFieldImpl name rec =
 
         [] ->
             []
+
+
+
+-- ====================== List helpers (M14 selfhost shims) ======================
+-- The richer List surface the compiler's OWN source (Type/Lower/Zinc) needs:
+-- plain recursive walkers over the existing Prelude combinators, so they stay
+-- inside the supported subset (no List/String stdlib modules).
+
+
+member : comparable -> List comparable -> Bool
+member x xs =
+    case xs of
+        y :: rest ->
+            if x == y then
+                True
+
+            else
+                member x rest
+
+        [] ->
+            False
+
+
+any : (a -> Bool) -> List a -> Bool
+any f xs =
+    case xs of
+        y :: rest ->
+            if f y then
+                True
+
+            else
+                any f rest
+
+        [] ->
+            False
+
+
+all : (a -> Bool) -> List a -> Bool
+all f xs =
+    case xs of
+        y :: rest ->
+            if f y then
+                all f rest
+
+            else
+                False
+
+        [] ->
+            True
+
+
+filterMap : (a -> Maybe b) -> List a -> List b
+filterMap f xs =
+    case xs of
+        y :: rest ->
+            case f y of
+                Just v ->
+                    v :: filterMap f rest
+
+                Nothing ->
+                    filterMap f rest
+
+        [] ->
+            []
+
+
+concatMap : (a -> List b) -> List a -> List b
+concatMap f xs =
+    case xs of
+        y :: rest ->
+            append (f y) (concatMap f rest)
+
+        [] ->
+            []
+
+
+map2 : (a -> b -> c) -> List a -> List b -> List c
+map2 f xs ys =
+    case xs of
+        x :: xr ->
+            case ys of
+                y :: yr ->
+                    f x y :: map2 f xr yr
+
+                [] ->
+                    []
+
+        [] ->
+            []
+
+
+indexedMap : (Int -> a -> b) -> List a -> List b
+indexedMap f xs =
+    indexedMapGo f 0 xs
+
+
+indexedMapGo : (Int -> a -> b) -> Int -> List a -> List b
+indexedMapGo f i xs =
+    case xs of
+        y :: rest ->
+            f i y :: indexedMapGo f (i + 1) rest
+
+        [] ->
+            []
+
+
+partition : (a -> Bool) -> List a -> ( List a, List a )
+partition f xs =
+    partitionGo f xs [] []
+
+
+partitionGo : (a -> Bool) -> List a -> List a -> List a -> ( List a, List a )
+partitionGo f xs ys ns =
+    case xs of
+        y :: rest ->
+            if f y then
+                partitionGo f rest (y :: ys) ns
+
+            else
+                partitionGo f rest ys (y :: ns)
+
+        [] ->
+            ( reverse ys, reverse ns )
+
+
+range : Int -> Int -> List Int
+range lo hi =
+    if lo > hi then
+        []
+
+    else
+        lo :: range (lo + 1) hi
+
+
+repeat : Int -> a -> List a
+repeat n x =
+    if n <= 0 then
+        []
+
+    else
+        x :: repeat (n - 1) x
+
+
+-- Integer modulo (both args non-negative at every selfhost call site: modBy 26
+-- i, modBy 2 code).  `//` is the VM's integer division.
+modBy : Int -> Int -> Int
+modBy n x =
+    x - (x // n) * n
+
+
+
+-- ====================== Char / String helpers (M14 selfhost shims) ============
+-- Char is a BYTE-ORIENTED 1-byte string at runtime (the VM's char-code /
+-- c-strlen count bytes, not code points), so these shims are the byte-level
+-- spellings the compiler's own source expects: Char.toCode = first byte,
+-- Char.fromCode = one byte, String.fromChar = identity, String.toList = one
+-- Char per byte.  The char/string conversion bodies are TRUSTED (the checker
+-- keeps Char and String distinct, but the VM does not).
+
+
+-- TRUSTED: `c` (a Char) IS a 1-byte string at runtime.
+stringFromChar : Char -> String
+stringFromChar c =
+    c
+
+
+-- TRUSTED: char-code on the 1-byte string is the code point for ASCII.
+charToCode : Char -> Int
+charToCode c =
+    charCode c 0
+
+
+-- TRUSTED: shen.bytes->string of a 1-element list is the 1-byte char.
+charFromCode : Int -> Char
+charFromCode n =
+    bytesToString (n :: [])
+
+
+-- One Char per byte (see the header note: byte semantics, not code points).
+stringToList : String -> List Char
+stringToList s =
+    stringToListGo s 0 (String.length s)
+
+
+stringToListGo : String -> Int -> Int -> List Char
+stringToListGo s i len =
+    if i >= len then
+        []
+
+    else
+        charFromCode (charCode s i) :: stringToListGo s (i + 1) len
+
+
+-- Real Elm's (start, end) slice over the byte-level substring prim.
+stringSlice : Int -> Int -> String -> String
+stringSlice start end s =
+    String.sliceLen start (end - start) s
+
+
+stringDropLeft : Int -> String -> String
+stringDropLeft n s =
+    if n <= 0 then
+        s
+
+    else if n >= String.length s then
+        ""
+
+    else
+        String.sliceLen n (String.length s - n) s
+
+
+stringDropRight : Int -> String -> String
+stringDropRight n s =
+    if n <= 0 then
+        s
+
+    else if n >= String.length s then
+        ""
+
+    else
+        String.sliceLen 0 (String.length s - n) s
+
+
+stringStartsWith : String -> String -> Bool
+stringStartsWith prefix s =
+    String.sliceLen 0 (String.length prefix) s == prefix
+
+
+stringEndsWith : String -> String -> Bool
+stringEndsWith suffix s =
+    let
+        n =
+            String.length s - String.length suffix
+    in
+    if n < 0 then
+        False
+
+    else
+        String.sliceLen n (String.length suffix) s == suffix
+
+
+-- TRUSTED: the 1-arg `str` prim renders any scalar (a Float here) to its
+-- decimal text.
+stringFromFloat : Float -> String
+stringFromFloat f =
+    strPrim f
+
+
+-- String.fromList over the byte-level Char model (each Char is one byte).
+stringFromList : List Char -> String
+stringFromList chars =
+    case chars of
+        c :: rest ->
+            String.append (stringFromChar c) (stringFromList rest)
+
+        [] ->
+            ""
+
+
+-- ASCII byte case-mapping; non-ASCII bytes pass through unchanged (the
+-- Unicode classification the selfhost corpus needs lives in Char.Extra's own
+-- `code <= ...` range tests, not in String.toLower/toUpper).
+charToLower : Char -> Char
+charToLower c =
+    let
+        n =
+            charToCode c
+    in
+    if 65 <= n && n <= 90 then
+        charFromCode (n + 32)
+
+    else
+        c
+
+
+charToUpper : Char -> Char
+charToUpper c =
+    let
+        n =
+            charToCode c
+    in
+    if 97 <= n && n <= 122 then
+        charFromCode (n - 32)
+
+    else
+        c
+
+
+stringToLower : String -> String
+stringToLower s =
+    stringFromList (map charToLower (stringToList s))
+
+
+stringToUpper : String -> String
+stringToUpper s =
+    stringFromList (map charToUpper (stringToList s))
+
+
+stringAny : (Char -> Bool) -> String -> Bool
+stringAny f s =
+    any f (stringToList s)
+
+
+stringCons : Char -> String -> String
+stringCons c s =
+    String.append (stringFromChar c) s
+
+
+stringFoldr : (Char -> b -> b) -> b -> String -> b
+stringFoldr f z s =
+    foldr f z (stringToList s)
+
+
+-- Float-literal parsing (ParserFast) has no VM string->float hostcall yet;
+-- returns Nothing until that lands.  The selfhost group only needs this to
+-- COMPILE (M14's goal); runtime float parsing is M15+.
+stringToFloat : String -> Maybe Float
+stringToFloat s =
+    Nothing
+
+
+charIsLower : Char -> Bool
+charIsLower c =
+    let
+        n =
+            charToCode c
+    in
+    97 <= n && n <= 122
+
+
+charIsUpper : Char -> Bool
+charIsUpper c =
+    let
+        n =
+            charToCode c
+    in
+    65 <= n && n <= 90
+
+
+charIsAlpha : Char -> Bool
+charIsAlpha c =
+    charIsLower c || charIsUpper c
+
+
+charIsDigit : Char -> Bool
+charIsDigit c =
+    let
+        n =
+            charToCode c
+    in
+    48 <= n && n <= 57
+
+
+charIsOctDigit : Char -> Bool
+charIsOctDigit c =
+    let
+        n =
+            charToCode c
+    in
+    48 <= n && n <= 55
+
+
+charIsHexDigit : Char -> Bool
+charIsHexDigit c =
+    charIsDigit c
+        || (let
+                n =
+                    charToCode c
+            in
+            97 <= n && n <= 102 || 65 <= n && n <= 70
+           )
+
+
+charIsAlphaNum : Char -> Bool
+charIsAlphaNum c =
+    charIsAlpha c || charIsDigit c
+
+
+-- TRUSTED: the VM number is untyped (Int/Float promote), so the identity is
+-- the faithful Int->Float widening.
+basicsToFloat : Int -> Float
+basicsToFloat n =
+    n
+
+
+-- A Char's byte code is never NaN; the surrogate probe in Char.Extra needs
+-- the Float-typed predicate to exist, and this is its faithful byte reading.
+basicsIsNaN : Float -> Bool
+basicsIsNaN f =
+    False

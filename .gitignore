@@ -12,3 +12,8 @@ tests/elm-fixtures/out/hello.out
 # runtime artifacts of the todos example app (generated each run)
 todos-bin
 todos.txt
+
+# zig global cache redirected onto the pool (tools/aot/aot-build.sh)
+.zig-cache-global/
+__pycache__/
+*.pyc

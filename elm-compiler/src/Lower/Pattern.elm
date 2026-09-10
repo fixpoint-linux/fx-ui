@@ -213,11 +213,12 @@ namedPattern modName qref subs path =
             _ ->
                 Err "boolean pattern cannot have sub-patterns"
 
-    else if not (List.isEmpty qref.moduleName) && qref.moduleName /= modName then
-        Err ("foreign ADTs are M3: " ++ String.join "." qref.moduleName ++ "." ++ qref.name)
-
     else
         let
+            -- The tag is the BARE ctor name for foreign-qualified AND self
+            -- patterns alike: ctor defuns always emit `Symbol <bare name>` as
+            -- the vector tag (Lower.Module.ctorEntry), and a qualified pattern
+            -- (`TA.GenericType x`) must test the same symbol.
             tag =
                 qref.name
 

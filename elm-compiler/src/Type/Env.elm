@@ -40,7 +40,9 @@ via `src/TestMain.elm`.
 
 import Dict exposing (Dict)
 import Elm.Syntax.Declaration as Declaration exposing (Declaration(..))
+import Elm.Syntax.Exposing as Exposing exposing (Exposing(..), TopLevelExpose(..))
 import Elm.Syntax.File as File
+import Elm.Syntax.Import as Import
 import Elm.Syntax.Module as SyntaxModule
 import Elm.Syntax.Node as Node exposing (Node(..))
 import Elm.Syntax.Signature as Signature
@@ -114,12 +116,15 @@ collectFile file =
     let
         self =
             String.join "." (moduleNameOf file)
+
+        typeTable =
+            buildTypeTable file.imports
     in
-    List.foldl (collectDecl self) empty file.declarations
+    List.foldl (collectDecl self typeTable) empty file.declarations
 
 
-collectDecl : String -> Node Declaration -> Env -> Env
-collectDecl self node env =
+collectDecl : String -> TypeTable -> Node Declaration -> Env -> Env
+collectDecl self typeTable node env =
     case node of
         Node _ (FunctionDeclaration fn) ->
             case fn.signature of
@@ -129,28 +134,28 @@ collectDecl self node env =
                             nodeString sig.name
                     in
                     insert (self ++ "." ++ name)
-                        (signatureScheme self (Node.value sig.typeAnnotation))
+                        (signatureScheme self typeTable (Node.value sig.typeAnnotation))
                         env
 
                 Nothing ->
                     env
 
         Node _ (CustomTypeDeclaration typeDecl) ->
-            collectCtors self typeDecl env
+            collectCtors self typeTable typeDecl env
 
         Node _ (AliasDeclaration aliasDecl) ->
             let
                 qname =
                     self ++ "." ++ nodeString aliasDecl.name
             in
-            insertAlias qname (buildAlias self qname aliasDecl) env
+            insertAlias qname (buildAlias self qname typeTable aliasDecl) env
 
         _ ->
             env
 
 
-collectCtors : String -> SyntaxType.Type -> Env -> Env
-collectCtors self typeDecl env =
+collectCtors : String -> TypeTable -> SyntaxType.Type -> Env -> Env
+collectCtors self typeTable typeDecl env =
     let
         typeName =
             nodeString typeDecl.name
@@ -165,7 +170,7 @@ collectCtors self typeDecl env =
                     Node.value ctorNode
             in
             insertCtor (self ++ "." ++ nodeString vc.name)
-                (ctorScheme self typeName generics vc.arguments)
+                (ctorScheme self typeTable typeName generics vc.arguments)
                 e
         )
         env
@@ -177,14 +182,14 @@ each generic bound to a NEGATIVE-id sentinel var (kind inferred from use
 position — a generic used as a row tail becomes `KRow`). `genericVars` mirrors
 `generics` order so `expandAliases` can substitute positionally.
 -}
-buildAlias : String -> String -> TypeAlias.TypeAlias -> Alias
-buildAlias self qname aliasDecl =
+buildAlias : String -> String -> TypeTable -> TypeAlias.TypeAlias -> Alias
+buildAlias self qname typeTable aliasDecl =
     let
         generics =
             List.map nodeString aliasDecl.generics
 
         ( body, varMap ) =
-            convertAliasBody self (Node.value aliasDecl.typeAnnotation)
+            convertAliasBody self typeTable (Node.value aliasDecl.typeAnnotation)
     in
     { name = qname
     , generics = generics
@@ -196,11 +201,11 @@ buildAlias self qname aliasDecl =
 
 -- Convert an alias-body annotation with sentinel (negative-id) generic vars,
 -- returning the body type and the generic-name -> sentinel-var map.
-convertAliasBody : String -> TA.TypeAnnotation -> ( Type, Dict String VarId )
-convertAliasBody self ann =
+convertAliasBody : String -> TypeTable -> TA.TypeAnnotation -> ( Type, Dict String VarId )
+convertAliasBody self typeTable ann =
     let
         ( body, ctx1 ) =
-            convert { self = self, vars = Dict.empty, next = -1, step = -1 } ann
+            convert { self = self, typeTable = typeTable, vars = Dict.empty, next = -1, step = -1 } ann
     in
     ( body, ctx1.vars )
 
@@ -209,11 +214,11 @@ convertAliasBody self ann =
 -- defining module; argument types may additionally introduce FRESH type
 -- variables, e.g. `TaskAndThen : (a -> Task x b) -> Task x a -> Task x a` —
 -- those are quantified too, so `generalize` on the whole ctor type is exact).
-ctorScheme : String -> String -> List String -> List (Node TA.TypeAnnotation) -> Scheme
-ctorScheme self typeName generics argAnnos =
+ctorScheme : String -> TypeTable -> String -> List String -> List (Node TA.TypeAnnotation) -> Scheme
+ctorScheme self typeTable typeName generics argAnnos =
     let
         ctx0 =
-            { self = self, vars = Dict.empty, next = 0, step = 1 }
+            { self = self, typeTable = typeTable, vars = Dict.empty, next = 0, step = 1 }
 
         ( genVars, ctx1 ) =
             List.foldl makeGeneric ( [], ctx0 ) generics
@@ -239,11 +244,11 @@ makeGeneric name ( acc, ctx ) =
 -- A signature scheme: every `GenericType` leaf is quantified (with `number`/
 -- `comparable`/`appendable` leaves given their flex marker); the row-kind of a
 -- generic used as a row tail is inferred from its use position.
-signatureScheme : String -> TA.TypeAnnotation -> Scheme
-signatureScheme self ann =
+signatureScheme : String -> TypeTable -> TA.TypeAnnotation -> Scheme
+signatureScheme self typeTable ann =
     let
         ( t, _ ) =
-            convert { self = self, vars = Dict.empty, next = 0, step = 1 } ann
+            convert { self = self, typeTable = typeTable, vars = Dict.empty, next = 0, step = 1 } ann
     in
     generalize t
 
@@ -692,14 +697,86 @@ collectRow row acc =
 
 
 -- Conversion context: the current (qualified) module for self-type
--- qualification, the generic-name -> var mapping (lazily built), and the next
--- fresh var id (ids reflect first-appearance order).
+-- qualification, the generic-name -> var mapping (lazily built), the next
+-- fresh var id (ids reflect first-appearance order), and the import-derived
+-- type-resolution table (bare type names + module aliases).
 type alias Ctx =
     { self : String
     , vars : Dict String VarId
     , next : Int
     , step : Int
+    , typeTable : TypeTable
     }
+
+
+{-| Import-derived type-name resolution: `bareTypes` maps a bare type name
+exposed by an import (`import Dict exposing (Dict)`) to its defining module's
+dotted name; `aliases` maps an import-alias spelling (`import X as Y`) to the
+real module segments.  Used by `qualifyTypeName` so unqualified/aliased type
+names resolve to the module that DEFINES them instead of self-qualifying.
+-}
+type alias TypeTable =
+    { bareTypes : Dict String String
+    , aliases : List ( String, List String )
+    }
+
+
+buildTypeTable : List (Node Import.Import) -> TypeTable
+buildTypeTable imports =
+    List.foldl addImportType { bareTypes = Dict.empty, aliases = [] } imports
+
+
+addImportType : Node Import.Import -> TypeTable -> TypeTable
+addImportType (Node _ imp) table =
+    let
+        mod =
+            Node.value imp.moduleName
+
+        modStr =
+            String.join "." mod
+
+        aliases =
+            case imp.moduleAlias of
+                Just (Node _ aliasSegs) ->
+                    ( String.join "." aliasSegs, mod ) :: table.aliases
+
+                Nothing ->
+                    table.aliases
+
+        bareTypes =
+            case imp.exposingList of
+                Just (Node _ exp) ->
+                    exposeTypes modStr exp table.bareTypes
+
+                Nothing ->
+                    table.bareTypes
+    in
+    { bareTypes = bareTypes, aliases = aliases }
+
+
+exposeTypes : String -> Exposing -> Dict String String -> Dict String String
+exposeTypes modStr exp acc =
+    case exp of
+        All _ ->
+            -- Cannot enumerate an `exposing (..)` module's types without a
+            -- cross-module export pass (same limitation as the alias table).
+            acc
+
+        Explicit items ->
+            List.foldl (exposeType modStr) acc items
+
+
+exposeType : String -> Node TopLevelExpose -> Dict String String -> Dict String String
+exposeType modStr (Node _ item) acc =
+    case item of
+        TypeOrAliasExpose n ->
+            Dict.insert n modStr acc
+
+        TypeExpose { name } ->
+            Dict.insert name modStr acc
+
+        _ ->
+            acc
 
 
 convert : Ctx -> TA.TypeAnnotation -> ( Type, Ctx )
@@ -717,7 +794,7 @@ convert ctx ann =
                 ( argTs, ctx2 ) =
                     convertList ctx args
             in
-            ( TCon (qualifyTypeName ctx.self modName name) argTs, ctx2 )
+            ( TCon (qualifyTypeName ctx.typeTable ctx.self modName name) argTs, ctx2 )
 
         TA.Unit ->
             ( Rep.tUnit, ctx )
@@ -793,16 +870,13 @@ convertFields ctx fields =
 
 -- Resolve a (possibly unqualified) type name to its qualified form. Builtin
 -- value types keep their bare spelling; the Prelude ADTs (Maybe/Result/Order)
--- get the "Prelude." prefix; anything else unqualified is the current module's
--- own type.
---
--- NOTE (S6 gap): cross-module UNQUALIFIED opaque type references (Array.elm's
--- `JsArray`) do not resolve here — the Infer/Env wiring must add a shared
--- bare-type-name table before the full core-libs corpus is checked.
-qualifyTypeName : String -> List String -> String -> String
-qualifyTypeName self modName name =
+-- get the "Prelude." prefix; a bare name exposed by an import resolves to the
+-- module that DEFINES it (`import Dict exposing (Dict)` -> "Dict.Dict");
+-- anything else unqualified is the current module's own type.
+qualifyTypeName : TypeTable -> String -> List String -> String -> String
+qualifyTypeName typeTable self modName name =
     if not (List.isEmpty modName) then
-        String.join "." (modName ++ [ name ])
+        String.join "." (resolveTypeModule typeTable modName ++ [ name ])
 
     else
         case name of
@@ -837,7 +911,29 @@ qualifyTypeName self modName name =
                 "Prelude.Order"
 
             _ ->
-                self ++ "." ++ name
+                case Dict.get name typeTable.bareTypes of
+                    Just modStr ->
+                        modStr ++ "." ++ name
+
+                    Nothing ->
+                        self ++ "." ++ name
+
+
+-- Rewrite a qualified type reference's module prefix through import aliases:
+-- `import Elm.Syntax.Node as Node` makes the type spelling `Node.Node` resolve
+-- to `Elm.Syntax.Node.Node`.
+resolveTypeModule : TypeTable -> List String -> List String
+resolveTypeModule typeTable modName =
+    case typeTable.aliases of
+        [] ->
+            modName
+
+        ( aliasSpelling, real ) :: rest ->
+            if String.join "." modName == aliasSpelling then
+                real
+
+            else
+                resolveTypeModule { typeTable | aliases = rest } modName
 
 
 -- Lazily create (or fetch) the var for a generic name. `kind` is the use

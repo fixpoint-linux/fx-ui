@@ -138,6 +138,15 @@ program config =
     Program m0 c0 config.update
 
 
+-- M15: the process command line as data (run.js argv[2:] shape, binary path
+-- excluded).  `argvPrim` is a PURE REWRITE TARGET (no defun — see
+-- Type.Builtins.pseudoGlobals); the lowerer rewrites this bare reference to a
+-- 1-arg thunk reading the `*argv*` pseudo-global the native driver installs.
+argv : () -> List String
+argv () =
+    argvPrim ()
+
+
 drive update model cmd =
     case cmd of
         task :: rest ->

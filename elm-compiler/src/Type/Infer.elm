@@ -39,6 +39,7 @@ import Elm.Syntax.Module as SyntaxModule
 import Elm.Syntax.Node as Node exposing (Node(..))
 import Elm.Syntax.Pattern as Pattern exposing (Pattern(..), QualifiedNameRef)
 import Elm.Syntax.Range as Range exposing (Range)
+import Lower.Expr as LowerExpr
 import Lower.Resolve as LowerModule
 import Type.Builtins as Builtins
 import Type.Env as Env exposing (Scheme, Env)
@@ -111,6 +112,8 @@ inferUnit env file =
             , top = top
             , locals = []
             , aliasTable = aliasTable
+            , moduleAliases = LowerModule.moduleAliasTable file.imports
+            , openTypeModules = LowerModule.openTypeModules file.imports
             }
 
         refs name =
@@ -279,6 +282,8 @@ type alias Ctx =
     , top : Dict String Scheme
     , locals : List ( String, Scheme )
     , aliasTable : List ( String, String )
+    , moduleAliases : List ( String, String )
+    , openTypeModules : List (List String)
     }
 
 
@@ -312,7 +317,12 @@ resolveScheme ctx modName name =
                         Just s
 
                     Nothing ->
-                        resolveTokenScheme ctx name
+                        case resolveTokenScheme ctx name of
+                            Just s ->
+                                Just s
+
+                            Nothing ->
+                                resolveOpenCtor name ctx
 
     else if modName == ctx.self then
         -- Self-qualified reference: resolves to the unit's own TOP-LEVEL
@@ -327,7 +337,7 @@ resolveScheme ctx modName name =
                 resolveGlobalScheme (joinName (ctx.self ++ [ name ])) ctx
 
     else
-        resolveTokenScheme ctx (joinName (modName ++ [ name ]))
+        resolveTokenScheme ctx (LowerExpr.resolveModuleAlias ctx.moduleAliases (joinName (modName ++ [ name ])))
 
 
 resolveTokenScheme : Ctx -> String -> Maybe Scheme
@@ -353,6 +363,24 @@ resolveGlobalScheme key ctx =
 
         Nothing ->
             Env.lookupValue key ctx.env
+
+
+{-| `T(..)` imports put the type's constructors in scope as bare names; try
+`M.name` against the env for each such module (see Lower.Resolve.openTypeModules).
+-}
+resolveOpenCtor : String -> Ctx -> Maybe Scheme
+resolveOpenCtor name ctx =
+    case ctx.openTypeModules of
+        [] ->
+            Nothing
+
+        m :: rest ->
+            case resolveGlobalScheme (joinName (m ++ [ name ])) ctx of
+                Just s ->
+                    Just s
+
+                Nothing ->
+                    resolveOpenCtor name { ctx | openTypeModules = rest }
 
 
 resolveImport : String -> List ( String, String ) -> Maybe String
@@ -415,7 +443,7 @@ scopeFreeVars ctx =
     -- deferred hot spot.
     dedupeIds
         (ctx.envFree
-            ++ List.concatMap (Env.freeVarsOfScheme << Tuple.second) ctx.locals
+            ++ List.concatMap (\( _, s ) -> Env.freeVarsOfScheme s) ctx.locals
             ++ List.concatMap Env.freeVarsOfScheme (Dict.values ctx.top)
         )
 
@@ -1355,7 +1383,13 @@ findReady remaining placed refs =
             Nothing
 
         n :: rest ->
-            if List.all (\r -> List.member r placed) (refs n) then
+            -- A self-recursive function (refs n includes n) is ready on its
+            -- own: monomorphic recursion generalizes a SINGLE function fine,
+            -- and grouping it with unrelated helpers that USE it at another
+            -- type (e.g. `map` used at `Char` by a String helper) would
+            -- wrongly constrain its scheme.  Only genuinely mutual recursion
+            -- (n -> m -> n, neither placed) still forms one SCC.
+            if List.all (\r -> r == n || List.member r placed) (refs n) then
                 Just n
 
             else
@@ -1602,7 +1636,7 @@ residualAppendable t =
             firstJust (List.map residualAppendable ts)
 
         TRecord row ->
-            firstJust (List.map (residualAppendable << Tuple.second) row.fields)
+            firstJust (List.map (\( _, ft ) -> residualAppendable ft) row.fields)
 
 
 {-| The phase-2 rewrite: replace resolved `++` sites, `Record.remove`

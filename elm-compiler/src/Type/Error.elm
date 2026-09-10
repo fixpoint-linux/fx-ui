@@ -28,14 +28,14 @@ type alias TypeError =
 -}
 atNode : Node a -> String -> String -> TypeError
 atNode node summary detail =
-    TypeError (Node.range node) summary detail
+    { range = Node.range node, summary = summary, detail = detail }
 
 
 {-| Build a `TypeError` from an explicit `Range`.
 -}
 atRange : Range -> String -> String -> TypeError
 atRange range summary detail =
-    TypeError range summary detail
+    { range = range, summary = summary, detail = detail }
 
 
 {-| Render a `TypeError` as `type error at <row>:<col>: <summary>`, with the

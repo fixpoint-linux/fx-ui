@@ -113,8 +113,8 @@ operatorSchemes =
         , ( "<=", cmpOp )
         , ( ">", cmpOp )
         , ( ">=", cmpOp )
-        , ( "==", cmpOp )
-        , ( "/=", cmpOp )
+        , ( "==", eqOp )
+        , ( "/=", eqOp )
         , ( "&&", mono (func [ tBool, tBool ] tBool) )
         , ( "||", mono (func [ tBool, tBool ] tBool) )
         , ( "++", flexBinop FAppendable )
@@ -145,6 +145,16 @@ cmpOp =
             Rep.var 0 KType FComparable
     in
     poly [ v ] (func [ TVar v, TVar v ] tBool)
+
+
+-- a -> a -> Bool (structural equality).  The VM's `=` prim is DEEP (cons
+-- trees, ADT vectors, records, tuples), so `==`/`/=` are unrestricted here:
+-- real Elm's comparable constraint on `==` cannot be expressed without
+-- constructor info, and the compiler's own source compares ADT values
+-- (`Flex`/`Kind` markers) that the comparable walker rejects.
+eqOp : Scheme
+eqOp =
+    poly [ a ] (func [ TVar a, TVar a ] tBool)
 
 
 -- a -> List a -> List a
@@ -300,6 +310,14 @@ valueTable =
             Dict.fromList
                 [ ( "stdin", mono stream )
                 , ( "stdout", mono stream )
+
+                -- M15 argv pseudo-global: argvPrim is a PURE REWRITE TARGET
+                -- (no corpus defun — same as stdin/stdout above), but it is
+                -- USED APPLIED (`argv () = argvPrim ()`), so its scheme must
+                -- be the FUNCTION `() -> List String`: the lowerer rewrites
+                -- every reference (value or callee) to a 1-arg thunk reading
+                -- the `*argv*` list the driver installs.
+                , ( "argvPrim", mono (func [ tUnit ] (tList tString)) )
                 ]
     in
     Dict.union fromPrims (Dict.union fromAliases (Dict.union removeField pseudoGlobals))
@@ -324,6 +342,11 @@ trustedBodies =
     [ recordRemoveImpl
     , "Prelude.compare"
     , "Prelude.fromInt"
+    , "Prelude.stringFromChar"
+    , "Prelude.charToCode"
+    , "Prelude.charFromCode"
+    , "Prelude.stringFromFloat"
+    , "Prelude.basicsToFloat"
     , "Str.fromFloat"
     , "Str.repeat"
     , "Str.countChar"

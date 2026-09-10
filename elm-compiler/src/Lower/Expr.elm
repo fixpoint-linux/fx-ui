@@ -8,6 +8,9 @@ module Lower.Expr exposing
     , ternaryPrims
     , wrapperGlobalName
     , withImport
+    , withModuleAliases
+    , withOpenTypeModules
+    , resolveModuleAlias
     , lowerExpression
     )
 
@@ -61,6 +64,8 @@ type alias Context =
     , scope : Scope.Scope
     , globals : Dict String Int
     , imports : List ( String, String )
+    , moduleAliases : List ( String, String )
+    , openTypeModules : List (List String)
     }
 
 
@@ -70,6 +75,8 @@ newContext moduleName globals =
     , scope = Scope.empty
     , globals = globals
     , imports = []
+    , moduleAliases = []
+    , openTypeModules = []
     }
 
 
@@ -88,9 +95,41 @@ withImport imports ctx =
     { ctx | imports = imports }
 
 
+withModuleAliases : List ( String, String ) -> Context -> Context
+withModuleAliases aliases ctx =
+    { ctx | moduleAliases = aliases }
+
+
+withOpenTypeModules : List (List String) -> Context -> Context
+withOpenTypeModules mods ctx =
+    { ctx | openTypeModules = mods }
+
+
 resolveImport : String -> List ( String, String ) -> Maybe String
 resolveImport name imports =
     Maybe.map Tuple.second (listAssoc lookupPair name imports)
+
+
+-- Rewrite a dotted reference token through import aliases: `import
+-- Elm.Syntax.Range as Range` rewrites "Range.empty" ->
+-- "Elm.Syntax.Range.empty".  Tokens whose first segment is not an alias pass
+-- through unchanged.  Lives here (not Lower.Resolve) because Lower.Resolve
+-- imports this module, so a shared helper there would be a module cycle.
+resolveModuleAlias : List ( String, String ) -> String -> String
+resolveModuleAlias aliases token =
+    case aliases of
+        [] ->
+            token
+
+        ( alias, real ) :: rest ->
+            if token == alias then
+                real
+
+            else if String.startsWith (alias ++ ".") token then
+                real ++ String.dropLeft (String.length alias) token
+
+            else
+                resolveModuleAlias rest token
 
 
 lookupPair : String -> ( String, String ) -> Bool
@@ -369,8 +408,29 @@ functionOrValue modName name ctx =
                 else if name == "stdout" then
                     Ok [ Symbol "*stoutput*", Prim "value" ]
 
+                else if name == "argvPrim" then
+                    -- M15 argv pseudo-global: argvPrim is a PURE REWRITE
+                    -- TARGET (no corpus defun, exactly like stdin/stdout —
+                    -- a stub defun would shadow the rewrite in CALLEE
+                    -- position via resolveName's self-qualified fallback).
+                    -- The pseudo-global is TYPED as `() -> List String`
+                    -- (Type.Builtins.pseudoGlobals) and used APPLIED
+                    -- (`Runtime.argv () = argvPrim ()`), so the rewrite
+                    -- emits a 1-arg THUNK closure reading *argv* — the same
+                    -- zinc shape the old stub defun compiled to (zero grabs
+                    -- + Return = arity 1), correct as a value AND as a
+                    -- callee.  argvPrimThunk is shared with the callee path.
+                    Ok argvPrimThunk
+
                 else
                     resolveName name ctx
+
+
+-- The argvPrim rewrite body: a 1-arg thunk `\_ -> value *argv*` over the
+-- driver-installed plain list of argument strings (run.js argv[2:] shape).
+argvPrimThunk : List Instr
+argvPrimThunk =
+    [ Cur [ Symbol "*argv*", Prim "value", Return ] ]
 
 
 -- THE UNIFIED NAME RESOLUTION ORDER for a reference token t (bare or dotted):
@@ -393,37 +453,65 @@ resolveName token ctx =
         Nothing ->
             let
                 -- Self-qualified spelling of a BARE token (dotted tokens pass
-                -- through unchanged): a module's own names always resolve.
+                -- through unchanged): a module's own top-level names resolve
+                -- BEFORE the alias table (imports + Prelude), mirroring the
+                -- typechecker's `ctx.top`-first order — otherwise a
+                -- NON-EXPORTED local helper whose name collides with a
+                -- Prelude/import row (e.g. Type.Infer's `map`, the M-monad
+                -- bind) would resolve to the WRONG global (`Prelude.map`).
                 qualified =
                     String.join "." ctx.moduleName ++ "." ++ token
 
-                -- Resolve a token to its global KEY (alias rows first, then
-                -- raw table membership), then emit by the KEY'S OWN ARITY —
-                -- mandatory because an alias row hit says nothing about the
-                -- target being a 0-arg thunk (apply!) or a closure (load).
-                tryTok t =
-                    case resolveImport t ctx.imports of
-                        Just gkey ->
-                            Just (globalRefByKey gkey ctx)
-
-                        Nothing ->
-                            if Dict.member t ctx.globals then
-                                Just (globalRefByKey t ctx)
-
-                            else
-                                Nothing
+                -- `T(..)` imports put the type's ctors in scope as bare names;
+                -- globals-membership on `M.token` resolves them (see
+                -- Lower.Resolve.openTypeModules).
+                openTokens =
+                    List.map
+                        (\m -> String.join "." (m ++ [ token ]))
+                        ctx.openTypeModules
             in
-            case tryTok token of
+            case tryAllTokens ctx (qualified :: token :: resolveModuleAlias ctx.moduleAliases token :: openTokens) of
                 Just code ->
                     code
 
                 Nothing ->
-                    case tryTok qualified of
-                        Just code ->
-                            code
+                    Err ("unknown name: " ++ token)
 
-                        Nothing ->
-                            Err ("unknown name: " ++ token)
+
+-- Resolve a token to its global KEY (alias rows first, then raw table
+-- membership), then emit by the KEY'S OWN ARITY — mandatory because an alias
+-- row hit says nothing about the target being a 0-arg thunk (apply!) or a
+-- closure (load).
+tryToken : String -> Context -> Maybe (Result String (List Instr))
+tryToken t ctx =
+    case resolveImport t ctx.imports of
+        Just gkey ->
+            Just (globalRefByKey gkey ctx)
+
+        Nothing ->
+            if Dict.member t ctx.globals then
+                Just (globalRefByKey t ctx)
+
+            else
+                Nothing
+
+
+-- First-token-that-resolves over the unified resolution order.  Hoisted
+-- top-level (a self-recursive `let f x = ...` cannot see its own name in this
+-- subset — see Dict.elm's mergeStepState note).
+tryAllTokens : Context -> List String -> Maybe (Result String (List Instr))
+tryAllTokens ctx toks =
+    case toks of
+        [] ->
+            Nothing
+
+        t :: rest ->
+            case tryToken t ctx of
+                Just code ->
+                    Just code
+
+                Nothing ->
+                    tryAllTokens ctx rest
 
 
 -- Emit the VALUE reference for a resolved global key: 0-arity entries are
@@ -700,7 +788,17 @@ calleeFunctionOrValue modName name ctx =
                 Ok [ Access idx ]
 
             Nothing ->
-                resolveName name ctx
+                -- M15: argvPrim is used APPLIED (`Runtime.argv () =
+                -- argvPrim ()`), so the rewrite MUST live on the CALLEE path
+                -- too — routing to resolveName here would find a corpus
+                -- defun (or the self-qualified fallback "Runtime.argvPrim")
+                -- and silently bypass the *argv* read.  stdin/stdout need no
+                -- callee arm: they are Stream values, never called.
+                if name == "argvPrim" then
+                    Ok argvPrimThunk
+
+                else
+                    resolveName name ctx
 
 
 lambdaExpr : Lambda -> Context -> Result String (List Instr)

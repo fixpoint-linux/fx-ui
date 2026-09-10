@@ -11,6 +11,8 @@ module Lower.Resolve exposing
     , processPrimAliases
     , comparePrimAliases
     , primDotAliases
+    , moduleAliasTable
+    , openTypeModules
     , qualify
     )
 
@@ -79,6 +81,7 @@ preludeTable =
     , ( "min", "Prelude.min" )
     , ( "max", "Prelude.max" )
     , ( "clamp", "Prelude.clamp" )
+    , ( "modBy", "Prelude.modBy" )
     , ( "compare", "Prelude.compare" )
     , ( "lt", "Prelude.lt" )
     , ( "gt", "Prelude.gt" )
@@ -125,26 +128,64 @@ preludeTable =
             , ( "sum", "sum" )
             , ( "reverse", "reverse" )
             , ( "append", "append" )
-            , ( "head", "head" )
+            , ( "head", "maybeHead" )
             , ( "tail", "tail" )
             , ( "isEmpty", "isEmpty" )
             , ( "singleton", "singleton" )
             , ( "drop", "drop" )
             , ( "take", "take" )
+            , ( "member", "member" )
+            , ( "any", "any" )
+            , ( "all", "all" )
+            , ( "concat", "concat" )
+            , ( "concatMap", "concatMap" )
+            , ( "filterMap", "filterMap" )
+            , ( "map2", "map2" )
+            , ( "indexedMap", "indexedMap" )
+            , ( "partition", "partition" )
+            , ( "range", "range" )
+            , ( "repeat", "repeat" )
             ]
         ++ dottedRows ""
             [ ( "String.concat", "concat" )
             , ( "String.join", "join" )
             , ( "String.fromInt", "fromInt" )
+            , ( "String.fromChar", "stringFromChar" )
+            , ( "String.toList", "stringToList" )
+            , ( "String.fromList", "stringFromList" )
+            , ( "String.slice", "stringSlice" )
+            , ( "String.dropLeft", "stringDropLeft" )
+            , ( "String.dropRight", "stringDropRight" )
+            , ( "String.startsWith", "stringStartsWith" )
+            , ( "String.endsWith", "stringEndsWith" )
+            , ( "String.fromFloat", "stringFromFloat" )
+            , ( "String.toFloat", "stringToFloat" )
+            , ( "String.toLower", "stringToLower" )
+            , ( "String.toUpper", "stringToUpper" )
+            , ( "String.any", "stringAny" )
+            , ( "String.cons", "stringCons" )
+            , ( "String.foldr", "stringFoldr" )
+            , ( "Char.toCode", "charToCode" )
+            , ( "Char.fromCode", "charFromCode" )
+            , ( "Char.isLower", "charIsLower" )
+            , ( "Char.isUpper", "charIsUpper" )
+            , ( "Char.isAlpha", "charIsAlpha" )
+            , ( "Char.isDigit", "charIsDigit" )
+            , ( "Char.isOctDigit", "charIsOctDigit" )
+            , ( "Char.isHexDigit", "charIsHexDigit" )
+            , ( "Char.isAlphaNum", "charIsAlphaNum" )
             ]
         ++ dottedRows "Basics."
-            [ ( "compare", "compare" )
+            [ ( "identity", "identity" )
+            , ( "compare", "compare" )
             , ( "lt", "lt" )
             , ( "gt", "gt" )
             , ( "le", "le" )
             , ( "ge", "ge" )
             , ( "eq", "eq" )
             , ( "neq", "neq" )
+            , ( "toFloat", "basicsToFloat" )
+            , ( "isNaN", "basicsIsNaN" )
             ]
 
 
@@ -443,27 +484,29 @@ checkImportShadowing defined imports =
                         (importAlias node)
                 )
                 imports
-
-        findClash names =
-            case names of
-                [] ->
-                    Ok ()
-
-                name :: rest ->
-                    case List.filter (\( bare, _ ) -> bare == name) bareNames of
-                        ( _, fromModule ) :: _ ->
-                            Err
-                                ("the name `"
-                                    ++ name
-                                    ++ "` is both a top-level definition and imported via `exposing` from "
-                                    ++ fromModule
-                                    ++ "; remove it from the import's exposing list (real Elm rejects this)"
-                                )
-
-                        [] ->
-                            findClash rest
     in
-    findClash defined
+    findShadowClash bareNames defined
+
+
+findShadowClash : List ( String, String ) -> List String -> Result String ()
+findShadowClash bareNames names =
+    case names of
+        [] ->
+            Ok ()
+
+        name :: rest ->
+            case List.filter (\( bare, _ ) -> bare == name) bareNames of
+                ( _, fromModule ) :: _ ->
+                    Err
+                        ("the name `"
+                            ++ name
+                            ++ "` is both a top-level definition and imported via `exposing` from "
+                            ++ fromModule
+                            ++ "; remove it from the import's exposing list (real Elm rejects this)"
+                        )
+
+                [] ->
+                    findShadowClash bareNames rest
 
 
 -- The ambiguous-import footgun, made loud: the SAME bare name exposed
@@ -482,29 +525,31 @@ checkAmbiguousImports imports =
                         (importAlias node)
                 )
                 imports
-
-        findClash names =
-            case names of
-                [] ->
-                    Ok ()
-
-                ( name, fromModule ) :: rest ->
-                    case List.filter (\( bare, mod ) -> bare == name && mod /= fromModule) rest of
-                        ( _, otherModule ) :: _ ->
-                            Err
-                                ("the name `"
-                                    ++ name
-                                    ++ "` is imported via `exposing` from two different modules: "
-                                    ++ fromModule
-                                    ++ " and "
-                                    ++ otherModule
-                                    ++ "; qualify it at use sites (real Elm rejects ambiguous imports)"
-                                )
-
-                        [] ->
-                            findClash rest
     in
-    findClash bareNames
+    findAmbiguousClash bareNames
+
+
+findAmbiguousClash : List ( String, String ) -> Result String ()
+findAmbiguousClash names =
+    case names of
+        [] ->
+            Ok ()
+
+        ( name, fromModule ) :: rest ->
+            case List.filter (\( bare, mod ) -> bare == name && mod /= fromModule) rest of
+                ( _, otherModule ) :: _ ->
+                    Err
+                        ("the name `"
+                            ++ name
+                            ++ "` is imported via `exposing` from two different modules: "
+                            ++ fromModule
+                            ++ " and "
+                            ++ otherModule
+                            ++ "; qualify it at use sites (real Elm rejects ambiguous imports)"
+                        )
+
+                [] ->
+                    findAmbiguousClash rest
 
 
 -- The exported-name list of a module, honoring its exposing clause:
@@ -542,3 +587,64 @@ exportedNames (Node _ modDef) defined =
 qualify : List String -> String -> String
 qualify modName name =
     String.join "." (modName ++ [ name ])
+
+
+-- import X as Y: qualified VALUE references `Y.f` resolve to `X.f`.  Returns
+-- (alias-spelling, real-module-dotted) pairs, used by the lowerer
+-- (Lower.Expr.resolveName) and the checker (Type.Infer.resolveScheme) so an
+-- import alias works with ZERO per-member registration (the real module's
+-- globals are keyed by its true name).
+moduleAliasTable : List (Node Import.Import) -> List ( String, String )
+moduleAliasTable imports =
+    moduleAliasHelp imports []
+
+
+moduleAliasHelp : List (Node Import.Import) -> List ( String, String ) -> List ( String, String )
+moduleAliasHelp imports acc =
+    case imports of
+        [] ->
+            List.reverse acc
+
+        (Node _ imp) :: rest ->
+            case imp.moduleAlias of
+                Just (Node _ aliasSegs) ->
+                    moduleAliasHelp rest
+                        (( String.join "." aliasSegs, String.join "." (Node.value imp.moduleName) ) :: acc)
+
+                Nothing ->
+                    moduleAliasHelp rest acc
+
+
+-- The modules imported with an OPEN type expose (`T(..)`): their type
+-- CONSTRUCTORS are in scope as bare names.  Enumerating a type's constructors
+-- needs a cross-module export pass (the documented minimal-M3 limitation), so
+-- instead the caller resolves a bare name against `M.name` for each such
+-- module (globals/env membership).  `T` (closed) exposes only the type name
+-- itself, already handled by importAliases.
+openTypeModules : List (Node Import.Import) -> List (List String)
+openTypeModules imports =
+    List.filterMap openTypeModule imports
+
+
+openTypeModule : Node Import.Import -> Maybe (List String)
+openTypeModule (Node _ imp) =
+    case imp.exposingList of
+        Just (Node _ (Exposing.Explicit items)) ->
+            if List.any exposesOpenType items then
+                Just (Node.value imp.moduleName)
+
+            else
+                Nothing
+
+        _ ->
+            Nothing
+
+
+exposesOpenType : Node Exposing.TopLevelExpose -> Bool
+exposesOpenType (Node _ item) =
+    case item of
+        Exposing.TypeExpose { open } ->
+            open /= Nothing
+
+        _ ->
+            False
