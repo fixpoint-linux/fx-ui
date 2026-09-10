@@ -272,6 +272,30 @@ pub fn buildEnv(g: *Gc, cl: *Value, argbuf: [*]Value, nargs: i32) BuiltEnv {
     return .{ .env = ne, .len = new_env_len };
 }
 
+/// Reconstruct a lex-frame's live env as a REAL GC array — the one boundary
+/// where something outside the frame (valLambda) needs env as a Value-array.
+/// `lex` is the frame's C-stack env local, already rooted by that frame's
+/// rootPushValueArray(&lex, &lexlen), so a collect inside allocArray updates
+/// its entries in place; copy AFTER the alloc reads them fresh.  The returned
+/// array is single-referee and handed straight to valLambda, which roots &
+/// copies it before its own alloc (the buildEnv handoff contract).
+pub fn materializeEnv(g: *Gc, lex: [*]Value, len: i32) ?[*]Value {
+    if (len <= 0) return null;
+    const ne = g.allocArray(Value, @intCast(len));
+    const lel: usize = @intCast(len);
+    @memcpy(ne[0..lel], lex[0..lel]);
+    if (g.inOldgen(@intFromPtr(ne))) {
+        var j: usize = 0;
+        while (j < lel) : (j += 1) {
+            if (gc.scan.valueReferencesNursery(g, &lex[j])) {
+                g.dirtyVectorsAdd(ne);
+                break;
+            }
+        }
+    }
+    return ne;
+}
+
 /// Self-tail env rebuild IN PLACE — interp.zig:1216-1275 (the M11 reuse).
 /// The current env array (rooted by the running frame's &env slot) is dead
 /// past the tail jump, so it is reused when env_cap fits; otherwise a fresh

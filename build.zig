@@ -286,6 +286,9 @@ pub fn build(b: *std.Build) void {
         .{ .name = "aotbench-fib", .fixture = "tests/elm-fixtures/fib.elm", .entry = "Fib.fib" },
         .{ .name = "aotbench-countdown", .fixture = "tests/elm-fixtures/countdown.elm", .entry = "Countdown.countdown" },
         .{ .name = "aotbench-biglist", .fixture = "tests/elm-fixtures/biglist.elm", .entry = "BigList.main" },
+        .{ .name = "aotbench-letread", .fixture = "tests/elm-fixtures/letread.elm", .entry = "LetRead.main" },
+        .{ .name = "aotbench-letclosure", .fixture = "tests/elm-fixtures/letclosure.elm", .entry = "LetClosure.main" },
+        .{ .name = "aotbench-letdeeprec", .fixture = "tests/elm-fixtures/letdeeprec.elm", .entry = "LetDeepRec.main" },
     }) |sp| {
         aot_step.dependOn(addAotSpike(b, target, optimize, gc_mod, vm_mod, aotrt_mod, aotdump, sp.name, sp.fixture, sp.entry));
     }

@@ -175,6 +175,12 @@ run sub        sub        "-7"                           3 10
 run div        main       "$(read_expected div)"
 run nested     main       "$(read_expected nested)"
 run closure    main       "$(read_expected closure)"
+# --- S2.5 lex-frame (let/endlet core) fixtures: off-by-one env height, .cur
+# reconstruction of a let-bound capture, and deep non-tail recursion from a
+# let-body (depth-guard fallback). ---
+run letread     main       "$(read_expected letread)"
+run letclosure  main       "$(read_expected letclosure)"
+run letdeeprec  main       "$(read_expected letdeeprec)"
 run applytwice main       "$(read_expected applytwice)"
 run countdown  countdown  "$(read_expected countdown)"  100000
 run eqlist     main       "$(read_expected eqlist)"
