@@ -57,9 +57,20 @@ pub fn main(init: std.process.Init) !void {
     const bundle_z: [:0]const u8 = raw[0..n :0];
 
     // ---- init Gc + Vm ----
+    // ELMC_HEAP_MB overrides the heap (same env as tools/aot/run.zig): the full
+    // compiler needs far more than the 64 MB default, and without the override
+    // a large workload spins in grow_heap forever instead of failing.
+    const heap_bytes: usize = blk: {
+        const env = std.c.getenv("ELMC_HEAP_MB") orelse break :blk HEAP_BYTES;
+        const s = std.mem.span(env);
+        if (s.len == 0) break :blk HEAP_BYTES;
+        const mb = std.fmt.parseUnsigned(usize, s, 10) catch break :blk HEAP_BYTES;
+        if (mb == 0) break :blk HEAP_BYTES;
+        break :blk mb * 1024 * 1024;
+    };
     var g = try heap.Gc.init(.{
-        .heap_bytes = HEAP_BYTES,
-        .reserve_bytes = RESERVE_BYTES,
+        .heap_bytes = heap_bytes,
+        .reserve_bytes = @max(heap_bytes * 2, RESERVE_BYTES),
     });
     defer g.deinit();
     var v: state.Vm = undefined;
@@ -92,7 +103,30 @@ pub fn main(init: std.process.Init) !void {
     var argstrs: [64][]const u8 = undefined;
     var argisfloat: [64]bool = undefined;
     var nargs: usize = 0;
-    while (it.next()) |arg| {
+    // AOTRUN_ARGV (same contract as tools/aot/run.zig): the trailing args are
+    // the APP's command line, exposed as the `*argv*` pseudo-global, NOT call
+    // arguments.  This lets the interpreter run a driver program (NativeMain)
+    // on an identical bundle, which is the reference implementation the AOT
+    // transpile must match.
+    const argv_mode = std.c.getenv("AOTRUN_ARGV") != null;
+    var app_args: []const []const u8 = &.{};
+    if (argv_mode) {
+        var list: [64][]const u8 = undefined;
+        var na: usize = 0;
+        while (it.next()) |arg| {
+            if (na >= 64) return error.TooManyArgs;
+            list[na] = try a.dupe(u8, arg);
+            na += 1;
+        }
+        app_args = try a.dupe([]const u8, list[0..na]);
+        var acc = values.valNil();
+        var k: usize = app_args.len;
+        while (k > 0) {
+            k -= 1;
+            acc = values.valCons(&g, values.valString(&g, app_args[k]), acc);
+        }
+        v.valueSet("*argv*", acc);
+    } else while (it.next()) |arg| {
         if (nargs >= 64) return error.TooManyArgs;
         argstrs[nargs] = arg;
         argisfloat[nargs] = isFloatArg(arg);
