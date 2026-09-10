@@ -2046,12 +2046,36 @@ pub fn runProgramWith(vm: *Vm, prog: Value, render_dump: bool) VmError!Value {
     std.debug.assert(prog.tag == .vector);
     const data = prog.payload.vector.data.?;
 
-    var loop = HostLoop{
-        .vm = vm,
-        .g = vm.gc,
-        .slots = [_]Value{values.valNil()} ** MAX_SLOTS,
-        .render_dump = render_dump,
-    };
+    // Construct via `undefined` + explicit initialization: the struct literal
+    // form makes LLVM materialize ~1.5MB of **-repeated array constants into
+    // this (escaping) alloca at ReleaseFast, blowing up opt time (>240s vs 3s
+    // Debug).  @memset lowers to llvm.memset instead (verified: 17s).
+    var loop: HostLoop = undefined;
+    loop.vm = vm;
+    loop.g = vm.gc;
+    @memset(&loop.slots, values.valNil());
+    @memset(&loop.evals, Eval{});
+    @memset(&loop.pollfds, std.posix.pollfd{ .fd = -1, .events = 0, .revents = 0 });
+    @memset(&loop.poll_eval, 0);
+    @memset(&loop.poll_role, PollRole.readfile);
+    @memset(&loop.children, Child{});
+    loop.nslots = MAX_SLOTS;
+    loop.nevals = 0;
+    loop.nactive = 0;
+    loop.npoll = 0;
+    loop.nchildren = 0;
+    loop.stdin_eof = false;
+    loop.stdin_nonblock = false;
+    loop.saved_termios = null;
+    loop.stdin_pending = .empty;
+    loop.mouse_armed = false;
+    loop.pending_events = .empty;
+    loop.quit = false;
+    loop.winch_fd = -1;
+    loop.render_dump = render_dump;
+    loop.term = terminal.TerminalRenderer.init(pa);
+    loop.gui_buf = .empty;
+    loop.gui_pending = .empty;
     vm.gc.rootPushValueArray(&loop.slots, &loop.nslots);
     defer vm.gc.rootPop();
     defer loop.cleanupAll();
