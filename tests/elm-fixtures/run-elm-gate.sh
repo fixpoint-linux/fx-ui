@@ -181,6 +181,9 @@ run closure    main       "$(read_expected closure)"
 run letread     main       "$(read_expected letread)"
 run letclosure  main       "$(read_expected letclosure)"
 run letdeeprec  main       "$(read_expected letdeeprec)"
+# Self-tail INSIDE a lex frame: rebuilds lex[] in place at the tail, the path
+# that carries the whole lex[] win (the hot list loops are self-tail recursive).
+run lexselftail main       "$(read_expected lexselftail)"
 run applytwice main       "$(read_expected applytwice)"
 run countdown  countdown  "$(read_expected countdown)"  100000
 run eqlist     main       "$(read_expected eqlist)"
