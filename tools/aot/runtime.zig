@@ -366,19 +366,28 @@ pub fn applyHost(vm: *Vm, fnv_in: Value, args: []const Value) VmError!Value {
         nargs += 1;
     }
     g.rootPushValueArray(&argbuf, &nargs);
+    defer g.rootPop(); // argbuf
+    defer g.rootPop(); // fnv
+
+    // S1: a defun/global closure has env_len==0 (parser.zig), so env==args
+    // exactly — pass the rooted argbuf straight as the callee env (no buildEnv
+    // alloc).  Captured-env closures (partials/curs) keep buildEnv below.
+    if (fnv.payload.lambda.env_len == 0) {
+        if (lookup(fnv)) |f| {
+            return fullCallNative(vm, f, fnv.payload.lambda.code, fnv.payload.lambda.code_len, &argbuf, nargs);
+        }
+        vmexec_fallbacks += 1;
+        return try interp.vmExecEnv(vm, fnv.payload.lambda.code, fnv.payload.lambda.code_len, &argbuf, nargs);
+    }
 
     // env = captured ++ args (the exact applyClosureN / buildEnv dance).
     const built = buildEnv(g, &fnv, &argbuf, nargs);
 
     if (lookup(fnv)) |f| {
-        g.rootPop(); // argbuf
-        g.rootPop(); // fnv
         return fullCallNative(vm, f, fnv.payload.lambda.code, fnv.payload.lambda.code_len, built.env, built.len);
     }
     const code = fnv.payload.lambda.code;
     const code_len = fnv.payload.lambda.code_len;
-    g.rootPop(); // argbuf
-    g.rootPop(); // fnv
     vmexec_fallbacks += 1;
     return try interp.vmExecEnv(vm, code, code_len, built.env, built.len);
 }
@@ -428,8 +437,13 @@ pub fn callKnown(
     nargs: i32,
 ) VmError!Value {
     if (nargs == expect_arity) {
-        const built = buildEnv(vm.gc, globals_k, argbuf, nargs);
-        return fullCallNative(vm, target, globals_k.*.payload.lambda.code, globals_k.*.payload.lambda.code_len, built.env, built.len);
+        // S1: defun/global closures have env_len==0 (parser.zig), so env==args
+        // exactly.  Pass the caller's rooted argbuf (ROOT_VALUE_ARRAY, count set
+        // to nargs by the apply site) straight as the callee env — no buildEnv
+        // alloc.  The callee's prologue roots &env (gcMove passes the C-stack
+        // ptr through unchanged); the caller's argbuf root keeps the elements
+        // live for the callee's whole extent.
+        return fullCallNative(vm, target, globals_k.*.payload.lambda.code, globals_k.*.payload.lambda.code_len, argbuf, nargs);
     }
     // N<A (partial) / N>A (peel): applyGeneric WRITES cl.* (the partial lands
     // there) — copy the global into a rooted frame-local first so the shared
@@ -509,18 +523,32 @@ pub fn applyGeneric(
     }
 
     if (cl.tag == .lambda and (nargs.* == arity or nargs.* == 0)) {
-        const built = buildEnv(g, cl, argbuf, nargs.*);
-        if (lookup(cl.*)) |f| {
-            if (tail)
-                return .{ .tail = .{ .f = f, .env = built.env, .env_len = built.len } };
-            return .{ .done = try fullCallNative(vm, f, cl.payload.lambda.code, cl.payload.lambda.code_len, built.env, built.len) };
+        // S1: a defun/global closure (env_len==0) has env==args exactly, so a
+        // NON-TAIL full call can pass the caller's rooted argbuf straight as the
+        // callee env (no buildEnv alloc).  A `.tail` result outlives this frame
+        // (the caller bounces it AFTER we return), so a C-stack argbuf would
+        // dangle — tail paths and captured-env closures keep buildEnv.
+        if (tail or cl.payload.lambda.env_len != 0) {
+            const built = buildEnv(g, cl, argbuf, nargs.*);
+            if (lookup(cl.*)) |f| {
+                if (tail)
+                    return .{ .tail = .{ .f = f, .env = built.env, .env_len = built.len } };
+                return .{ .done = try fullCallNative(vm, f, cl.payload.lambda.code, cl.payload.lambda.code_len, built.env, built.len) };
+            }
+            // Unknown closure: run its ORIGINAL body through the interpreter,
+            // which handles its own appterm tails internally (never grows native
+            // stack).  built.env is a fresh single-referee array handed straight
+            // to vmExecEnv, whose prologue copies + roots it.
+            vmexec_fallbacks += 1;
+            const v = try interp.vmExecEnv(vm, cl.payload.lambda.code, cl.payload.lambda.code_len, built.env, built.len);
+            return .{ .done = v };
         }
-        // Unknown closure: run its ORIGINAL body through the interpreter,
-        // which handles its own appterm tails internally (never grows native
-        // stack).  built.env is a fresh single-referee array handed straight
-        // to vmExecEnv, whose prologue copies + roots it.
+        // env_len==0, non-tail full call: argbuf == env, no alloc.
+        if (lookup(cl.*)) |f| {
+            return .{ .done = try fullCallNative(vm, f, cl.payload.lambda.code, cl.payload.lambda.code_len, argbuf, nargs.*) };
+        }
         vmexec_fallbacks += 1;
-        const v = try interp.vmExecEnv(vm, cl.payload.lambda.code, cl.payload.lambda.code_len, built.env, built.len);
+        const v = try interp.vmExecEnv(vm, cl.payload.lambda.code, cl.payload.lambda.code_len, argbuf, nargs.*);
         return .{ .done = v };
     }
 

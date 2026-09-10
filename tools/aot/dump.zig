@@ -948,6 +948,30 @@ fn emit(
     try out.appendSlice(a, "}\n");
 }
 
+/// S2 native-frame eligibility: the body's CORE (instrs after the leading
+/// grab prefix, which is the arity convention — those grabs are always skipped
+/// at native-fn entry because args arrive in env) must not mutate env.  A
+/// let/endlet/grab in the core does (envPush/envPop); a self-tail
+/// (.global_appterm to this body's own slot) rebuilds env in place via
+/// tailSelf, so params materialized once at entry would go stale.  Cross-defun
+/// tails and first-class appterms return .tail (the frame exits) and are fine.
+fn nativeFrameEligible(code: [*]Instr, code_len: i32, arity: i32, self_slot: usize, defuns: []const Defun) bool {
+    var pc: i32 = arity - 1; // skip the leading grab prefix
+    while (pc < code_len) : (pc += 1) {
+        const ins = &code[@intCast(pc)];
+        switch (ins.op) {
+            .let, .endlet, .grab => return false,
+            .global_appterm => {
+                if (indexOfDefun(defuns, values.symSlice(ins.operand))) |tslot| {
+                    if (tslot == self_slot) return false; // self-tail rebuilds env in place
+                }
+            },
+            else => {},
+        }
+    }
+    return true;
+}
+
 fn emitFn(
     a: Allocator,
     out: *std.ArrayList(u8),
@@ -968,6 +992,16 @@ fn emitFn(
     // `continue :sw` arms) exceed Zig's default 1000 backwards-branch comptime
     // quota during switch analysis.  Compile-time only (zero runtime cost).
     try out.appendSlice(a, "    @setEvalBranchQuota(100000);\n");
+    // ---- S2 native-frame selection (mixed emission) ----
+    // A rooted body whose CORE (the instrs after the leading grab-prefix, which
+    // is the arity convention) has no let/endlet/grab and no self-tail never
+    // mutates its env, so params can be materialized once into p[arity] and
+    // .access-to-a-param becomes a constant index p[i] (no env read).  Bodies
+    // with let/endlet/grab or a self-tail keep the env-array path (envPush/
+    // envPop/tailSelf rebuild env in place).  Elided bodies keep lookupEnv too:
+    // their depth-guard fallback (deepStackEnv) roots env but not a p[] copy.
+    const arity = interp.zincArity(code, code_len);
+    const native_frame = !elided and nativeFrameEligible(@ptrCast(code.?), code_len, arity, self_slot, defuns);
     if (elided) {
         try out.print(a,
             \\    const g = vm.gc;
@@ -1033,6 +1067,18 @@ fn emitFn(
             \\    var pc: i32 = 0;
             \\
         , .{ maxd, maxd, maxd });
+        if (native_frame) {
+            // S2 native params: p[i] = env[env_len-1-i], rooted once (the
+            // scan updates the copies on any collect).  Materialized from
+            // env_in: a native-frame body never reassigns env (no let/grab/
+            // self-tail), so env == env_in for the whole frame.
+            try out.print(a, "    var p: [{d}]Value = undefined;\n    var p_len: i32 = {d};\n    g.rootPushValueArray(&p, &p_len);\n", .{ arity, arity });
+            var pi: i32 = 0;
+            while (pi < arity) : (pi += 1) {
+                try out.print(a, "    p[{d}] = interp.lookupEnv({d}, env_in, env_len_in);\n", .{ pi, pi });
+            }
+            try out.appendSlice(a, "\n");
+        }
     }
 
     // ---- body: basic-block grouping (R2) ----
@@ -1114,7 +1160,7 @@ fn emitFn(
         try body.print(a, "            rt.count({d});\n", .{n});
         var q: i32 = leader;
         while (q < end) : (q += 1) {
-            try emitArmBody(a, &body, &cur[@intCast(q)], q, self_slot, consts, globals, defuns, elided);
+            try emitArmBody(a, &body, &cur[@intCast(q)], q, self_slot, consts, globals, defuns, elided, arity, native_frame);
         }
         // Block dispatch: the last body fell through to here, so control
         // must reach successor = leader + n (Zig prongs do NOT fall through,
@@ -1154,6 +1200,8 @@ fn emitArmBody(
     globals: []const []const u8,
     defuns: []const Defun,
     elided: bool,
+    arity: i32,
+    native_frame: bool,
 ) !void {
     const next = pc + 1;
     switch (ins.op) {
@@ -1166,9 +1214,16 @@ fn emitArmBody(
         },
         .access => {
             try out.appendSlice(a, "        {\n");
-            try out.appendSlice(a, "            acc = interp.lookupEnv(");
-            try out.print(a, "{d}", .{ins.jmp_target});
-            try out.appendSlice(a, ", env, env_len);\n            ipush(&stk, &stack.len, acc);\n");
+            if (native_frame and ins.jmp_target < arity) {
+                // S2: param access -> constant index p[i], no env read.
+                try out.appendSlice(a, "            acc = p[");
+                try out.print(a, "{d}", .{ins.jmp_target});
+                try out.appendSlice(a, "];\n            ipush(&stk, &stack.len, acc);\n");
+            } else {
+                try out.appendSlice(a, "            acc = interp.lookupEnv(");
+                try out.print(a, "{d}", .{ins.jmp_target});
+                try out.appendSlice(a, ", env, env_len);\n            ipush(&stk, &stack.len, acc);\n");
+            }
             try out.print(a, "            pc = {d};\n        }}\n", .{next});
         },
         .prim => {
@@ -1186,9 +1241,16 @@ fn emitArmBody(
         },
         .access_prim => {
             try out.appendSlice(a, "        {\n");
-            try out.appendSlice(a, "            acc = interp.lookupEnv(");
-            try out.print(a, "{d}", .{ins.operand.payload.number});
-            try out.appendSlice(a, ", env, env_len);\n            ipush(&stk, &stack.len, acc);\n");
+            if (native_frame and ins.operand.payload.number < arity) {
+                // S2: param access -> constant index p[i], no env read.
+                try out.appendSlice(a, "            acc = p[");
+                try out.print(a, "{d}", .{ins.operand.payload.number});
+                try out.appendSlice(a, "];\n            ipush(&stk, &stack.len, acc);\n");
+            } else {
+                try out.appendSlice(a, "            acc = interp.lookupEnv(");
+                try out.print(a, "{d}", .{ins.operand.payload.number});
+                try out.appendSlice(a, ", env, env_len);\n            ipush(&stk, &stack.len, acc);\n");
+            }
             try emitPrim(a, out, ins, ";\n            ipush(&stk, &stack.len, acc);\n");
             try out.print(a, "            pc = {d};\n        }}\n", .{next});
         },
