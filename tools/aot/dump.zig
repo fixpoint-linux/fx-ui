@@ -43,6 +43,13 @@ const Vm = state.Vm;
 const HEAP_BYTES: usize = 64 * 1024 * 1024;
 const RESERVE_BYTES: usize = 64 * 1024 * 1024;
 
+/// R2a experiment: emit `noinline fn aot_*`.  The direct native calls
+/// (rt.callKnown / stack-env calls / rt.tailKnown) otherwise invite LLVM to
+/// clone every callee body into each call site — a fn called 100x becomes
+/// 100 IR copies (plausible cause of the 15.6GB RSS / superlinear build).
+/// Flip to false to measure the with-inlining baseline.
+const NOINLINE_AOT_FNS = true;
+
 /// One AOT'd defun (a lambda body + the emit-time facts we derive from it).
 const Defun = struct {
     name: []const u8, // arena-owned copy
@@ -913,6 +920,7 @@ fn emit(
         try out.print(a, "    rt.reg_code[{d}] = vm.defunGet(", .{i});
         try emitStringLit(a, out, d.name);
         try out.appendSlice(a, ").payload.lambda.code;\n");
+        try out.print(a, "    rt.reg_len[{d}] = {d};\n", .{ i, d.code_len });
     }
     // Cur bodies: reg_code[cur_slot] is read FRESH from the (already-rooted)
     // parent slot's .cur closure_code field — the same field the generated
@@ -924,6 +932,7 @@ fn emit(
         const mangled = try mangle(&mbuf, c.name);
         try out.print(a, "    rt.reg_fn[{d}] = aot_{s};\n", .{ slot, mangled });
         try out.print(a, "    rt.reg_code[{d}] = rt.origCode({d})[{d}].closure_code;\n", .{ slot, parentSlot(defuns, curs, c), c.pc });
+        try out.print(a, "    rt.reg_len[{d}] = {d};\n", .{ slot, c.code_len });
     }
     try out.print(a, "    rt.reg_count = {d};\n", .{defuns.len + curs.len});
     try out.appendSlice(a, "    for (0..N_AOT) |i| g.rootPushPtr(@ptrCast(&rt.reg_code[i]));\n");
@@ -954,7 +963,7 @@ fn emitFn(
 ) !void {
     var mbuf: [256]u8 = undefined;
     const mangled = try mangle(&mbuf, name);
-    try out.print(a, "fn aot_{s}(vm: *Vm, env_in: ?[*]Value, env_len_in: i32) VmError!rt.Ret {{\n", .{mangled});
+    try out.print(a, "{s} fn aot_{s}(vm: *Vm, env_in: ?[*]Value, env_len_in: i32) VmError!rt.Ret {{\n", .{ if (NOINLINE_AOT_FNS) "noinline " else "", mangled });
     // Large bodies (the todos app emits fns up to ~512 instrs, ~600
     // `continue :sw` arms) exceed Zig's default 1000 backwards-branch comptime
     // quota during switch analysis.  Compile-time only (zero runtime cost).
@@ -963,24 +972,37 @@ fn emitFn(
         try out.print(a,
             \\    const g = vm.gc;
             \\    const a0 = rt.allocStable(g);
-            \\    defer rt.assertAllocStable(g, a0);
+            \\    const fb0 = rt.depth_fallbacks;
+            \\    // The assert is skipped iff a DEPTH-GUARD FALLBACK fired inside
+            \\    // this dynamic extent: that path routes through vmExecEnv,
+            \\    // which allocates (env copy, value stack), by design.  fb0 is
+            \\    // the ENTRY snapshot, so an elided ANCESTOR's assert is also
+            \\    // relaxed after a descendant's fallback — the whole native
+            \\    // chain above the interpreter boundary un-rooted itself.
+            \\    defer if (rt.depth_fallbacks == fb0) rt.assertAllocStable(g, a0);
             \\    rt.elided_calls += 1;
+            \\    rt.natEnter();
+            \\    defer rt.natLeave();
             \\    var acc: Value = values.valNil();
             \\    var stk: [{d}]Value = .{{values.valNil()}} ** {d};
             \\    var stack = types.ValueArray{{ .data = &stk, .len = 0, .cap = {d} }};
             \\    // NO rooting: a NON_ALLOCATING fn performs zero gc_allocs in
             \\    // its whole dynamic extent, so no collection can start and the
             \\    // unrooted acc/stack/env locals can never dangle (the assert
-            \\    // above re-proves this per entry/exit in Debug).
+            \\    // above re-proves this per entry/exit in Debug; a depth
+            \\    // fallback, the one sanctioned alloc, skips it).
             \\
         , .{ maxd, maxd, maxd });
         try out.appendSlice(a,
-            \\    const env = env_in;
+            \\    var env = env_in;
             \\    const env_len = env_len_in;
-            \\    _ = &env; // used only by .access arms (a pure body may not read params)
-            \\    _ = &env_len;
+            \\    // `env` is a var ONLY so a collect inside a depth fallback can
+            \\    // write the MOVED pointer back through the root rt.deepStackEnv
+            \\    // pushes (&env); an elided body never writes it itself (no
+            \\    // let/grab => no envPush).
+            \\    _ = &env;
+            \\    _ = &env_len; // used only by .access arms (a pure body may not read params)
             \\    var pc: i32 = 0;
-            \\    sw: switch (pc) {
             \\
         );
     } else {
@@ -1006,24 +1028,123 @@ fn emitFn(
             \\    g.rootPushPtr(@ptrCast(&env));
             \\    _ = &env_len; // frame slots mutated via &env_len/&env_cap in envPush/tailSelf
             \\    _ = &env_cap;
+            \\    rt.natEnter();
+            \\    defer rt.natLeave();
             \\    var pc: i32 = 0;
-            \\    sw: switch (pc) {{
             \\
         , .{ maxd, maxd, maxd });
     }
 
+    // ---- body: basic-block grouping (R2) ----
+    // Block LEADERS = {0} u {every jmp/jmpf target} u {0 for self-tail
+    // targets}.  One switch prong per leader; the bodies of consecutive
+    // non-leader arms are concatenated straight-line inside it, and the
+    // unconditional `pc = N; continue :sw pc;` dispatch is emitted ONLY
+    // where control actually leaves the block (successor is a leader, or the
+    // arm is a ret/prim_return/appterm terminator, which return rather than
+    // fall through).  This cuts ~61K dispatch sites to ~#leaders and lets
+    // Zig/LLVM see straight-line code instead of one basic block per
+    // bytecode instr.  Arms with INTERNAL dispatch (grab mark/env branches,
+    // jmpf, apply/appterm non-tail branches) keep those emissions as-is.
     const cur: [*]Instr = @ptrCast(code.?);
-    var pc: i32 = 0;
-    while (pc < code_len) : (pc += 1) {
-        const ins = &cur[@intCast(pc)];
-        try emitArm(a, out, ins, pc, self_slot, consts, globals, defuns, elided);
+
+    var is_leader = try a.alloc(bool, @intCast(code_len));
+    @memset(is_leader, false);
+    // pc 0 is always a prong: the switch entry — and, since the switch
+    // operand starts at 0, this also covers self-tails (`continue :sw 0`).
+    is_leader[0] = true;
+    {
+        var p: i32 = 0;
+        while (p < code_len) : (p += 1) {
+            const ins = &cur[@intCast(p)];
+            switch (ins.op) {
+                .jmp => if (ins.jmp_target >= 0 and ins.jmp_target < code_len) {
+                    is_leader[@intCast(ins.jmp_target)] = true;
+                },
+                // jmpf/grab keep their INTERNAL branch dispatches, which also
+                // continue to pc+1 — pc+1 must be a prong (its target).
+                .jmpf => {
+                    if (ins.jmp_target >= 0 and ins.jmp_target < code_len) is_leader[@intCast(ins.jmp_target)] = true;
+                    if (p + 1 < code_len) is_leader[@intCast(p + 1)] = true;
+                },
+                .grab => if (p + 1 < code_len) {
+                    is_leader[@intCast(p + 1)] = true;
+                },
+                else => {},
+            }
+        }
     }
+
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(a);
+
+    var p: i32 = 0;
+    while (p < code_len) {
+        const leader = p;
+        // Find the run extent.  The leader arm is always in the run; further
+        // arms are absorbed while (a) they are NOT themselves branch targets
+        // (leaders start their own prong) and (b) no arm so far has exited
+        // internally.  An internally-exiting arm (ret/prim_return return;
+        // jmp/jmpf/grab continue to another pc) is absorbed ONLY as the LAST
+        // arm of the run when it is not a leader — after it, control never
+        // reaches the prong end, so no trailing dispatch may follow (Zig
+        // rejects unreachable statements after return/continue).
+        var end: i32 = leader + 1;
+        var exits_internally = armExitsInternally(cur[@intCast(leader)].op);
+        while (!exits_internally and end < code_len) {
+            const op = cur[@intCast(end)].op;
+            if (armExitsInternally(op)) {
+                if (!is_leader[@intCast(end)]) {
+                    exits_internally = true;
+                    end += 1;
+                }
+                break;
+            }
+            if (is_leader[@intCast(end)]) break;
+            end += 1;
+        }
+        const n = end - leader;
+        try body.print(a, "        {d} => {{\n", .{leader});
+        // Fold the per-arm rt.count(1) into ONE rt.count(n) at the TOP of
+        // the prong: top placement so run-ending ret/jmp arms (which exit
+        // before any tail statement) still count.  Every ENTRY into the
+        // block adds n, exactly like n per-arm count(1)s on every non-error
+        // path (error paths return early and overcount the unexecuted
+        // remainder by < block size — counter only drives ns/instr stats).
+        try body.print(a, "            rt.count({d});\n", .{n});
+        var q: i32 = leader;
+        while (q < end) : (q += 1) {
+            try emitArmBody(a, &body, &cur[@intCast(q)], q, self_slot, consts, globals, defuns, elided);
+        }
+        // Block dispatch: the last body fell through to here, so control
+        // must reach successor = leader + n (Zig prongs do NOT fall through,
+        // and the fn must not exit the switch).  If that successor is
+        // code_len this continues to `else => unreachable` — byte-identical
+        // to the old per-arm `pc = N; continue` for a malformed body.
+        if (!exits_internally) {
+            try body.print(a, "            pc = {d};\n            continue :sw pc;\n", .{end});
+        }
+        try body.appendSlice(a, "        },\n");
+        p = end;
+    }
+    // The `sw:` label is only used when some arm/run actually dispatches
+    // (`continue :sw pc`); a body whose every run terminates via return has
+    // no dispatch and Zig rejects an unused switch label.
+    const needs_label = std.mem.indexOf(u8, body.items, "continue :sw pc") != null;
+    try out.appendSlice(a, if (needs_label) "    sw: switch (pc) {\n\n" else "    switch (pc) {\n\n");
+    try out.appendSlice(a, body.items);
     try out.appendSlice(a, "        else => unreachable,\n");
     try out.appendSlice(a, "    }\n");
     try out.appendSlice(a, "}\n\n");
 }
 
-fn emitArm(
+/// Emit ONE arm's body WITHOUT its trailing unconditional dispatch (`pc =
+/// next; continue :sw pc;`): the block emitter (emitFn, R2) owns dispatch
+/// placement.  Where an arm's successor was not a block leader the old
+/// dispatch is simply dropped (straight-line fall-through emits the same
+/// program); the pc assignment is still emitted so the `pc` variable — read
+/// by the switch header on real dispatches — stays semantically current.
+fn emitArmBody(
     a: Allocator,
     out: *std.ArrayList(u8),
     ins: *Instr,
@@ -1037,56 +1158,53 @@ fn emitArm(
     const next = pc + 1;
     switch (ins.op) {
         .number, .string, .symbol, .boolean, .float => {
-            try out.print(a, "        {d} => {{\n", .{pc});
-            try out.appendSlice(a, "            rt.count(1);\n            acc = ");
+            try out.appendSlice(a, "        {\n");
+            try out.appendSlice(a, "            acc = ");
             try emitConst(a, out, consts, ins.operand);
             try out.appendSlice(a, ";\n            ipush(&stk, &stack.len, acc);\n");
-            try out.print(a, "            pc = {d};\n            continue :sw pc;\n        }},\n", .{next});
+            try out.print(a, "            pc = {d};\n        }}\n", .{next});
         },
         .access => {
-            try out.print(a, "        {d} => {{\n", .{pc});
-            try out.appendSlice(a, "            rt.count(1);\n            acc = interp.lookupEnv(");
+            try out.appendSlice(a, "        {\n");
+            try out.appendSlice(a, "            acc = interp.lookupEnv(");
             try out.print(a, "{d}", .{ins.jmp_target});
             try out.appendSlice(a, ", env, env_len);\n            ipush(&stk, &stack.len, acc);\n");
-            try out.print(a, "            pc = {d};\n            continue :sw pc;\n        }},\n", .{next});
+            try out.print(a, "            pc = {d};\n        }}\n", .{next});
         },
         .prim => {
-            try out.print(a, "        {d} => {{\n", .{pc});
-            try out.appendSlice(a, "            rt.count(1);\n");
+            try out.appendSlice(a, "        {\n");
             try emitPrim(a, out, ins, ";\n            ipush(&stk, &stack.len, acc);\n");
-            try out.print(a, "            pc = {d};\n            continue :sw pc;\n        }},\n", .{next});
+            try out.print(a, "            pc = {d};\n        }}\n", .{next});
         },
         .const_prim => {
-            try out.print(a, "        {d} => {{\n", .{pc});
-            try out.appendSlice(a, "            rt.count(1);\n            acc = ");
+            try out.appendSlice(a, "        {\n");
+            try out.appendSlice(a, "            acc = ");
             try emitConst(a, out, consts, ins.operand);
             try out.appendSlice(a, ";\n            ipush(&stk, &stack.len, acc);\n");
             try emitPrim(a, out, ins, ";\n            ipush(&stk, &stack.len, acc);\n");
-            try out.print(a, "            pc = {d};\n            continue :sw pc;\n        }},\n", .{next});
+            try out.print(a, "            pc = {d};\n        }}\n", .{next});
         },
         .access_prim => {
-            try out.print(a, "        {d} => {{\n", .{pc});
-            try out.appendSlice(a, "            rt.count(1);\n            acc = interp.lookupEnv(");
+            try out.appendSlice(a, "        {\n");
+            try out.appendSlice(a, "            acc = interp.lookupEnv(");
             try out.print(a, "{d}", .{ins.operand.payload.number});
             try out.appendSlice(a, ", env, env_len);\n            ipush(&stk, &stack.len, acc);\n");
             try emitPrim(a, out, ins, ";\n            ipush(&stk, &stack.len, acc);\n");
-            try out.print(a, "            pc = {d};\n            continue :sw pc;\n        }},\n", .{next});
+            try out.print(a, "            pc = {d};\n        }}\n", .{next});
         },
         .prim_return => {
-            try out.print(a, "        {d} => {{\n", .{pc});
-            try out.appendSlice(a, "            rt.count(1);\n");
+            try out.appendSlice(a, "        {\n");
             try emitPrim(a, out, ins, ";\n            return .{ .done = acc };\n");
-            try out.appendSlice(a, "        },\n");
+            try out.appendSlice(a, "        }\n");
         },
         .pushmark => {
-            try out.print(a, "        {d} => {{\n", .{pc});
-            try out.appendSlice(a, "            rt.count(1);\n            ipush(&stk, &stack.len, values.valMark());\n");
-            try out.print(a, "            pc = {d};\n            continue :sw pc;\n        }},\n", .{next});
+            try out.appendSlice(a, "        {\n");
+            try out.appendSlice(a, "            ipush(&stk, &stack.len, values.valMark());\n");
+            try out.print(a, "            pc = {d};\n        }}\n", .{next});
         },
         .grab => {
-            try out.print(a, "        {d} => {{\n", .{pc});
+            try out.appendSlice(a, "        {\n");
             try out.appendSlice(a,
-                \\            rt.count(1);
                 \\            if (stack.len > 0 and ipeek(&stk, &stack.len).tag == .mark) {
                 \\                _ = ipop(&stk, &stack.len);
                 \\                return .{ .done = acc };
@@ -1096,53 +1214,51 @@ fn emitArm(
                 \\
             );
             try out.print(a, "                pc = {d};\n                continue :sw pc;\n            }} else {{\n", .{next});
-            try out.print(a, "                pc = {d};\n                continue :sw pc;\n            }}\n        }},\n", .{next});
+            try out.print(a, "                pc = {d};\n                continue :sw pc;\n            }}\n        }}\n", .{next});
         },
         .let => {
-            try out.print(a, "        {d} => {{\n", .{pc});
-            try out.appendSlice(a, "            rt.count(1);\n            const v: Value = if (stack.len > 0) ipop(&stk, &stack.len) else acc;\n            interp.envPush(g, &env, &env_len, &env_cap, v);\n");
-            try out.print(a, "            pc = {d};\n            continue :sw pc;\n        }},\n", .{next});
+            try out.appendSlice(a, "        {\n");
+            try out.appendSlice(a, "            const v: Value = if (stack.len > 0) ipop(&stk, &stack.len) else acc;\n            interp.envPush(g, &env, &env_len, &env_cap, v);\n");
+            try out.print(a, "            pc = {d};\n        }}\n", .{next});
         },
         .endlet => {
-            try out.print(a, "        {d} => {{\n", .{pc});
-            try out.appendSlice(a, "            rt.count(1);\n            if (env_len > 0) _ = try interp.envPop(vm, &env, &env_len);\n");
-            try out.print(a, "            pc = {d};\n            continue :sw pc;\n        }},\n", .{next});
+            try out.appendSlice(a, "        {\n");
+            try out.appendSlice(a, "            if (env_len > 0) _ = try interp.envPop(vm, &env, &env_len);\n");
+            try out.print(a, "            pc = {d};\n        }}\n", .{next});
         },
         .jmp => {
-            try out.print(a, "        {d} => {{\n", .{pc});
-            try out.appendSlice(a, "            rt.count(1);\n");
-            try out.print(a, "            pc = {d};\n            continue :sw pc;\n        }},\n", .{ins.jmp_target});
+            try out.appendSlice(a, "        {\n");
+            try out.print(a, "            pc = {d};\n            continue :sw pc;\n        }}\n", .{ins.jmp_target});
         },
         .jmpf => {
-            try out.print(a, "        {d} => {{\n", .{pc});
-            try out.appendSlice(a, "            rt.count(1);\n            const cond: Value = if (stack.len > 0) ipop(&stk, &stack.len) else acc;\n            if (cond.tag == .boolean and cond.payload.boolean == 0) {\n");
+            try out.appendSlice(a, "        {\n");
+            try out.appendSlice(a, "            const cond: Value = if (stack.len > 0) ipop(&stk, &stack.len) else acc;\n            if (cond.tag == .boolean and cond.payload.boolean == 0) {\n");
             try out.print(a, "                pc = {d};\n                continue :sw pc;\n            }} else {{\n", .{ins.jmp_target});
-            try out.print(a, "                pc = {d};\n                continue :sw pc;\n            }}\n        }},\n", .{next});
+            try out.print(a, "                pc = {d};\n                continue :sw pc;\n            }}\n        }}\n", .{next});
         },
         .cur => {
-            try out.print(a, "        {d} => {{\n", .{pc});
-            try out.appendSlice(a, "            rt.count(1);\n            acc = values.valLambda(g, rt.origCode(");
+            try out.appendSlice(a, "        {\n");
+            try out.appendSlice(a, "            acc = values.valLambda(g, rt.origCode(");
             try out.print(a, "{d}", .{self_slot});
             try out.print(a, ")[{d}].closure_code, rt.origCode({d})[{d}].closure_len, env, env_len);\n", .{ pc, self_slot, pc });
             try out.appendSlice(a, "            ipush(&stk, &stack.len, acc);\n");
-            try out.print(a, "            pc = {d};\n            continue :sw pc;\n        }},\n", .{next});
+            try out.print(a, "            pc = {d};\n        }}\n", .{next});
         },
         .ret => {
-            try out.print(a, "        {d} => {{\n", .{pc});
-            try out.appendSlice(a, "            rt.count(1);\n            return .{ .done = acc };\n        },\n");
+            try out.appendSlice(a, "        {\n");
+            try out.appendSlice(a, "            return .{ .done = acc };\n        }\n");
         },
         .global => {
-            try out.print(a, "        {d} => {{\n", .{pc});
-            try out.appendSlice(a, "            rt.count(1);\n            acc = globals[");
+            try out.appendSlice(a, "        {\n");
+            try out.appendSlice(a, "            acc = globals[");
             try out.print(a, "{d}", .{indexOf(globals, values.symSlice(ins.operand)).?});
             try out.appendSlice(a, "];\n            ipush(&stk, &stack.len, acc);\n");
-            try out.print(a, "            pc = {d};\n            continue :sw pc;\n        }},\n", .{next});
+            try out.print(a, "            pc = {d};\n        }}\n", .{next});
         },
         .apply => {
-            try out.print(a, "        {d} => {{\n", .{pc});
-            try out.appendSlice(a, "            rt.count(1);\n");
+            try out.appendSlice(a, "        {\n");
             try emitApply(a, out, next, null, defuns);
-            try out.appendSlice(a, "        },\n");
+            try out.appendSlice(a, "        }\n");
         },
         .global_apply => {
             const gname = values.symSlice(ins.operand);
@@ -1151,12 +1267,12 @@ fn emitArm(
                 // Stack-env DIRECT call: target is a known NON_ALLOCATING defun
                 // with static nargs == its arity (classification guarantees it).
                 const tslot = indexOfDefun(defuns, gname).?;
-                try out.print(a, "        {d} => {{\n            rt.count(1);\n", .{pc});
+                try out.appendSlice(a, "        {\n");
                 try emitStackEnvCall(a, out, next, tslot, defuns[tslot].arity, defuns);
-                try out.appendSlice(a, "        },\n");
+                try out.appendSlice(a, "        }\n");
             } else {
-                try out.print(a, "        {d} => {{\n", .{pc});
-                try out.appendSlice(a, "            rt.count(1);\n            acc = globals[");
+                try out.appendSlice(a, "        {\n");
+                try out.appendSlice(a, "            acc = globals[");
                 try out.print(a, "{d}", .{gslot});
                 try out.appendSlice(a, "];\n            ipush(&stk, &stack.len, acc);\n");
                 if (indexOfDefun(defuns, gname)) |slot| {
@@ -1164,22 +1280,21 @@ fn emitArm(
                 } else {
                     try emitApply(a, out, next, null, defuns);
                 }
-                try out.appendSlice(a, "        },\n");
+                try out.appendSlice(a, "        }\n");
             }
         },
         .appterm => {
-            try out.print(a, "        {d} => {{\n", .{pc});
-            try out.appendSlice(a, "            rt.count(1);\n");
+            try out.appendSlice(a, "        {\n");
             try emitAppterm(a, out, next, null, defuns, null);
-            try out.appendSlice(a, "        },\n");
+            try out.appendSlice(a, "        }\n");
         },
         .global_appterm => {
             // An elided fn never reaches here (structurallyEligible rejects any
             // .global_appterm), so this arm is the rooted P1 shape only.
             const gname = values.symSlice(ins.operand);
             const gslot = indexOf(globals, gname).?;
-            try out.print(a, "        {d} => {{\n", .{pc});
-            try out.appendSlice(a, "            rt.count(1);\n            acc = globals[");
+            try out.appendSlice(a, "        {\n");
+            try out.appendSlice(a, "            acc = globals[");
             try out.print(a, "{d}", .{gslot});
             try out.appendSlice(a, "];\n            ipush(&stk, &stack.len, acc);\n");
             if (indexOfDefun(defuns, gname)) |slot| {
@@ -1194,16 +1309,29 @@ fn emitArm(
             } else {
                 try emitAppterm(a, out, next, null, defuns, null);
             }
-            try out.appendSlice(a, "        },\n");
+            try out.appendSlice(a, "        }\n");
         },
         .count => {
             std.debug.print("aotdump: warning: unknown op at pc={d} — emitting unreachable\n", .{pc});
-            try out.print(a, "        {d} => unreachable,\n", .{pc});
+            try out.appendSlice(a, "        { unreachable; }\n");
         },
     }
 }
 
 const KnownTarget = struct { slot: usize, global: usize };
+
+/// True when a body emitted by emitArmBody never reaches the prong end: it
+/// RETURNs (.ret, .prim_return) or continues to a pc of its own choosing
+/// (.jmp/.jmpf/.grab — appterm/global_appterm only exit internally on their
+/// lambda branch and CAN fall through, so they do not count).  Such an arm
+/// may end a block run, in which case the run emits NO trailing dispatch
+/// (control provably never reaches it — Zig rejects unreachable statements).
+fn armExitsInternally(op: types.Opcode) bool {
+    return switch (op) {
+        .ret, .prim_return, .jmp, .jmpf, .grab, .count => true,
+        else => false,
+    };
+}
 
 /// Elided Q-site stack-env direct call (Phase 2): pops exactly `arity` args
 /// into a SITE-LOCAL `senv` buffer (a distinct stack array per site — never
@@ -1227,16 +1355,25 @@ fn emitStackEnvCall(a: Allocator, out: *std.ArrayList(u8), next: i32, target_slo
         \\            if (stack.len == 0 or ipeek(&stk, &stack.len).tag != .mark)
         \\                return rt.throwStatic(vm, err_arity);
         \\            _ = ipop(&stk, &stack.len);
-        \\            const r = aot_{s}(vm, &senv, {d}) catch |e| switch (e) {{
-        \\                error.Halt => return .{{ .done = acc }},
-        \\                error.ShenError => return error.ShenError,
-        \\            }};
-        \\            acc = r.done;
+        \\            if (rt.natDeep()) {{
+        \\                // Depth guard (R1): run the callee interpreted.  The
+        \\                // elided caller has NOTHING rooted, and vmExecEnv
+        \\                // allocs — rt.deepStackEnv roots this frame's C-stack
+        \\                // senv/stk/env first (registered VALUE_ARRAYs scan
+        \\                // live + pin nothing when the count is 0), and the
+        \\                // elided prologue's assertAllocStable defers on the
+        \\                // depth_fallbacks delta, so the sanctioned alloc is
+        \\                // exempt from the NON_ALLOCATING proof.
+        \\                var slen: i32 = {d};
+        \\                acc = rt.deepStackEnv(vm, {d}, &senv, &slen, &stk, &stack.len, &env) catch |e| return rt.propagate(e, acc);
+        \\            }} else {{
+        \\                const r = aot_{s}(vm, &senv, {d}) catch |e| return rt.propagate(e, acc);
+        \\                acc = r.done;
+        \\            }}
         \\            ipush(&stk, &stack.len, acc);
         \\            pc = {d};
-        \\            continue :sw pc;
         \\
-    , .{ kmangled, arity, next });
+    , .{ arity, target_slot, kmangled, arity, next });
 }
 
 /// The non-tail apply body (function already on top of the value stack).
@@ -1257,53 +1394,20 @@ fn emitApply(a: Allocator, out: *std.ArrayList(u8), next: i32, known: ?KnownTarg
         \\
     );
     if (known) |k| {
-        // known direct call — INLINE fast path (P1c): arity check + buildEnv +
-        // direct target call + a local bounce loop, instead of the rt.callKnown
-        // call layer (the mismatch case still falls back to rt.applyGeneric).
-        var mbuf: [256]u8 = undefined;
-        const kmangled = try mangle(&mbuf, defuns[k.slot].name);
-        const arity = defuns[k.slot].arity;
+        // Known direct call — routed through rt.callKnown (R1): the native
+        // call is made inside the runtime helper, where the depth guard
+        // (natDeep -> interpreted vmExecEnv of the SAME callee body) and the
+        // arity-mismatch generic path live in ONE place instead of being
+        // re-inlined at every Q site.
+        var kbuf: [256]u8 = undefined;
         try out.print(a,
-            \\                {{
-            \\                    var r: rt.Ret = undefined;
-            \\                    if (nargs == {d}) {{
-            \\                        const built = rt.buildEnv(g, &acc, &argbuf, nargs);
-            \\                        r = aot_{s}(vm, built.env, built.len) catch |e| switch (e) {{
-            \\                            error.Halt => return .{{ .done = acc }},
-            \\                            error.ShenError => return error.ShenError,
-            \\                        }};
-            \\                    }} else {{
-            \\                        // N<A (partial) or N>A (peel): route the LOCAL
-            \\                        // &acc (a rooted copy of the global) so the
-            \\                        // partial/peel result is built in the frame slot —
-            \\                        // NEVER in the globals cache (applyGeneric writes
-            \\                        // cl.* = buildPartialClosure, which would corrupt
-            \\                        // the shared global for every later caller).
-            \\                        var nn = nargs;
-            \\                        r = rt.applyGeneric(vm, &acc, &argbuf, &nn, false) catch |e| switch (e) {{
-            \\                            error.Halt => return .{{ .done = acc }},
-            \\                            error.ShenError => return error.ShenError,
-            \\                        }};
-            \\                    }}
-            \\                    while (true) {{
-            \\                        switch (r) {{
-            \\                            .done => |v| {{ acc = v; break; }},
-            \\                            .tail => |t| r = t.f(vm, t.env, t.env_len) catch |e| switch (e) {{
-            \\                                error.Halt => return .{{ .done = acc }},
-            \\                                error.ShenError => return error.ShenError,
-            \\                            }},
-            \\                        }}
-            \\                    }}
-            \\                }}
+            \\                acc = rt.callKnown(vm, &acc, {d}, aot_{s}, &argbuf, nargs) catch |e| return rt.propagate(e, acc);
             \\
-        , .{ arity, kmangled });
+        , .{ defuns[k.slot].arity, try mangle(&kbuf, defuns[k.slot].name) });
     } else {
         try out.appendSlice(a,
             \\                {
-            \\                    const r = rt.applyGeneric(vm, &acc, &argbuf, &nargs, false) catch |e| switch (e) {
-            \\                        error.Halt => return .{ .done = acc },
-            \\                        error.ShenError => return error.ShenError,
-            \\                    };
+            \\                    const r = rt.applyGeneric(vm, &acc, &argbuf, &nargs, false) catch |e| return rt.propagate(e, acc);
             \\                    acc = r.done;
             \\                }
             \\
@@ -1314,19 +1418,16 @@ fn emitApply(a: Allocator, out: *std.ArrayList(u8), next: i32, known: ?KnownTarg
         \\                ipush(&stk, &stack.len, acc);
         \\
     );
-    try out.print(a, "                pc = {d};\n                continue :sw pc;\n", .{next});
+    try out.print(a, "                pc = {d};\n", .{next});
     try out.appendSlice(a,
         \\            } else if (acc.tag == .prim) {
         \\                if (stack.len > 0 and ipeek(&stk, &stack.len).tag == .mark) _ = ipop(&stk, &stack.len);
         \\                const pn = values.primSlice(acc);
-        \\                prims.execPrimitive(vm, pn, &acc, &stack) catch |e| switch (e) {
-        \\                    error.Halt => return .{ .done = acc },
-        \\                    error.ShenError => return error.ShenError,
-        \\                };
+        \\                prims.execPrimitive(vm, pn, &acc, &stack) catch |e| return rt.propagate(e, acc);
         \\                ipush(&stk, &stack.len, acc);
         \\
     );
-    try out.print(a, "                pc = {d};\n                continue :sw pc;\n", .{next});
+    try out.print(a, "                pc = {d};\n", .{next});
     try out.appendSlice(a,
         \\            } else {
         \\                if (vm.catch_chain != null and vm.catch_chain.?.in_trap_error)
@@ -1372,14 +1473,11 @@ fn emitAppterm(a: Allocator, out: *std.ArrayList(u8), next: i32, known: ?KnownTa
         // already holds the popped copy of the global.
         try out.print(a, "                {{\n                    const r = rt.tailKnown(vm, &acc, ", .{});
         try emitTarget(a, out, defuns, k.slot);
-        try out.appendSlice(a, ", &argbuf, nargs) catch |e| switch (e) {\n                        error.Halt => return .{ .done = acc },\n                        error.ShenError => return error.ShenError,\n                    };\n                    argbuf_len = 0;\n                    return r;\n                }\n");
+        try out.appendSlice(a, ", &argbuf, nargs) catch |e| return rt.propagate(e, acc);\n                    argbuf_len = 0;\n                    return r;\n                }\n");
     } else {
         try out.appendSlice(a,
             \\                {
-            \\                    const r = rt.applyGeneric(vm, &acc, &argbuf, &nargs, true) catch |e| switch (e) {
-            \\                        error.Halt => return .{ .done = acc },
-            \\                        error.ShenError => return error.ShenError,
-            \\                    };
+            \\                    const r = rt.applyGeneric(vm, &acc, &argbuf, &nargs, true) catch |e| return rt.propagate(e, acc);
             \\                    argbuf_len = 0;
             \\                    return r;
             \\                }
@@ -1390,14 +1488,11 @@ fn emitAppterm(a: Allocator, out: *std.ArrayList(u8), next: i32, known: ?KnownTa
         \\            } else if (acc.tag == .prim) {
         \\                if (stack.len > 0 and ipeek(&stk, &stack.len).tag == .mark) _ = ipop(&stk, &stack.len);
         \\                const pn = values.primSlice(acc);
-        \\                prims.execPrimitive(vm, pn, &acc, &stack) catch |e| switch (e) {
-        \\                    error.Halt => return .{ .done = acc },
-        \\                    error.ShenError => return error.ShenError,
-        \\                };
+        \\                prims.execPrimitive(vm, pn, &acc, &stack) catch |e| return rt.propagate(e, acc);
         \\                ipush(&stk, &stack.len, acc);
         \\
     );
-    try out.print(a, "                pc = {d};\n                continue :sw pc;\n", .{next});
+    try out.print(a, "                pc = {d};\n", .{next});
     try out.appendSlice(a,
         \\            } else {
         \\                if (vm.catch_chain != null and vm.catch_chain.?.in_trap_error)
@@ -1411,7 +1506,7 @@ fn emitAppterm(a: Allocator, out: *std.ArrayList(u8), next: i32, known: ?KnownTa
 
 /// Emit the prim call + Halt/ShenError routing, followed by `suffix`.
 fn emitPrim(a: Allocator, out: *std.ArrayList(u8), ins: *Instr, suffix: []const u8) !void {
-    try out.print(a, "            prims.primByIndex({d}).func(vm, &acc, &stack) catch |e| switch (e) {{\n                error.Halt => return .{{ .done = acc }},\n                error.ShenError => return error.ShenError,\n            }}", .{ins.jmp_target - 1});
+    try out.print(a, "            prims.primByIndex({d}).func(vm, &acc, &stack) catch |e| return rt.propagate(e, acc)", .{ins.jmp_target - 1});
     try out.appendSlice(a, suffix);
 }
 

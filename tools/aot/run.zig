@@ -53,6 +53,14 @@ const VmError = state.VmError;
 /// String-literal args coerce to [*:0]const u8.
 extern "c" fn getenv(name: [*:0]const u8) ?[*:0]u8;
 
+/// Parse an unsigned decimal env var; null when unset/empty/malformed.
+fn envUsize(name: [*:0]const u8) ?usize {
+    const v = getenv(name) orelse return null;
+    const s = std.mem.span(v);
+    if (s.len == 0) return null;
+    return std.fmt.parseUnsigned(usize, s, 10) catch null;
+}
+
 // ---------------------------------------------------------------------
 //  Apply-timing counters (populated only when AOTRUN_STATS_FILE is set)
 // ---------------------------------------------------------------------
@@ -89,18 +97,76 @@ fn timedApplyClosure(vm_: *Vm, fnv: Value, args: []const Value) VmError!Value {
     return hostcall.applyClosureN(vm_, fnv, args);
 }
 
+/// AOTRUN_ARGV mode: the saved CLI args (prog already dropped), collected
+/// from the iterator before the GC exists (iterator buffers live in the
+/// process arena, which outlives the run).
+var app_args: []const []const u8 = &.{};
+
+/// Build the *argv* pseudo-global value: a plain cons LIST of strings, built
+/// back-to-front (cdr-first) so each valCons roots the previous tail.  The
+/// empty case installs the nil singleton (Runtime.argv () -> []).
+fn buildArgvList(g: *gc.Gc, args: []const []const u8) Value {
+    var acc: Value = values.valNil();
+    var i: usize = args.len;
+    while (i > 0) {
+        i -= 1;
+        acc = values.valCons(g, values.valString(g, args[i]), acc);
+    }
+    return acc;
+}
+
 pub fn main(init: std.process.Init) !void {
     const a = init.arena.allocator();
     const io = init.io;
 
+    // ---- env knobs (all optional) ----
+    // AOTRUN_ARGV: hand the process arguments to the APP as the *argv*
+    // pseudo-global (run.js argv[2:] shape: the binary path is NOT an
+    // element).  In this mode the driver's own [bundle] [fn-name] positional
+    // parsing is disabled — every argument belongs to the app — so a
+    // compiler-CLI binary (elmc) can take real arguments.  The bundle comes
+    // from the embedded copy; a bundle path can still be forced with
+    // AOTRUN_BUNDLE for debugging.
+    // AOTRUN_QUIET: suppress the final printValue line (a compiler CLI's
+    // stdout must stay clean; the app writes its own files/status).
+    // ELMC_HEAP_MB / AOTRUN_RESERVE_MB: heap sizing overrides (the whole
+    // compiler closure through HM inference needs more than the default).
+    const argv_mode = getenv("AOTRUN_ARGV") != null;
+    const quiet = getenv("AOTRUN_QUIET") != null;
+    const heap_bytes = (envUsize("ELMC_HEAP_MB") orelse (HEAP_BYTES / (1024 * 1024))) * 1024 * 1024;
+
     var it = init.minimal.args.iterate();
     const prog = it.next() orelse "aot-run";
-    const bundle_arg: ?[]const u8 = it.next(); // optional: overrides the embedded bundle
-    const fn_name: ?[]const u8 = it.next(); // CLI symmetry; the entry is baked
-    if (fn_name != null and it.next() != null) usage(prog);
+    var bundle_arg: ?[]const u8 = null;
+    if (argv_mode) {
+        // Every argument (after the program name) belongs to the APP.  The
+        // iterator's slices point into its internal buffer, so dupe them
+        // into the process arena (outlives the run) for the global.
+        var args_list: [256][]const u8 = undefined;
+        var n: usize = 0;
+        while (it.next()) |arg| {
+            if (n == args_list.len) break; // absurd CLI; truncate
+            args_list[n] = arg;
+            n += 1;
+        }
+        const saved = try a.alloc([]const u8, n);
+        for (args_list[0..n], 0..) |arg, i| saved[i] = try a.dupe(u8, arg);
+        app_args = saved;
+    } else {
+        bundle_arg = it.next(); // optional: overrides the embedded bundle
+        const fn_name = it.next(); // CLI symmetry; the entry is baked
+        if (fn_name != null and it.next() != null) usage(prog);
+    }
 
     const interp_mode = getenv("AOTRUN_INTERP") != null;
     const stats_file: ?[]const u8 = if (getenv("AOTRUN_STATS_FILE")) |p| std.mem.span(p) else null;
+    if (getenv("AOTRUN_BUNDLE")) |p| bundle_arg = std.mem.span(p);
+    // AOT_NAT_DEPTH: the native-depth cap (R1).  Non-tail native calls made
+    // at or beyond it run interpreted (interp.vmExecEnv) instead of growing
+    // the C stack — the cap bounds native recursion at depth x frame-size,
+    // and the interpreter (flat loop, pooled call frames) handles the deep
+    // remainder identically.  Default 256 (see rt.nat_depth_max).
+    if (envUsize("AOT_NAT_DEPTH")) |nd| rt.nat_depth_max = @intCast(@min(nd, std.math.maxInt(u32)));
 
     // ---- the bundle text: CLI arg, else the copy aotdump embedded ----
     const bundle_z: [:0]const u8 = if (bundle_arg) |path| blk: {
@@ -115,8 +181,11 @@ pub fn main(init: std.process.Init) !void {
 
     // ---- init Gc + Vm ----
     var g = try heap.Gc.init(.{
-        .heap_bytes = HEAP_BYTES,
-        .reserve_bytes = RESERVE_BYTES,
+        .heap_bytes = heap_bytes,
+        // Reservation must exceed the initial heap or grow_heap can never
+        // extend (a fixed 64MB cap made ELMC_HEAP_MB and even the default
+        // 64->128MB growth spin forever); same policy as tools/aot/main.zig.
+        .reserve_bytes = @max(heap_bytes * 2, RESERVE_BYTES),
     });
     defer g.deinit();
     var v: state.Vm = undefined;
@@ -134,6 +203,17 @@ pub fn main(init: std.process.Init) !void {
     v.valueSet("*stinput*", streams.valStreamInFd(0));
     v.valueSet("*stoutput*", streams.valStreamOutFd(1));
     v.valueSet("*sterror*", streams.valStreamOutFd(2));
+
+    // ---- M15: the *argv* pseudo-global (AOTRUN_ARGV mode) ----
+    // Mirrors the stream pseudo-globals: the app reads it via the trusted
+    // Runtime.argvPrim (lowered to `Symbol "*argv*" + Prim "value"`), which
+    // pops whatever value lives here.  valueSet copies into the GC-scanned
+    // values table, so the list survives collections without rooting.
+    if (argv_mode) {
+        v.valueSet("*argv*", buildArgvList(&g, app_args));
+    } else {
+        v.valueSet("*argv*", values.valNil());
+    }
 
     // ---- AOT init: consts + globals cache + registry (generated) ----
     aot_gen.aotInit(&v);
@@ -165,16 +245,20 @@ pub fn main(init: std.process.Init) !void {
     } else {
         try values.printValue(&w, result);
     }
-    try std.Io.File.writeStreamingAll(std.Io.File.stdout(), io, w.buffered());
-    try std.Io.File.writeStreamingAll(std.Io.File.stdout(), io, "\n");
+    // AOTRUN_QUIET: a compiler CLI's stdout must stay clean (the app already
+    // wrote its files + status itself); skip the final model print entirely.
+    if (!quiet) {
+        try std.Io.File.writeStreamingAll(std.Io.File.stdout(), io, w.buffered());
+        try std.Io.File.writeStreamingAll(std.Io.File.stdout(), io, "\n");
+    }
 
     // ---- write the apply stats (to a FILE, so stdout stays frame-clean) ----
     if (stats_file) |path| {
         var buf: [256]u8 = undefined;
         const line = try std.fmt.bufPrint(
             &buf,
-            "calls={d} total_ns={d} max_ns={d} vmexec_fb={d} elided={d} stack_env={d}\n",
-            .{ apply_count, apply_total_ns, apply_max_ns, rt.vmexec_fallbacks, rt.elided_calls, rt.stack_env_calls },
+            "calls={d} total_ns={d} max_ns={d} vmexec_fb={d} elided={d} stack_env={d} depth_fb={d}\n",
+            .{ apply_count, apply_total_ns, apply_max_ns, rt.vmexec_fallbacks, rt.elided_calls, rt.stack_env_calls, rt.depth_fallbacks },
         );
         std.Io.Dir.writeFile(.cwd(), io, .{ .sub_path = path, .data = line }) catch {};
     }

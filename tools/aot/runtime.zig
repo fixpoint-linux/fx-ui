@@ -55,6 +55,18 @@ pub const Ret = union(enum) {
     tail: Tail,
 };
 
+/// Uniform error propagation for every apply/prim site in generated code.
+/// `error.Halt` is the "return this acc from the enclosing aot_ fn" signal;
+/// `error.ShenError` is the VM's own throw, passed straight up.  Emitted as
+/// `catch |e| return rt.propagate(e, acc);` — a single line replacing the
+/// open-coded 3-line switch that used to be duplicated at every site.
+pub inline fn propagate(e: VmError, acc: Value) VmError!Ret {
+    return switch (e) {
+        error.Halt => .{ .done = acc },
+        error.ShenError => error.ShenError,
+    };
+}
+
 // =====================================================================
 //  Instruction-parity counter (drives the aotbench ns/instr report)
 // =====================================================================
@@ -80,10 +92,41 @@ pub var stack_env_calls: u64 = 0;
 pub var vmexec_fallbacks: u64 = 0;
 
 // =====================================================================
+//  Native-depth guard (R1): bound the C stack, fall back to the
+//  interpreter for the deep tail of a non-tail recursion
+// =====================================================================
+
+/// Native aot_ frames currently on the C stack.  Every emitted fn's
+/// prologue does natEnter() + `defer natLeave()` (the defer covers error
+/// unwind, so the counter cannot leak).  Tail paths never grow it: self
+/// tails loop in-frame, cross-defun tails bounce at constant depth.
+pub var nat_depth: u32 = 0;
+/// The cap: a non-tail native call made at nat_depth >= nat_depth_max runs
+/// its callee through interp.vmExecEnv (flat loop, pooled call frames)
+/// instead of a fresh native frame.  AOT_NAT_DEPTH overrides at startup.
+/// 256 x ~15KB Debug frames ~= 4MB, under the 8MB default stack (the crash
+/// repro died at 551 frames).
+pub var nat_depth_max: u32 = 256;
+/// How many times the guard fired (stats line + the elided-fn assert
+/// relaxation: an elided fn skips its assertAllocStable iff a fallback
+/// fired anywhere in its dynamic extent, since vmExecEnv allocs).
+pub var depth_fallbacks: u64 = 0;
+
+pub inline fn natEnter() void {
+    nat_depth += 1;
+}
+pub inline fn natLeave() void {
+    nat_depth -= 1;
+}
+pub inline fn natDeep() bool {
+    return nat_depth >= nat_depth_max;
+}
+
+// =====================================================================
 //  Registry: code-array identity -> native fn
 // =====================================================================
 
-pub const REG_MAX = 1024;
+pub const REG_MAX = 4096;
 
 /// The native fn per AOT'd defun (index = the defun's registry slot).
 pub var reg_fn: [REG_MAX]AotFn = undefined;
@@ -129,6 +172,16 @@ pub fn lookup(cl: Value) ?AotFn {
 /// arms index it: rt.origCode(SELF)[pc].closure_code.
 pub inline fn origCode(slot: usize) [*]Instr {
     return @ptrCast(reg_code[slot].?);
+}
+
+/// The body's ORIGINAL instr count for registry slot `slot` (mirrors
+/// origCode; filled by the generated aotInit).  The interpreted fallback at
+/// a depth-guarded call site runs this exact code array + length — the same
+/// body the native fn reifies.
+pub var reg_len: [REG_MAX]i32 = undefined;
+
+pub inline fn origLen(slot: usize) i32 {
+    return reg_len[slot];
 }
 
 // =====================================================================
@@ -320,7 +373,7 @@ pub fn applyHost(vm: *Vm, fnv_in: Value, args: []const Value) VmError!Value {
     if (lookup(fnv)) |f| {
         g.rootPop(); // argbuf
         g.rootPop(); // fnv
-        return bounce(vm, try f(vm, built.env, built.len));
+        return fullCallNative(vm, f, fnv.payload.lambda.code, fnv.payload.lambda.code_len, built.env, built.len);
     }
     const code = fnv.payload.lambda.code;
     const code_len = fnv.payload.lambda.code_len;
@@ -333,6 +386,35 @@ pub fn applyHost(vm: *Vm, fnv_in: Value, args: []const Value) VmError!Value {
 // =====================================================================
 //  Call sites
 // =====================================================================
+
+/// The elided Q-site depth-guard fallback.  An elided caller enters with
+/// NOTHING rooted (the NON_ALLOCATING contract), but vmExecEnv allocates
+/// (env copy, value stack), so a collection in there would move the
+/// caller's unrooted stk/env/acc locals.  Root the caller's frame here,
+/// first: the senv C-stack buffer is registered as a VALUE_ARRAY (a
+/// registered count of 0 pins nothing, exactly like the `argbuf` idiom),
+/// so it survives any evacuation and the interpreter's post-alloc reads
+/// through it are fresh.  The DEPTH counter stays owned by the emitted
+/// prologue's defer (this helper must not pop it).
+pub fn deepStackEnv(
+    vm: *Vm,
+    target_slot: usize,
+    senv: [*]Value,
+    slen: *i32,
+    stk: []Value,
+    stack_len: *i32,
+    env: *?[*]Value,
+) VmError!Value {
+    const g = vm.gc;
+    g.rootPushValueArray(senv, slen);
+    g.rootPushValueArray(stk.ptr, stack_len);
+    g.rootPushPtr(@ptrCast(env));
+    defer g.rootPop();
+    defer g.rootPop();
+    defer g.rootPop();
+    depth_fallbacks += 1;
+    return interp.vmExecEnv(vm, origCode(target_slot), origLen(target_slot), senv, slen.*);
+}
 
 /// Non-tail known-global call (fused Q = global + apply): fast path when the
 /// runtime arg count matches the emit-time arity, else the generic apply
@@ -347,7 +429,7 @@ pub fn callKnown(
 ) VmError!Value {
     if (nargs == expect_arity) {
         const built = buildEnv(vm.gc, globals_k, argbuf, nargs);
-        return bounce(vm, try target(vm, built.env, built.len));
+        return fullCallNative(vm, target, globals_k.*.payload.lambda.code, globals_k.*.payload.lambda.code_len, built.env, built.len);
     }
     // N<A (partial) / N>A (peel): applyGeneric WRITES cl.* (the partial lands
     // there) — copy the global into a rooted frame-local first so the shared
@@ -358,6 +440,26 @@ pub fn callKnown(
     var nn = nargs;
     const r = try applyGeneric(vm, &cl, argbuf, &nn, false);
     return bounce(vm, r);
+}
+
+/// Depth-guarded body shared by callKnown / applyGeneric: the fast path is
+/// the plain native call; a call made at nat_depth >= nat_depth_max runs
+/// the callee through the interpreter instead (its flat loop + pooled call
+/// frames never grow the C stack — the same engine that already runs every
+/// deep non-tail recursion correctly).  code/len are the callee's own body.
+fn fullCallNative(
+    vm: *Vm,
+    target: AotFn,
+    code: ?*Instr,
+    code_len: i32,
+    env: ?[*]Value,
+    env_len: i32,
+) VmError!Value {
+    if (natDeep()) {
+        depth_fallbacks += 1;
+        return interp.vmExecEnv(vm, code, code_len, env, env_len);
+    }
+    return bounce(vm, try target(vm, env, env_len));
 }
 
 /// Tail known-global call (fused R = global + appterm): fast path returns a
@@ -411,7 +513,7 @@ pub fn applyGeneric(
         if (lookup(cl.*)) |f| {
             if (tail)
                 return .{ .tail = .{ .f = f, .env = built.env, .env_len = built.len } };
-            return .{ .done = try bounce(vm, try f(vm, built.env, built.len)) };
+            return .{ .done = try fullCallNative(vm, f, cl.payload.lambda.code, cl.payload.lambda.code_len, built.env, built.len) };
         }
         // Unknown closure: run its ORIGINAL body through the interpreter,
         // which handles its own appterm tails internally (never grows native

@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# elmc.sh — thin CLI wrapper for the aot-built elmc compiler binary (M15).
+#
+#   elmc <input1.elm> [input2.elm ...] <output.csexp>
+#   elmc <manifest>            (line format: sources one per line, each
+#                                group terminated by '-> <out.csexp>')
+#
+# Builds zig-out/bin/elmc from the selfhost group (NativeMain + the compiler
+# frontend, via aot-build.sh --group) on first use, then runs it with the
+# driver's argv plumbing enabled:
+#   AOTRUN_ARGV=1   the binary's arguments reach NativeMain as Runtime.argv ()
+#   AOTRUN_QUIET=1  the driver's final model print is suppressed (clean stdout)
+#
+# Byte-for-byte parity with `node elm-compiler/run.js ...` is the contract
+# (same corpus order, same Lower.Module.compileBatch, same output bytes).
+#
+# Env:
+#   ELMC_BIN   use this prebuilt binary instead of (re)building
+#   ELMC_HEAP_MB  heap override for the compiler binary (big groups)
+#   ELMC_SKIP_BUILD=1  fail loudly instead of building when ELMC_BIN is unset
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+BIN="${ELMC_BIN:-$ROOT/zig-out/bin/elmc}"
+
+# Global zig cache off the cramped /home onto the pool (see aot-build.sh).
+: "${ZIG_GLOBAL_CACHE_DIR:=$ROOT/.zig-cache-global}"
+export ZIG_GLOBAL_CACHE_DIR
+mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
+
+if [ ! -x "$BIN" ]; then
+  if [ "${ELMC_SKIP_BUILD:-0}" = "1" ]; then
+    echo "elmc: no binary at $BIN (set ELMC_BIN or drop ELMC_SKIP_BUILD)" >&2
+    exit 2
+  fi
+  echo "elmc: building $BIN (aot-build NativeMain + selfhost group)..." >&2
+  # ELMC_BUILD_MODE: -O for aot-build.  Default Debug — the optimised modes
+  # (ReleaseFast/ReleaseSafe) take many minutes on the full-closure gen.zig
+  # (LLVM on ~550K emitted lines) while Debug builds it in seconds, and this
+  # binary exists to exercise the compiler, not to be fast.  Set
+  # ELMC_BUILD_MODE=ReleaseFast for a performance build.
+  "$ROOT/tools/aot/aot-build.sh" \
+    "$ROOT/elm-compiler/selfhost/NativeMain.elm" \
+    --group "$ROOT/elm-compiler/selfhost/manifest.json" \
+    --entry NativeMain.main \
+    -O "${ELMC_BUILD_MODE:-Debug}" \
+    -o "$BIN"
+fi
+
+export AOTRUN_ARGV=1
+export AOTRUN_QUIET=1
+if [ -n "${ELMC_HEAP_MB:-}" ]; then
+  export ELMC_HEAP_MB
+fi
+
+exec "$BIN" "$@"
