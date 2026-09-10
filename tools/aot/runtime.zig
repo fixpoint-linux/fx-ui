@@ -413,7 +413,7 @@ pub fn deepStackEnv(
     defer g.rootPop();
     defer g.rootPop();
     depth_fallbacks += 1;
-    return interp.vmExecEnv(vm, origCode(target_slot), origLen(target_slot), senv, slen.*);
+    return interp.vmExecEnv(vm, @ptrCast(origCode(target_slot)), origLen(target_slot), senv, slen.*);
 }
 
 /// Non-tail known-global call (fused Q = global + apply): fast path when the
