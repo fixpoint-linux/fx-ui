@@ -73,7 +73,13 @@ pub inline fn propagate(e: VmError, acc: Value) VmError!Ret {
 
 /// When false, count() compiles to nothing (pure-speed runs).  The driver's
 /// ns/instr report reads the delta in `instrs` between its timed window.
-pub const COUNT_INSTRS = true;
+///
+/// `rt.count(n)` is emitted once per basic block — 118.9M calls on the biglist
+/// fixture — and costs ~4% of runtime, which a SHIPPED binary should not pay.
+/// So the flag is a build MODULE OPTION (build.zig's `count_instrs`), not a
+/// const: the `aot`/`aot-build` steps default it on for aotbench (which needs
+/// ns/instr) and off for real apps, and `-Dcount-instrs` overrides either way.
+pub const COUNT_INSTRS = @import("count_instrs").count_instrs;
 pub var instrs: u64 = 0;
 
 pub inline fn count(n: u64) void {

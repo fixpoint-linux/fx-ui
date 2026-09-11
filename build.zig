@@ -125,6 +125,13 @@ pub fn build(b: *std.Build) void {
     // default build, `zig build test`, nor any gate/CI host needs SDL.
     const gui = b.option(bool, "gui", "Link the SDL2 window backend into elmvm (P2 GUI; needs sdl2 + fonts)") orelse false;
 
+    // AOT instruction counting: `rt.count(n)` is emitted once per basic block
+    // (118.9M calls on biglist) and costs ~4% of runtime.  It is ON for the
+    // aotbench spike exes (their ns/instr report needs it) and OFF for real
+    // apps (`aot-build`), which should not pay for instrumentation they never
+    // read.  `-Dcount-instrs=<bool>` forces it either way.
+    const count_instrs_opt = b.option(bool, "count-instrs", "AOT: emit the per-block instruction counter (default: on for aotbench, off for aot-build apps)");
+
     const gui_model_mod = b.createModule(.{
         .root_source_file = b.path("src/renderer/gui.zig"),
         .target = target,
@@ -254,6 +261,27 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // `runtime.zig` reads `@import("count_instrs").count_instrs`.  Both
+    // variants come from the SAME source file; they differ only in the options
+    // module attached, so one can have the counter and the other not.
+    const count_instrs_bench = b.addOptions();
+    count_instrs_bench.addOption(bool, "count_instrs", count_instrs_opt orelse true);
+    aotrt_mod.addOptions("count_instrs", count_instrs_bench);
+
+    const aotrt_app_mod = b.createModule(.{
+        .root_source_file = b.path("tools/aot/runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "gc", .module = gc_mod },
+            .{ .name = "vm", .module = vm_mod },
+        },
+    });
+    const count_instrs_app = b.addOptions();
+    count_instrs_app.addOption(bool, "count_instrs", count_instrs_opt orelse false);
+    aotrt_app_mod.addOptions("count_instrs", count_instrs_app);
+
     // ---- `aotdump`: the AOT emitter (links gc+vm, real parseBundle) ----
     // Also imports aotrt: the dumper checks the emitted unit count against
     // runtime.zig's REG_MAX (the registry arrays the generated aotInit fills).
@@ -315,7 +343,9 @@ pub fn build(b: *std.Build) void {
         };
         const out_name = b.option([]const u8, "out", "aot-build: output exe name") orelse "aot-app";
         const aot_build_step = b.step("aot-build", "Build a self-contained native exe from an .elm app (see tools/aot/aot-build.sh)");
-        aot_build_step.dependOn(addAotApp(b, target, optimize, gc_mod, vm_mod, aotrt_mod, effectloop_mod, aotdump, out_name, &.{app_path}, entry));
+        // A real app: instruction counting OFF (it would cost ~4% and nothing
+        // reads the counter).  `-Dcount-instrs=true` overrides.
+        aot_build_step.dependOn(addAotApp(b, target, optimize, gc_mod, vm_mod, aotrt_app_mod, effectloop_mod, aotdump, out_name, &.{app_path}, entry));
     }
 
     // This creates a top level step. Top level steps have a name and can be

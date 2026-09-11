@@ -119,9 +119,16 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    // A shipped app must not pay for the per-block instruction counter (it is
+    // ~4% of runtime and nothing reads it here).  `-Dcount-instrs=true` opts
+    // back in for a profiling build.
+    const count_instrs_opt = b.option(bool, "count-instrs", "AOT: emit the per-block instruction counter") orelse false;
+    const count_instrs = b.addOptions();
+    count_instrs.addOption(bool, "count_instrs", count_instrs_opt);
     const gc_mod = b.createModule(.{ .root_source_file = b.path("vendor/zinc-vm/src/gc.zig"), .target = target, .optimize = optimize });
     const vm_mod = b.createModule(.{ .root_source_file = b.path("vendor/zinc-vm/src/vm.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "gc", .module = gc_mod }} });
     const aotrt_mod = b.createModule(.{ .root_source_file = b.path("tools/aot/runtime.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "gc", .module = gc_mod }, .{ .name = "vm", .module = vm_mod }} });
+    aotrt_mod.addOptions("count_instrs", count_instrs);
     const gui_model_mod = b.createModule(.{ .root_source_file = b.path("src/renderer/gui.zig"), .target = target, .optimize = optimize });
     const terminal_mod = b.createModule(.{ .root_source_file = b.path("src/renderer/terminal.zig"), .target = target, .optimize = optimize });
     terminal_mod.addImport("gui_model", gui_model_mod);
