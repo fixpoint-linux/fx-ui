@@ -166,7 +166,15 @@ pub fn main(init: std.process.Init) !void {
     // the C stack — the cap bounds native recursion at depth x frame-size,
     // and the interpreter (flat loop, pooled call frames) handles the deep
     // remainder identically.  Default 256 (see rt.nat_depth_max).
-    if (envUsize("AOT_NAT_DEPTH")) |nd| rt.nat_depth_max = @intCast(@min(nd, std.math.maxInt(u32)));
+    //
+    // CLAMPED to rt.SAFE_NAT_DEPTH_CAP: the cap is ALSO a correctness bound.
+    // Raising it past that runs native recursion the design does not trust,
+    // and MEASURED corrupts results — a selfhost corpus compile is correct at
+    // 256/512 but WRONG at 1024/6000 (see SAFE_NAT_DEPTH_CAP's comment).  The
+    // clamp makes AOT_NAT_DEPTH un-lower-able (it can only lower the depth at
+    // which fallback starts) rather than a knob that can silently break the
+    // program.
+    if (envUsize("AOT_NAT_DEPTH")) |nd| rt.nat_depth_max = @intCast(@min(nd, rt.SAFE_NAT_DEPTH_CAP));
 
     // ---- the bundle text: CLI arg, else the copy aotdump embedded ----
     const bundle_z: [:0]const u8 = if (bundle_arg) |path| blk: {

@@ -113,6 +113,20 @@ pub var nat_depth: u32 = 0;
 /// 256 x ~15KB Debug frames ~= 4MB, under the 8MB default stack (the crash
 /// repro died at 551 frames).
 pub var nat_depth_max: u32 = 256;
+
+/// The largest nat_depth_max KNOWN SAFE — a CORRECTNESS bound, not just a
+/// stack bound.  MEASURED 2026-09-29 on the selfhost corpus: the compiled
+/// typechecker recurses ~700 deep, and a corpus compile is CORRECT at
+/// nat_depth_max 256 and 512 but WRONG at 1024 and 6000 ("ShenError:
+/// non-exhaustive case").  It is not a stack overflow (the same run with a
+/// 4GB stack still fails) and not an out-of-bounds value-stack push (a
+/// ReleaseSafe build of the same emitted code asserts clean).  At 512 the
+/// deep recursion still FALLS BACK to the interpreter; at 1024 it completes
+/// NATIVELY — so the divergence is in the native path for a body recursing
+/// past ~512 frames, and it is MASKED whenever the body runs interpreted.
+/// 256 is the largest value with both invariants intact; run.zig clamps
+/// AOT_NAT_DEPTH here so it cannot be raised into the broken regime.
+pub const SAFE_NAT_DEPTH_CAP: u32 = 256;
 /// How many times the guard fired (stats line + the elided-fn assert
 /// relaxation: an elided fn skips its assertAllocStable iff a fallback
 /// fired anywhere in its dynamic extent, since vmExecEnv allocs).
