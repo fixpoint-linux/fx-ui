@@ -34,7 +34,7 @@
 
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SELFHOST_CSEXP="$ROOT/zig-out/selfhost.csexp"
 OPT="${SELFHOST_OPT:-Debug}"
 ENTRY="NativeMain.main"
@@ -125,18 +125,44 @@ jq -c --arg d "$tmp/self" '
 echo "selfhost-gate: compiling $ngroup groups via stock (node run.js --batch)"
 node "$ROOT/elm-compiler/run.js" --batch "$tmp/stock-manifest.json" 2>/dev/null
 
-# selfhost: translate the JSON manifest to NativeMain's line format
-# (one source path per line; each group terminated by '-> <output>') and run
-# the SELF-COMPILED compiler on it.
-jq -r '.groups[] | (.sources[] | .), "-> " + .output' "$tmp/self-manifest.json" > "$tmp/self.manifest"
-echo "selfhost-gate: compiling $ngroup groups via the selfhost binary"
-# M15 CONTRACT (handoff-elm-native-boot-plan M15): the compiler binary takes the
-# manifest path as argv[1]; NativeMain reads it (via the *argv* pseudo-global
-# run.zig installs / the Runtime.argv reader), Io.readFile's each source, calls
-# Lower.Module.compileBatch, and Io.writeFile's each group to its '-> out' path.
-# Compile failures land in the group's output path as "err <msg>" (run.js
-# parity); adjust if M15's NativeMain routes errors to a sibling .err instead.
-"$BIN" "$tmp/self.manifest"
+# selfhost: translate the JSON manifest to NativeMain's line format (one
+# source path per line, terminated by '-> <output>') and run the SELF-COMPILED
+# compiler on it.  The driver contract (tools/elmc.sh, tools/aot/run.zig) is
+# the M15 one: AOTRUN_ARGV hands the manifest path to NativeMain as *argv*,
+# AOTRUN_QUIET keeps the driver's final printValue off stdout.
+#
+# ONE INVOCATION PER GROUP, not a single whole-manifest batch: NativeMain
+# runs Lower.Module.compileBatch over EVERY group in one vmExecEnv entry, and
+# that whole-corpus entry exceeds any practical GC heap (>16GB live set
+# observed) and the VM's 5e9 interpreted-instruction budget per entry
+# (Type.Infer.inferExpr is stack-elided, so its deep recursion runs
+# interpreted REGARDLESS of AOT_NAT_DEPTH).  One group per process keeps each
+# entry inside both budgets — the same shape M15's elmc runs prove out.
+# Groups are independent (the same corpus is re-compiled per group), so they
+# run in parallel; compile failures land in the group's output path as
+# "err <msg>" (run.js parity) and the cmp loop below reports them as FAIL.
+for ((i=0; i<ngroup; i++)); do
+  jq -r --argjson i "$i" --arg d "$tmp/self" \
+    '.groups[$i] | (.sources[] | .), "-> " + ($d + "/g" + ($i|tostring) + ".csexp")' \
+    "$MANIFEST" > "$tmp/man.$i"
+done
+# Bounding is xargs -P (a shell `jobs -rp` throttle silently no-ops inside a
+# command substitution's subshell — its job table is empty — which once
+# fan-out-spawned every group at once and nearly OOM'd the host).
+# Heap: even ONE group's corpus+fixture compile through the (stack-elided,
+# interpreted) Type.Infer.inferExpr has a multi-GB live set — 1500MB pins in
+# GC thrash; 8GB headroom per lane keeps it collecting.  10 lanes x ~6GB
+# peaks ~60GB: safe on a 125GB host.
+cat > "$tmp/run-group.sh" <<'RG'
+#!/usr/bin/env bash
+# run one exact per-group manifest through the self-compiled compiler
+set -u
+bin="$1"; man="$2"
+AOTRUN_ARGV=1 AOTRUN_QUIET=1 ELMC_HEAP_MB="${ELMC_HEAP_MB:-8000}" \
+  AOT_NAT_DEPTH="${AOT_NAT_DEPTH:-64}" exec "$bin" "$man"
+RG
+chmod +x "$tmp/run-group.sh"
+printf '%s\n' "$tmp"/man.* | xargs -P "${SELFHOST_JOBS:-10}" -n1 "$tmp/run-group.sh" "$BIN" || true
 
 # ---- cmp every group: selfhost .csexp vs stock .csexp, byte-for-byte ----
 pass=0; fail=0
