@@ -23,15 +23,39 @@ module Zinc.Csexp exposing
 -- A LIST is  (elem elem ...)  with single-space separators, and a BUNDLE is a
 -- list of (name code) entries.
 --
--- The length prefix counts BYTES, not code points.  Elm's String.length counts
--- code points and is WRONG for the prefix whenever the value contains a
--- multi-byte UTF-8 character (é = 2 bytes, 🦀 = 4 bytes), so the emitter must
--- compute the UTF-8 byte length itself — utf8ByteLength below.
+-- The length prefix counts BYTES, not code points.  Under real Elm,
+-- String.length counts code points and is WRONG for the prefix whenever the
+-- value contains a multi-byte UTF-8 character (é = 2 bytes, 🦀 = 4 bytes),
+-- so the emitter must compute the UTF-8 byte length itself — utf8ByteLength
+-- below.
+
+
+{-| This module runs under TWO runtimes with opposite String semantics, and
+both must emit the same (byte-count) prefixes:
+
+  - real Elm (compiler.js on node): Strings are CODE-POINT indexed —
+    String.length "é" == 1, String.toList yields one Char per code point.
+  - the fx Zig VM (selfhost.csexp): Strings are BYTE indexed —
+    String.length "é" == 2 (the UTF-8 byte count) and String.toList yields
+    one Char per BYTE, so summing charUtf8Length over it would count every
+    continuation byte as 2 and over-count.
+
+The code-point sum is only correct under code-point semantics; under byte
+semantics String.length already IS the UTF-8 byte count.  Probe which runtime
+we are in by measuring a string whose two measures differ.
+-}
+stringIsByteIndexed : Bool
+stringIsByteIndexed =
+    String.length "é" == 2
 
 
 utf8ByteLength : String -> Int
 utf8ByteLength str =
-    List.sum (List.map charUtf8Length (String.toList str))
+    if stringIsByteIndexed then
+        String.length str
+
+    else
+        List.sum (List.map charUtf8Length (String.toList str))
 
 
 charUtf8Length : Char -> Int
