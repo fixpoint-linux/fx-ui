@@ -192,6 +192,15 @@ pub fn main(init: std.process.Init) !void {
     v.init(&g);
     defer v.deinit();
 
+    // ZINCVM_INSTR_LIMIT: the VM's hard instruction budget (C parity —
+    // $ZINCVM_INSTR_LIMIT, see state.Vm.instr_limit).  Default 5e9, which is
+    // PER vmExecEnv entry: a whole-manifest compiler batch (the corpus plus
+    // every fixture group) is one entry and legitimately exceeds it, aborting
+    // mid-run ("[HARD LIMIT] ... aborting").  Raising the budget here lets the
+    // whole batch run in ONE process — the corpus is then parsed/typechecked/
+    // lowered once instead of once per group.
+    if (envUsize("ZINCVM_INSTR_LIMIT")) |n| v.instr_limit = n;
+
     // ---- load the bundle (registers each entry as a defun) ----
     const loaded = parser.parseBundle(&g, &v.symbols, &v, bundle_z);
     if (loaded <= 0) {

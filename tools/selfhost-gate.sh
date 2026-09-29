@@ -24,19 +24,22 @@
 #
 # Usage: tools/selfhost-gate.sh
 # Env:
-#   SELFHOST_OPT        zig optimize mode (default Debug — see below)
+#   SELFHOST_OPT        zig optimize mode (default ReleaseFast — see below)
 #   SELFHOST_BIN        skip the build and use this existing compiler binary
 #
 # Optimize mode: the full selfhost closure is ~1550 AOT units -> an ~800K-line
-# gen.zig.  -Doptimize=Debug builds that in ~12s; ReleaseSmall/ReleaseFast take
-# 11+ minutes (one-time LLVM cost).  This is a CORRECTNESS gate, not a perf
-# benchmark, so Debug is the default.  Override SELFHOST_OPT for a perf run.
+# gen.zig.  -Doptimize=Debug builds that in ~12s but runs ~10x slower;
+# ReleaseFast takes ~7 minutes of one-time LLVM work.  The gate now runs the
+# WHOLE fixture manifest in ONE process (see step 4), so the RUN dominates:
+# ~55 min ReleaseFast vs ~9 h Debug, i.e. the 7-min build pays for itself many
+# times over.  ReleaseFast is therefore the default.  Use Debug only for a
+# quick syntax/debug pass on a reduced fixture set.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SELFHOST_CSEXP="$ROOT/zig-out/selfhost.csexp"
-OPT="${SELFHOST_OPT:-Debug}"
+OPT="${SELFHOST_OPT:-ReleaseFast}"
 ENTRY="NativeMain.main"
 
 command -v node >/dev/null 2>&1 || { echo "selfhost-gate: node not found" >&2; exit 2; }
@@ -131,38 +134,37 @@ node "$ROOT/elm-compiler/run.js" --batch "$tmp/stock-manifest.json" 2>/dev/null
 # the M15 one: AOTRUN_ARGV hands the manifest path to NativeMain as *argv*,
 # AOTRUN_QUIET keeps the driver's final printValue off stdout.
 #
-# ONE INVOCATION PER GROUP, not a single whole-manifest batch: NativeMain
-# runs Lower.Module.compileBatch over EVERY group in one vmExecEnv entry, and
-# that whole-corpus entry exceeds any practical GC heap (>16GB live set
-# observed) and the VM's 5e9 interpreted-instruction budget per entry
-# (Type.Infer.inferExpr is stack-elided, so its deep recursion runs
-# interpreted REGARDLESS of AOT_NAT_DEPTH).  One group per process keeps each
-# entry inside both budgets — the same shape M15's elmc runs prove out.
-# Groups are independent (the same corpus is re-compiled per group), so they
-# run in parallel; compile failures land in the group's output path as
+# THE WHOLE MANIFEST IN ONE PROCESS.  Lower.Module.compileBatch parses,
+# typechecks and lowers the fixed corpus ONCE per process, then compiles each
+# group against it; the corpus pass is the entire cost (~30 min, and it
+# dominates a fixture's own compile, which is ~10 s).  Running one process per
+# group therefore REPEATS the corpus pass 121 times.  One process for the whole
+# manifest pays it once: MEASURED 121 groups in 55 min, vs 121x ~30 min (~13 h
+# even at -P 10).  Compile failures land in the group's own output path as
 # "err <msg>" (run.js parity) and the cmp loop below reports them as FAIL.
-for ((i=0; i<ngroup; i++)); do
-  jq -r --argjson i "$i" --arg d "$tmp/self" \
-    '.groups[$i] | (.sources[] | .), "-> " + ($d + "/g" + ($i|tostring) + ".csexp")' \
-    "$MANIFEST" > "$tmp/man.$i"
-done
-# Bounding is xargs -P (a shell `jobs -rp` throttle silently no-ops inside a
-# command substitution's subshell — its job table is empty — which once
-# fan-out-spawned every group at once and nearly OOM'd the host).
-# Heap: even ONE group's corpus+fixture compile through the (stack-elided,
-# interpreted) Type.Infer.inferExpr has a multi-GB live set — 1500MB pins in
-# GC thrash; 8GB headroom per lane keeps it collecting.  10 lanes x ~6GB
-# peaks ~60GB: safe on a 125GB host.
-cat > "$tmp/run-group.sh" <<'RG'
-#!/usr/bin/env bash
-# run one exact per-group manifest through the self-compiled compiler
-set -u
-bin="$1"; man="$2"
-AOTRUN_ARGV=1 AOTRUN_QUIET=1 ELMC_HEAP_MB="${ELMC_HEAP_MB:-8000}" \
-  AOT_NAT_DEPTH="${AOT_NAT_DEPTH:-64}" exec "$bin" "$man"
-RG
-chmod +x "$tmp/run-group.sh"
-printf '%s\n' "$tmp"/man.* | xargs -P "${SELFHOST_JOBS:-10}" -n1 "$tmp/run-group.sh" "$BIN" || true
+#
+# Two budgets must be lifted for the whole-batch entry:
+#   * ELMC_HEAP_MB — the corpus + all groups have a multi-GB live set; 8 GB
+#     lets the GC keep collecting (1.5 GB thrashes).
+#   * ZINCVM_INSTR_LIMIT — the VM's hard per-entry budget defaults to 5e9, and
+#     the whole batch is ONE entry that legitimately exceeds it, aborting with
+#     "[HARD LIMIT] ... aborting" and writing no outputs.  (AOT_NAT_DEPTH is
+#     NOT relevant to this: Type.Infer.inferExpr is left INTERPRETED by aotdump
+#     — its value stack exceeds the 256-slot static limit — so it runs in
+#     interp.vmExecEnv regardless of the native-depth cap.)
+#
+# Outputs are keyed on the group INDEX: the manifest reuses output basenames
+# (e.g. `sub` is registered twice), so a basename-keyed manifest would have
+# groups overwrite each other and cmp the wrong bytes.
+jq -r --arg d "$tmp/self" \
+  '.groups | to_entries[] | (.value.sources[] | .), "-> " + ($d + "/g" + (.key|tostring) + ".csexp")' \
+  "$MANIFEST" > "$tmp/self.manifest"
+
+echo "selfhost-gate: compiling $ngroup groups via the SELF-COMPILED compiler (one process)"
+AOTRUN_ARGV=1 AOTRUN_QUIET=1 \
+  ELMC_HEAP_MB="${ELMC_HEAP_MB:-8000}" \
+  ZINCVM_INSTR_LIMIT="${ZINCVM_INSTR_LIMIT:-1000000000000}" \
+  "$BIN" "$tmp/self.manifest"
 
 # ---- cmp every group: selfhost .csexp vs stock .csexp, byte-for-byte ----
 pass=0; fail=0
