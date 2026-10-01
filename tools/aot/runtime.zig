@@ -164,12 +164,21 @@ pub var reg_count: usize = 0;
 /// source it records the partial's fresh code pointer -> the SAME target
 /// AotFn (a full apply of a partial runs the original body with env =
 /// captured ++ args, so the target fn is unchanged; a partial of a partial
-/// resolves transitively through lookup() before the build).  Slots are
-/// rootPushPtr'd at creation; on overflow the partial is simply left
-/// unregistered (correct — lookup() misses it and the interpreter runs it).
+/// resolves transitively through lookup() before the build).  On overflow the
+/// partial is simply left unregistered (correct — lookup() misses it and the
+/// interpreter runs it).  The whole pcode array is registered with the GC
+/// once at aotInit via registerTracedCode (see the generated aotInit), so
+/// every live slot is evacuated on every collect — a slot must NEVER be
+/// rootPushPtr'd from inside a native fn (that root is truncated by the
+/// frame's rootPopTo and lets a collected partial's code array be recycled
+/// into a later partial at the same address, aliasing the registry).
 pub var pfn: [REG_MAX]AotFn = undefined;
 pub var pcode: [REG_MAX]?*Instr = undefined;
-pub var pcount: usize = 0;
+// i32 (not usize) so &pcount can serve as the GC-registered traced-code length
+// pointer: the collector reads it LIVE at scan time, so every slot in [0,pcount)
+// is evacuated (kept alive + pointer-updated on move) on EVERY collect — the
+// permanent rooting the partial registry needs (see applyGeneric below).
+pub var pcount: i32 = 0;
 
 /// Linear scan: the closure's fresh-read code pointer vs each rooted slot.
 /// Precondition: cl.tag == .lambda.
@@ -180,7 +189,7 @@ pub fn lookup(cl: Value) ?AotFn {
         if (reg_code[i] == code) return reg_fn[i];
     }
     i = 0;
-    while (i < pcount) : (i += 1) {
+    while (i < @as(usize, @intCast(pcount))) : (i += 1) {
         if (pcode[i] == code) return pfn[i];
     }
     return null;
@@ -605,10 +614,21 @@ pub fn applyGeneric(
         const target = lookup(cl.*);
         cl.* = interp.buildPartialClosure(g, cl, argbuf, nargs.*);
         if (target) |f| {
+            // The new pcode slot is rooted by the array-wide registerTracedCode
+            // at aotInit, NOT by a rootPushPtr here: a root pushed inside a
+            // native aot_ fn is transient (the frame's `defer rootPopTo(wm)`
+            // truncates the shadow stack past it on exit), so once the partial
+            // closure is collected its drop-grabs code array gets recycled and
+            // the stale pcode pointer ALIASES a later partial built at the same
+            // address — lookup() then returns this slot's (wrong) pfn for a
+            // different closure (the wrong-function-entered corruption).  The
+            // registerTracedCode walker evacuates every live slot on every
+            // collect, independent of the shadow-stack watermark.  No alloc
+            // occurs between the write and pcount += 1, so the not-yet-counted
+            // slot is still safe across a collect.
             if (pcount < REG_MAX) {
-                pcode[pcount] = cl.*.payload.lambda.code;
-                pfn[pcount] = f;
-                g.rootPushPtr(@ptrCast(&pcode[pcount]));
+                pcode[@intCast(pcount)] = cl.*.payload.lambda.code;
+                pfn[@intCast(pcount)] = f;
                 pcount += 1;
             }
         }

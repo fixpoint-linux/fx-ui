@@ -946,6 +946,14 @@ fn emit(
     }
     try out.print(a, "    rt.reg_count = {d};\n", .{defuns.len + curs.len});
     try out.appendSlice(a, "    for (0..N_AOT) |i| g.rootPushPtr(@ptrCast(&rt.reg_code[i]));\n");
+    // The partial-application registry (rt.pcode) needs PERMANENT rooting: a
+    // rootPushPtr inside a native aot_ fn would be truncated by that frame's
+    // `defer rootPopTo(wm)`, letting a collected partial's code array be
+    // recycled and its stale pcode pointer alias a later partial (wrong fn
+    // resolved by lookup).  registerTracedCode evacuates every live slot on
+    // EVERY collect, independent of the shadow-stack watermark — the same
+    // permanent-rooting contract reg_code gets from its aotInit-level pushes.
+    try out.appendSlice(a, "    g.registerTracedCode(@ptrCast(&rt.pcode), &rt.pcount);\n");
     try out.appendSlice(a, "}\n\n");
     try out.print(a, "const N_AOT = {d};\n\n", .{defuns.len + curs.len});
 
