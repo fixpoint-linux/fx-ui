@@ -277,7 +277,28 @@ pub fn main(init: std.process.Init) !void {
             "calls={d} total_ns={d} max_ns={d} vmexec_fb={d} elided={d} stack_env={d} depth_fb={d}\n",
             .{ apply_count, apply_total_ns, apply_max_ns, rt.vmexec_fallbacks, rt.elided_calls, rt.stack_env_calls, rt.depth_fallbacks },
         );
-        std.Io.Dir.writeFile(.cwd(), io, .{ .sub_path = path, .data = line }) catch {};
+        // Second line: the GC snapshot at exit (heap.zig Stats) — attributes
+        // the run between collection-walk vs mutator-alloc work.  The two
+        // dirty_vectors_* fields are plain Gc fields, not in Stats.
+        var gbuf: [512]u8 = undefined;
+        const s = g.stats();
+        const gline = try std.fmt.bufPrint(
+            &gbuf,
+            "gc: scavenges={d} (preemptive={d} reactive={d}) pages_reclaimed={d} full_collects={d} allocated_pages={d} alloc_class={d},{d},{d},{d},{d} dirty_vectors_fired={d} dirty_defuns_fired={d} dirty_defuns_scanned={d} dirty_vectors_count={d} dirty_vectors_overflow={}\n",
+            .{
+                s.nursery_scavenge_count, s.preemptive_scavenge_count,
+                s.reactive_scavenge_count, s.nursery_pages_reclaimed,
+                s.full_collect_count,     s.allocated_pages,
+                s.alloc_class_count[0],   s.alloc_class_count[1],
+                s.alloc_class_count[2],   s.alloc_class_count[3],
+                s.alloc_class_count[4],   s.dirty_vectors_fired,
+                s.dirty_defuns_fired,     s.dirty_defuns_scanned,
+                g.dirty_vectors_count,    g.dirty_vectors_overflow,
+            },
+        );
+        var both: [768]u8 = undefined;
+        const all = try std.fmt.bufPrint(&both, "{s}{s}", .{ line, gline });
+        std.Io.Dir.writeFile(.cwd(), io, .{ .sub_path = path, .data = all }) catch {};
     }
 }
 
