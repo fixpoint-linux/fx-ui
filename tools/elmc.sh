@@ -49,8 +49,14 @@ fi
 
 export AOTRUN_ARGV=1
 export AOTRUN_QUIET=1
-if [ -n "${ELMC_HEAP_MB:-}" ]; then
-  export ELMC_HEAP_MB
-fi
+
+# ELMC_HEAP_MB — the compiler's GC heap.  Measured on the corpus compile
+# (2026-10-02): time SCALES WITH HEAP SIZE because a nursery scavenge walks the
+# old-gen live set (O(heap)), so a smaller heap is faster.  Curve (one corpus
+# compile): 1000MB=25m35s (past the knee — full collects thrash), 1500MB=21m31s
+# (fastest), 2000MB=22m05s, 4000MB=25m58s, 8000MB=~35m, 16000MB=62m.  2000 sits
+# just above the ~1500MB knee with headroom for large groups — the previous
+# hard-coded 8000 was ~40% slower.  Override for a bigger/smaller working set.
+export ELMC_HEAP_MB="${ELMC_HEAP_MB:-2000}"
 
 exec "$BIN" "$@"
