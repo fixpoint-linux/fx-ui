@@ -777,10 +777,37 @@ charToCode c =
     charCode c 0
 
 
--- TRUSTED: shen.bytes->string of a 1-element list is the 1-byte char.
+-- TRUSTED: shen.bytes->string of the byte list.  n <= 0xFF keeps the
+-- historical ONE-BYTE Char (String.toList/fromList round-trip over raw
+-- source bytes depends on it); n > 0xFF encodes the code point as UTF-8 —
+-- real Elm's Char carries a code point, and \u{4E00}-style escapes in
+-- string literals must lower to the same bytes stock emits (a truncated
+-- single byte diverges the S atom).
 charFromCode : Int -> Char
 charFromCode n =
-    bytesToString (n :: [])
+    if n <= 255 then
+        bytesToString (n :: [])
+
+    else if n <= 2047 then
+        bytesToString
+            ((192 + n // 64) :: (128 + modBy 64 n) :: [])
+
+    else if n <= 65535 then
+        bytesToString
+            ((224 + n // 4096)
+                :: (128 + modBy 64 (n // 64))
+                :: (128 + modBy 64 n)
+                :: []
+            )
+
+    else
+        bytesToString
+            ((240 + n // 262144)
+                :: (128 + modBy 64 (n // 4096))
+                :: (128 + modBy 64 (n // 64))
+                :: (128 + modBy 64 n)
+                :: []
+            )
 
 
 -- One Char per byte (see the header note: byte semantics, not code points).
@@ -848,9 +875,231 @@ stringEndsWith suffix s =
 
 -- TRUSTED: the 1-arg `str` prim renders any scalar (a Float here) to its
 -- decimal text.
+-- JS Number::toString parity (the selfhost csexp F atom must render EXACTLY
+-- like real Elm's String.fromFloat, which is JS).  The VM `str` prim gives
+-- the correct SHORTEST-ROUNDTRIP DIGITS but always in fixed notation with a
+-- mandatory ".0" on integrals; this re-renders those digits in JS's form:
+-- exponential iff k > 21 or k <= -6 (k = decimal weight of the first
+-- significant digit), "d.ddd" / "0.00ddd" / plain digits otherwise.  NaN and
+-- the infinities pass through unchanged (same spellings in both).
 stringFromFloat : Float -> String
 stringFromFloat f =
-    strPrim f
+    jsFloatText (strPrim f)
+
+
+-- JS Number::toString parity over the `str` prim's text (see the note above
+-- stringFromFloat).  Non-decimal texts (NaN / Infinity) pass through as-is:
+-- both runtimes spell them identically.
+jsFloatText : String -> String
+jsFloatText text =
+    let
+        len =
+            String.length text
+    in
+    if len == 0 then
+        text
+
+    else if charCode text 0 == 45 then
+        -- "-" sign (a decimal negative, or -Infinity)
+        if len > 1 && 48 <= charCode text 1 && charCode text 1 <= 57 then
+            String.append "-" (jsFloatUnsigned text 1 len)
+
+        else
+            text
+
+    else if 48 <= charCode text 0 && charCode text 0 <= 57 then
+        jsFloatUnsigned text 0 len
+
+    else
+        -- NaN / Infinity
+        text
+
+
+jsFloatUnsigned : String -> Int -> Int -> String
+jsFloatUnsigned text at end =
+    let
+        intEnd =
+            digitsEnd text at end
+
+        fracEnd =
+            if charCode text intEnd == 46 then
+                digitsEnd text (intEnd + 1) end
+
+            else
+                intEnd
+    in
+    jsFloatDigits text at intEnd fracEnd
+
+
+digitsEnd : String -> Int -> Int -> Int
+digitsEnd text i end =
+    if i < end && 48 <= charCode text i && charCode text i <= 57 then
+        digitsEnd text (i + 1) end
+
+    else
+        i
+
+
+-- digits [at, fracEnd) with the '.' at intEnd skipped: LOGICAL digit index
+-- space (0 = first int digit).  intCount = digits before the point; a digit
+-- at logical i is at byte at+i while i < intCount, else at intEnd+1+(i-intCount).
+jsFloatDigits : String -> Int -> Int -> Int -> String
+jsFloatDigits text at intEnd fracEnd =
+    let
+        intCount =
+            intEnd - at
+
+        hasFrac =
+            fracEnd > intEnd
+
+        digitCount =
+            intCount
+                + (if hasFrac then
+                    fracEnd - intEnd - 1
+
+                   else
+                    0
+                  )
+
+        digitAt i =
+            if i < intCount then
+                charCode text (at + i)
+
+            else
+                charCode text (intEnd + 1 + (i - intCount))
+
+        firstSig =
+            jsFirstSignificantDigit digitAt digitCount 0
+
+        lastSig =
+            jsLastSignificantDigit digitAt digitCount (digitCount - 1)
+    in
+    if firstSig == -1 then
+        "0"
+
+    else
+        let
+            k =
+                intCount - firstSig
+
+            n =
+                lastSig - firstSig + 1
+
+            sig =
+                jsSigOfDigits digitAt firstSig lastSig 0
+        in
+        if k > 21 || k <= -6 then
+            jsExponential sig n k
+
+        else
+            jsFixed sig n k
+
+
+-- first logical digit index whose value is not "0" (-1 when all zeros)
+jsFirstSignificantDigit : (Int -> Int) -> Int -> Int -> Int
+jsFirstSignificantDigit digitAt count i =
+    if i >= count then
+        -1
+
+    else if digitAt i == 48 then
+        jsFirstSignificantDigit digitAt count (i + 1)
+
+    else
+        i
+
+
+-- last logical digit index whose value is not "0" (trailing zeros stripped)
+jsLastSignificantDigit : (Int -> Int) -> Int -> Int -> Int
+jsLastSignificantDigit digitAt count i =
+    if i < 0 then
+        -1
+
+    else if digitAt i == 48 then
+        jsLastSignificantDigit digitAt count (i - 1)
+
+    else
+        i
+
+
+-- significand of digits [from, to] inclusive (both logical indices)
+jsSigOfDigits : (Int -> Int) -> Int -> Int -> Int -> Int
+jsSigOfDigits digitAt from to acc =
+    if from > to then
+        acc
+
+    else
+        jsSigOfDigits digitAt (from + 1) to (acc * 10 + (digitAt from - 48))
+
+
+-- digits (as Int significand), n = digit count, k = weight of d1: JS fixed
+-- notation.  intPart = d1..dk, frac = dk+1..dn (or zeros when k >= n).
+jsFixed : Int -> Int -> Int -> String
+jsFixed sig n k =
+    if k <= 0 then
+        String.append "0."
+            (String.append (zeroRun (0 - k)) (intDigits sig n 0))
+
+    else if k < n then
+        String.append (intDigits (sig // pow10 (n - k)) k 0)
+            (String.append "." (intDigits (modBy (pow10 (n - k)) sig) (n - k) 0))
+
+    else
+        String.append (intDigits sig n 0) (zeroRun (k - n))
+
+
+-- exponential: d1 [. d2..dn] e (+|-) (k-1)
+jsExponential : Int -> Int -> Int -> String
+jsExponential sig n k =
+    String.append (intDigits (sig // pow10 (n - 1)) 1 0)
+        (String.append
+            (if n > 1 then
+                String.append "." (intDigits (modBy (pow10 (n - 1)) sig) (n - 1) 0)
+
+             else
+                ""
+            )
+            (String.append "e"
+                (if k - 1 >= 0 then
+                    String.append "+" (fromInt (k - 1))
+
+                 else
+                    fromInt (k - 1)
+                )
+            )
+        )
+
+
+zeroRun : Int -> String
+zeroRun count =
+    if count <= 0 then
+        ""
+
+    else
+        String.append "0" (zeroRun (count - 1))
+
+
+-- decimal digits of a non-negative Int, padded WITH leading zeros to width.
+intDigits : Int -> Int -> Int -> String
+intDigits value width depth =
+    if value < 10 then
+        if width - depth > 1 then
+            String.append "0" (intDigits value width (depth + 1))
+
+        else
+            stringFromChar (charFromCode (48 + value))
+
+    else
+        String.append (intDigits (value // 10) width (depth + 1))
+            (stringFromChar (charFromCode (48 + modBy 10 value)))
+
+
+pow10 : Int -> Int
+pow10 n =
+    if n <= 0 then
+        1
+
+    else
+        10 * pow10 (n - 1)
 
 
 -- String.fromList over the byte-level Char model (each Char is one byte).
@@ -918,12 +1167,158 @@ stringFoldr f z s =
     foldr f z (stringToList s)
 
 
--- Float-literal parsing (ParserFast) has no VM string->float hostcall yet;
--- returns Nothing until that lands.  The selfhost group only needs this to
--- COMPILE (M14's goal); runtime float parsing is M15+.
+-- 10^n as an exact Float (10^k is f64-exact through k = 22; larger n is a
+-- product of exact factors — exactness is not required there, only use as a
+-- division denominator when <= 22).
+pow10Float : Int -> Float
+pow10Float n =
+    if n <= 0 then
+        1
+
+    else if n > 22 then
+        pow10Float 22 * pow10Float (n - 22)
+
+    else
+        pow10FloatExact n
+
+
+pow10FloatExact : Int -> Float
+pow10FloatExact n =
+    if n == 0 then
+        1
+
+    else
+        10 * pow10FloatExact (n - 1)
+
+
+-- Decimal -> Float over the grammar ParserFast pre-validates
+-- (digits [ '.' digits ] [ ('e'|'E') ['+'|'-'] digits ]).  Byte semantics:
+-- scan with charCode, never String.toList.  Correct rounding = ONE f/
+-- division of two exact f64 operands: an integer significand N (exact in
+-- f64, so at most 2^53) and 10^scale (exact through scale = 22).  IEEE
+-- division rounds once, so N / 10^scale is the correctly-rounded value of
+-- the decimal — bit-identical to JS's unary + and real Elm's String.toFloat
+-- on this grammar.  A negative final scale (exponent overcame the fraction,
+-- e.g. 15e2) folds the shift into the significand (still one division; the
+-- shifted integer stays exact while it fits 2^53).  Returns Nothing outside
+-- the grammar (real Elm's toFloat parity for malformed input).  The walkers
+-- are TOP-LEVEL: let-bound functions cannot see their own name, so
+-- self-recursion must live at module scope.
 stringToFloat : String -> Maybe Float
 stringToFloat s =
-    Nothing
+    let
+        len =
+            String.length s
+    in
+    if len == 0 || not (48 <= charCode s 0 && charCode s 0 <= 57) then
+        Nothing
+
+    else
+        case floatSignificandScale s len 0 False 0 0 of
+            Nothing ->
+                Nothing
+
+            Just ( value, scale, at ) ->
+                if at >= len then
+                    floatCombine value scale 0
+
+                else if charCode s at == 101 || charCode s at == 69 then
+                    let
+                        first =
+                            at + 1
+
+                        afterSign =
+                            if charCode s first == 43 || charCode s first == 45 then
+                                first + 1
+
+                            else
+                                first
+
+                        negated =
+                            charCode s first == 45
+                    in
+                    if afterSign >= len || not (48 <= charCode s afterSign && charCode s afterSign <= 57) then
+                        Nothing
+
+                    else
+                        case floatExponentValue s len afterSign 0 of
+                            Nothing ->
+                                Nothing
+
+                            Just exponent ->
+                                floatCombine value scale
+                                    (if negated then 0 - exponent else exponent)
+
+                else
+                    Nothing
+
+
+-- significand and decimal scale of digits [j, len), stopping at the first
+-- non-digit; returns (value, scale, offsetStoppedAt).  fracSeen guards the
+-- single '.'; each fraction digit INCREMENTS the scale, so `scale` is the
+-- positive power of ten the significand must be divided by (floatCombine's
+-- convention: value * 10^exponent / 10^scale).
+floatSignificandScale : String -> Int -> Int -> Bool -> Int -> Int -> Maybe ( Int, Int, Int )
+floatSignificandScale s len j fracSeen value scale =
+    if j >= len then
+        Just ( value, scale, j )
+
+    else if charCode s j == 46 then
+        -- '.' must introduce a fraction digit run (no "1." / "1..2")
+        if fracSeen || not (48 <= charCode s (j + 1) && charCode s (j + 1) <= 57) then
+            Nothing
+
+        else
+            floatSignificandScale s len (j + 1) True value scale
+
+    else if 48 <= charCode s j && charCode s j <= 57 then
+        floatSignificandScale s len (j + 1) fracSeen
+            (value * 10 + (charCode s j - 48))
+            (if fracSeen then scale + 1 else scale)
+
+    else
+        Just ( value, scale, j )
+
+
+-- unsigned exponent digits [j, len)
+floatExponentValue : String -> Int -> Int -> Int -> Maybe Int
+floatExponentValue s len j acc =
+    if j >= len then
+        Just acc
+
+    else if 48 <= charCode s j && charCode s j <= 57 then
+        floatExponentValue s len (j + 1) (acc * 10 + (charCode s j - 48))
+
+    else
+        Nothing
+
+
+-- value * 10^exponent / 10^scale as ONE exact-operand division
+floatCombine : Int -> Int -> Int -> Maybe Float
+floatCombine value scale exponent =
+    let
+        total =
+            scale - exponent
+    in
+    if total <= 0 then
+        floatShiftedDivide value (0 - total) 1
+
+    else if total <= 22 then
+        Just (basicsToFloat value / pow10Float total)
+
+    else
+        -- fraction deeper than 22: shift the significand (stays exact while
+        -- it fits 2^53) and divide by 10^22
+        floatShiftedDivide value (total - 22) (pow10Float 22)
+
+
+floatShiftedDivide : Int -> Int -> Float -> Maybe Float
+floatShiftedDivide value shift denominator =
+    if shift <= 0 then
+        Just (basicsToFloat value / denominator)
+
+    else
+        floatShiftedDivide (value * 10) (shift - 1) denominator
 
 
 charIsLower : Char -> Bool
