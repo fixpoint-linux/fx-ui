@@ -34,16 +34,16 @@ if [ ! -x "$BIN" ]; then
     exit 2
   fi
   echo "elmc: building $BIN (aot-build NativeMain + selfhost group)..." >&2
-  # ELMC_BUILD_MODE: -O for aot-build.  Default Debug — the optimised modes
-  # (ReleaseFast/ReleaseSafe) take many minutes on the full-closure gen.zig
-  # (LLVM on ~550K emitted lines) while Debug builds it in seconds, and this
-  # binary exists to exercise the compiler, not to be fast.  Set
-  # ELMC_BUILD_MODE=ReleaseFast for a performance build.
+  # ELMC_BUILD_MODE: -O for aot-build.  Default ReleaseFast: the compiler is a
+  # binary you RUN (often repeatedly), and a Debug build is ~10x slower at
+  # runtime (it is the whole point of elmc to be usable); the one-time ~9 min
+  # LLVM cost on the full-closure gen.zig is worth it.  Set
+  # ELMC_BUILD_MODE=Debug only for a quick syntax/debug build.
   "$ROOT/tools/aot/aot-build.sh" \
     "$ROOT/elm-compiler/selfhost/NativeMain.elm" \
     --group "$ROOT/elm-compiler/selfhost/manifest.json" \
     --entry NativeMain.main \
-    -O "${ELMC_BUILD_MODE:-Debug}" \
+    -O "${ELMC_BUILD_MODE:-ReleaseFast}" \
     -o "$BIN"
 fi
 
