@@ -191,59 +191,134 @@ compose s1 s2 =
 {-| Apply a substitution to a type to fixpoint (zonk).  A `TVar` bound to
 another type is replaced and the result re-zonked; a bound row variable is
 spliced into its enclosing row's field list.
+
+A subtree the substitution cannot change is returned UNCHANGED — the shared
+original node, not a fresh copy.  Types are immutable and Elm has no reference
+identity, so sharing is observably identical to rebuilding; it just skips
+allocating a copy of every untouched node on every zonk.  The touch test is
+variable MEMBERSHIP itself, so an unbound leaf pays only the same `Dict` miss
+the `TVar` arm would.
 -}
 zonk : Subst -> Type -> Type
 zonk s t =
-    case t of
-        TVar v ->
-            case Dict.get v.id s of
-                Just t2 ->
-                    zonk s t2
+    if Dict.isEmpty s then
+        -- Nothing is bound anywhere, so no type can change.
+        t
 
-                Nothing ->
+    else
+        case t of
+            TVar v ->
+                case Dict.get v.id s of
+                    Just t2 ->
+                        zonk s t2
+
+                    Nothing ->
+                        t
+
+            TCon name args ->
+                if substTouches s args then
+                    TCon name (List.map (zonk s) args)
+
+                else
                     t
 
-        TCon name args ->
-            TCon name (List.map (zonk s) args)
+            TFun a b ->
+                if typeTouches s a || typeTouches s b then
+                    TFun (zonk s a) (zonk s b)
 
-        TFun a b ->
-            TFun (zonk s a) (zonk s b)
+                else
+                    t
 
-        TTuple ts ->
-            TTuple (List.map (zonk s) ts)
+            TTuple ts ->
+                if substTouches s ts then
+                    TTuple (List.map (zonk s) ts)
 
-        TRecord row ->
-            TRecord (zonkRow s row)
+                else
+                    t
+
+            TRecord row ->
+                if rowTouches s row then
+                    TRecord (zonkRow s row)
+
+                else
+                    t
 
 
 {-| Zonk a row: zonk each field type, then splice a bound row tail.
 -}
 zonkRow : Subst -> Row -> Row
 zonkRow s row =
-    let
-        fields =
-            List.map (\( n, t ) -> ( n, zonk s t )) row.fields
-    in
-    case row.tail of
+    if rowTouches s row then
+        let
+            fields =
+                List.map (\( n, t ) -> ( n, zonk s t )) row.fields
+        in
+        case row.tail of
+            REmpty ->
+                { fields = fields, tail = REmpty }
+
+            RVar v ->
+                case Dict.get v.id s of
+                    Just (TRecord bound) ->
+                        -- A row variable bound to a Row expands into that row's
+                        -- (zonked) fields with its tail becoming ours.
+                        let
+                            spliced =
+                                zonkRow s bound
+                        in
+                        { fields = fields ++ spliced.fields
+                        , tail = spliced.tail
+                        }
+
+                    _ ->
+                        -- Unbound (or a kind violation, which the unifier forbids).
+                        { fields = fields, tail = RVar v }
+
+    else
+        row
+
+
+-- Touch tests for the zonk short-circuit: does the substitution bind ANY
+-- variable occurring in the type/row?  Like `occurs`, these walks allocate
+-- nothing (a miss is one `Dict` branch).
+
+
+typeTouches : Subst -> Type -> Bool
+typeTouches s t =
+    case t of
+        TVar v ->
+            Dict.member v.id s
+
+        TCon _ args ->
+            substTouches s args
+
+        TFun a b ->
+            typeTouches s a || typeTouches s b
+
+        TTuple ts ->
+            substTouches s ts
+
+        TRecord row ->
+            rowTouches s row
+
+
+substTouches : Subst -> List Type -> Bool
+substTouches s ts =
+    List.any (typeTouches s) ts
+
+
+rowTouches : Subst -> Row -> Bool
+rowTouches s row =
+    (case row.tail of
         REmpty ->
-            { fields = fields, tail = REmpty }
+            False
 
         RVar v ->
-            case Dict.get v.id s of
-                Just (TRecord bound) ->
-                    -- A row variable bound to a Row expands into that row's
-                    -- (zonked) fields with its tail becoming ours.
-                    let
-                        spliced =
-                            zonkRow s bound
-                    in
-                    { fields = fields ++ spliced.fields
-                    , tail = spliced.tail
-                    }
-
-                _ ->
-                    -- Unbound (or a kind violation, which the unifier forbids).
-                    { fields = fields, tail = RVar v }
+            -- A bound tail SPLICES into the enclosing row, so it forces a
+            -- rebuild on its own (never short-circuit past a row splice).
+            Dict.member v.id s
+    )
+        || List.any (\( _, t ) -> typeTouches s t) row.fields
 
 
 
