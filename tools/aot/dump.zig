@@ -161,7 +161,7 @@ pub fn main(init: std.process.Init) !void {
                 std.debug.print("aotdump: warning: '{s}' has an unknown prim — left interpreted\n", .{d.name});
                 continue;
             }
-            d.maxd = stackDepth(@ptrCast(d.code.?), d.code_len) orelse {
+            d.maxd = (try stackDepth(a, @ptrCast(d.code.?), d.code_len)) orelse {
                 std.debug.print("aotdump: warning: '{s}' needs a value stack beyond the {d}-slot static limit — left interpreted\n", .{ d.name, STK_MAX });
                 continue;
             };
@@ -187,7 +187,7 @@ pub fn main(init: std.process.Init) !void {
                 continue;
             }
             if (indexOfCode(kept_codes.items, c.parent_code) == null) continue; // orphaned
-            c.maxd = stackDepth(@ptrCast(c.code.?), c.code_len) orelse {
+            c.maxd = (try stackDepth(a, @ptrCast(c.code.?), c.code_len)) orelse {
                 std.debug.print("aotdump: warning: '{s}' needs a value stack beyond the {d}-slot static limit — left interpreted\n", .{ c.name, STK_MAX });
                 continue;
             };
@@ -396,10 +396,6 @@ fn constIndex(consts: []const Const, is_string: bool, text: []const u8) usize {
 /// in ReleaseFast (ipush's Debug assert is stripped).
 const STK_MAX: i32 = 256;
 
-/// The sim's heights/worklist array size: a body longer than this cannot be
-/// statically sized at all.
-const SIM_LIMIT: usize = 512;
-
 /// The lex[] C-stack array cap for lex-frame bodies (arity + live lets).  A
 /// body whose env-height sim proves a max height above this keeps the
 /// env-array path — never clamp down (an undersized lex[] is a silent OOB
@@ -407,15 +403,16 @@ const SIM_LIMIT: usize = 512;
 const LEX_MAX: i32 = 64;
 
 /// Fixed value-stack size for one body (sim maxd + slack), or null when the
-/// emitter cannot statically size it: body longer than SIM_LIMIT, worklist
-/// overflow (unbounded relaxation), or depth beyond STK_MAX.  The caller
-/// leaves null units interpreted.
-fn stackDepth(code: [*]Instr, len: i32) ?i32 {
-    if (@as(usize, @intCast(len)) > SIM_LIMIT) return null;
-    var heights: [SIM_LIMIT]i32 = undefined;
-    @memset(&heights, -1); // -1 = unvisited
+/// emitter cannot statically size it: worklist overflow (unbounded relaxation)
+/// or depth beyond STK_MAX.  The caller leaves null units interpreted.
+fn stackDepth(a: Allocator, code: [*]Instr, len: i32) Allocator.Error!?i32 {
+    if (len <= 0) return null;
+    const heights = a.alloc(i32, @intCast(len)) catch return error.OutOfMemory;
+    defer a.free(heights);
+    @memset(heights, -1); // -1 = unvisited
     heights[0] = 0;
-    var wl: [SIM_LIMIT]i32 = undefined;
+    const wl = a.alloc(i32, @intCast(len)) catch return error.OutOfMemory;
+    defer a.free(wl);
     var wl_len: usize = 0;
     wl[wl_len] = 0;
     wl_len += 1;
@@ -500,7 +497,7 @@ fn stackDepth(code: [*]Instr, len: i32) ?i32 {
             if (t < 0 or t >= len) continue; // bogus target — belt-and-braces
             if (succ_h[s] > heights[@intCast(t)]) {
                 heights[@intCast(t)] = succ_h[s];
-                if (wl_len >= wl.len) return null; // relaxation overflow: unsizable
+                if (wl_len >= wl.len) return null; // relaxation overflow: unsizable (arena-freed)
                 wl[wl_len] = t;
                 wl_len += 1;
             }
@@ -527,16 +524,17 @@ fn stackDepth(code: [*]Instr, len: i32) ?i32 {
 /// allocate; the plan's draft allowlist listed it, but the plan's own rule
 /// ("any throwing prim is OUT") excludes it.
 const PURE_PRIMS = [_][]const u8{
-    "hd", "tl", "=", "empty?",
-    "+", "/", "f/", "*", "-",
-    ">", "<", ">=", "<=",
-    "bitwise-and", "bitwise-or", "bitwise-xor", "bitwise-not",
-    "bitwise-shift-left", "bitwise-shift-right", "bitwise-shift-right-zf",
-    "number?", "string?", "symbol?", "boolean?", "cons?",
-    "absvector?", "function?", "error?", "stream?", "variable?",
-    "element?", "c-strlen", "char-code", "string->n",
-    "address->", "<-address", "fst", "snd",
-    "get-time", "intern", "set", "value",
+    "hd",          "tl",                 "=",                   "empty?",
+    "+",           "/",                  "f/",                  "*",
+    "-",           ">",                  "<",                   ">=",
+    "<=",          "bitwise-and",        "bitwise-or",          "bitwise-xor",
+    "bitwise-not", "bitwise-shift-left", "bitwise-shift-right", "bitwise-shift-right-zf",
+    "number?",     "string?",            "symbol?",             "boolean?",
+    "cons?",       "absvector?",         "function?",           "error?",
+    "stream?",     "variable?",          "element?",            "c-strlen",
+    "char-code",   "string->n",          "address->",           "<-address",
+    "fst",         "snd",                "get-time",            "intern",
+    "set",         "value",
 };
 // gensym/newvar are deliberately OUT: both pop-if-present under the
 // nullary-call convention (primGensym/primNewvar), so their runtime stack
@@ -567,8 +565,7 @@ const PathState = struct {
 
 fn recordArg(counts: []i32, pc: i32, argc: i32) void {
     const i: usize = @intCast(pc);
-    if (counts[i] == ARG_UNSET) counts[i] = argc
-    else if (counts[i] != argc) counts[i] = ARG_AMBIG;
+    if (counts[i] == ARG_UNSET) counts[i] = argc else if (counts[i] != argc) counts[i] = ARG_AMBIG;
 }
 
 fn pushState(a: Allocator, visited: *std.AutoHashMap(PathState, void), wl: *std.ArrayList(PathState), s: PathState) !void {
@@ -737,8 +734,7 @@ fn structurallyEligible(d: Defun, defuns: []const Defun) bool {
             // op not listed here — including future additions to Opcode — is
             // rejected at the structural layer, so analyzeArgCounts never has
             // to guess a successor for an op it doesn't model.
-            .number, .string, .symbol, .boolean, .float,
-            .access, .global, .pushmark, .jmp, .jmpf, .ret => {},
+            .number, .string, .symbol, .boolean, .float, .access, .global, .pushmark, .jmp, .jmpf, .ret => {},
             else => return false,
         }
     }
@@ -1004,17 +1000,18 @@ fn nativeFrameEligible(code: [*]Instr, code_len: i32, arity: i32, self_slot: usi
 /// delta here is silent wrong VALUES, not a crash).
 const LexPlan = struct {
     max_d: i32, // max live-lets delta (for the array bound: arity + max_d)
-    heights: [SIM_LIMIT]i32, // -1 = unvisited, -2 = ambiguous join
+    n: i32, // body length covered by heights (== code_len at plan time)
+    heights: []i32, // -1 = unvisited, -2 = ambiguous join (caller-freed)
 };
 
 /// Static live-lets-delta simulation over the leader/branch graph.  Returns
 /// null when the delta cannot be proven unique/bounded.
-fn lexPlan(code: [*]Instr, len: i32, arity: i32) ?LexPlan {
-    if (@as(usize, @intCast(len)) > SIM_LIMIT) return null;
-    var heights: [SIM_LIMIT]i32 = undefined;
-    @memset(&heights, -1); // -1 = unvisited, -2 = ambiguous join
+fn lexPlan(a: Allocator, code: [*]Instr, len: i32, arity: i32) Allocator.Error!?LexPlan {
+    if (len <= 0) return null;
+    const heights = a.alloc(i32, @intCast(len)) catch return error.OutOfMemory;
+    @memset(heights, -1); // -1 = unvisited, -2 = ambiguous join
     heights[0] = 0;
-    var wl: [SIM_LIMIT]i32 = undefined;
+    const wl = a.alloc(i32, @intCast(len)) catch return error.OutOfMemory;
     var wl_len: usize = 0;
     wl[wl_len] = 0;
     wl_len += 1;
@@ -1106,7 +1103,11 @@ fn lexPlan(code: [*]Instr, len: i32, arity: i32) ?LexPlan {
                 // wrong VALUES, so this must not be skipped.
                 if (heights[@intCast(t)] != -2) {
                     heights[@intCast(t)] = -2;
-                    if (wl_len >= wl.len) return null; // relaxation overflow
+                    if (wl_len >= wl.len) { // relaxation overflow
+                        a.free(heights);
+                        a.free(wl);
+                        return null;
+                    }
                     wl[wl_len] = t;
                     wl_len += 1;
                 }
@@ -1116,7 +1117,11 @@ fn lexPlan(code: [*]Instr, len: i32, arity: i32) ?LexPlan {
             const prev = heights[@intCast(t)];
             if (prev == -1) {
                 heights[@intCast(t)] = succ_h[s];
-                if (wl_len >= wl.len) return null; // relaxation overflow
+                if (wl_len >= wl.len) { // relaxation overflow
+                    a.free(heights);
+                    a.free(wl);
+                    return null;
+                }
                 wl[wl_len] = t;
                 wl_len += 1;
             } else if (prev != succ_h[s]) {
@@ -1125,7 +1130,11 @@ fn lexPlan(code: [*]Instr, len: i32, arity: i32) ?LexPlan {
                 // propagated it) is stale.
                 heights[@intCast(t)] = -2;
                 if (prev != -2) {
-                    if (wl_len >= wl.len) return null; // relaxation overflow
+                    if (wl_len >= wl.len) { // relaxation overflow
+                        a.free(heights);
+                        a.free(wl);
+                        return null;
+                    }
                     wl[wl_len] = t;
                     wl_len += 1;
                 }
@@ -1133,7 +1142,7 @@ fn lexPlan(code: [*]Instr, len: i32, arity: i32) ?LexPlan {
         }
     }
 
-    return .{ .max_d = max_d, .heights = heights };
+    return .{ .max_d = max_d, .n = len, .heights = heights };
 }
 
 /// S2.5 lex-frame eligibility: a DEFUN body whose CORE has let/endlet/grab, no
@@ -1146,7 +1155,7 @@ fn lexPlan(code: [*]Instr, len: i32, arity: i32) ?LexPlan {
 /// DEFUN bodies: a cur body's captured env makes env_len_in (the runtime base)
 /// exceed arity by an unknown amount, and the leading-grab prefix of a defun is
 /// always skipped at native entry.
-fn lexFrameEligible(code: [*]Instr, len: i32, arity: i32, self_slot: usize, defuns: []const Defun) ?LexPlan {
+fn lexFrameEligible(a: Allocator, code: [*]Instr, len: i32, arity: i32, self_slot: usize, defuns: []const Defun) Allocator.Error!?LexPlan {
     if (self_slot >= defuns.len) return null;
 
     var has_lex_op = false;
@@ -1166,10 +1175,13 @@ fn lexFrameEligible(code: [*]Instr, len: i32, arity: i32, self_slot: usize, defu
     }
     if (!has_lex_op) return null; // the plain p[] frame already covers it
 
-    const plan = lexPlan(code, len, arity) orelse return null;
+    const plan = (lexPlan(a, code, len, arity) catch return error.OutOfMemory) orelse return null;
     // The lex array is [LEX_MAX]; lexlen <= env_len_in + max_d <= arity + max_d
     // (env_len_in is 0 for a 0-arg defun, arity otherwise — never more).
-    if (arity + plan.max_d > LEX_MAX) return null;
+    if (arity + plan.max_d > LEX_MAX) {
+        a.free(plan.heights);
+        return null;
+    }
 
     // Every access site must have a UNIQUE live-lets delta.  (An out-of-bounds
     // access — n >= env_len — is handled at runtime by the emitted lexlen > n
@@ -1178,7 +1190,10 @@ fn lexFrameEligible(code: [*]Instr, len: i32, arity: i32, self_slot: usize, defu
     while (q < len) : (q += 1) {
         const ins = &code[@intCast(q)];
         switch (ins.op) {
-            .access, .access_prim => if (plan.heights[@intCast(q)] < 0) return null,
+            .access, .access_prim => if (plan.heights[@intCast(q)] < 0) {
+                a.free(plan.heights);
+                return null;
+            },
             else => {},
         }
     }
@@ -1220,7 +1235,8 @@ fn emitFn(
     // S2.5 lex frame: a defun whose CORE has let/endlet/grab gets a C-stack
     // lex[] local instead of the growing GC env array, when the height sim
     // proves unique in-bounds heights (deny-by-default otherwise).
-    const lex_plan = if (native_frame or elided) null else lexFrameEligible(@ptrCast(code.?), code_len, arity, self_slot, defuns);
+    const lex_plan = if (native_frame or elided) null else try lexFrameEligible(a, @ptrCast(code.?), code_len, arity, self_slot, defuns);
+    defer if (lex_plan) |lp| a.free(lp.heights);
     const lex_frame = lex_plan != null;
     if (native_frame) native_count.* += 1;
     if (lex_frame) lex_count.* += 1;
